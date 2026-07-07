@@ -1,0 +1,54 @@
+---
+# Behavioral login watcher. Every new SSH session must run the secret
+# pattern command within the time window, otherwise alert (or in
+# active mode, kill the session and block the source IP).
+
+- name: Ensure watcher dependencies (rsyslog writes auth.log on minimal images)
+  ansible.builtin.apt:
+    name: [rsyslog, python3]
+    state: present
+
+- name: Create watcher directory
+  ansible.builtin.file:
+    path: /opt/watcher
+    state: directory
+    mode: "0700"
+
+- name: Install watcher config (pattern lives here, 0600, rotate quarterly)
+  ansible.builtin.template:
+    src: watcher.conf.j2
+    dest: /opt/watcher/watcher.conf
+    mode: "0600"
+  notify: restart watcher
+
+- name: Install watcher service script
+  ansible.builtin.template:
+    src: watcher.py.j2
+    dest: /opt/watcher/watcher.py
+    mode: "0700"
+  notify: restart watcher
+
+- name: Systemd unit for watcher
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/login-watcher.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Behavioral login pattern watcher
+      After=auditd.service rsyslog.service
+      Wants=auditd.service
+
+      [Service]
+      ExecStart=/usr/bin/python3 /opt/watcher/watcher.py
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: reload systemd watcher
+
+- name: Enable watcher
+  ansible.builtin.service:
+    name: login-watcher
+    state: started
+    enabled: true

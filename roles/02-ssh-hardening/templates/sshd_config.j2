@@ -1,0 +1,26 @@
+# Managed by Ansible. Manual edits will be overwritten.
+Port {{ ssh_port }}
+Protocol 2
+
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+UsePAM yes
+
+AllowUsers {{ deploy_user }}
+MaxAuthTries {{ ssh_max_auth_tries }}
+LoginGraceTime 20
+MaxSessions 5
+
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+PermitEmptyPasswords no
+
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+LogLevel VERBOSE
+Subsystem sftp internal-sftp

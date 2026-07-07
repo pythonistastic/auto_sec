@@ -1,0 +1,65 @@
+---
+- name: Install UFW and fail2ban
+  ansible.builtin.apt:
+    name: [ufw, fail2ban]
+    state: present
+
+- name: UFW default deny incoming
+  community.general.ufw:
+    direction: incoming
+    policy: deny
+
+- name: UFW default allow outgoing
+  community.general.ufw:
+    direction: outgoing
+    policy: allow
+
+- name: Allow HTTP and HTTPS
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop: ["80", "443"]
+
+- name: Allow SSH with rate limiting (standard mode, fwknop gates it in high mode)
+  community.general.ufw:
+    rule: limit
+    port: "{{ ssh_port }}"
+    proto: tcp
+  when: paranoia_level == "standard"
+
+- name: Break-glass, allow SSH from office static IP directly
+  community.general.ufw:
+    rule: allow
+    port: "{{ ssh_port }}"
+    proto: tcp
+    src: "{{ office_static_ip }}"
+  when: office_static_ip | length > 0
+
+- name: Enable UFW
+  community.general.ufw:
+    state: enabled
+
+- name: fail2ban jail config
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/jail.local
+    mode: "0644"
+    content: |
+      [DEFAULT]
+      bantime  = 1h
+      bantime.increment = true
+      bantime.factor = 2
+      findtime = 10m
+      maxretry = 4
+      backend = systemd
+
+      [sshd]
+      enabled = true
+      port = {{ ssh_port }}
+
+      [nginx-http-auth]
+      enabled = true
+
+      [nginx-botsearch]
+      enabled = true
+  notify: restart fail2ban

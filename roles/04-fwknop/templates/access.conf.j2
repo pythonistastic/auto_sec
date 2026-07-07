@@ -1,0 +1,7 @@
+# Managed by Ansible
+SOURCE              ANY
+OPEN_PORTS          tcp/{{ ssh_port }}
+KEY_BASE64          {{ fwknop_key }}
+HMAC_KEY_BASE64     {{ fwknop_hmac_key }}
+FW_ACCESS_TIMEOUT   {{ fwknop_open_seconds }}
+REQUIRE_SOURCE_ADDRESS  Y

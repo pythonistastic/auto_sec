@@ -1,0 +1,20 @@
+---
+# Pragmatic lint profile: catch real mistakes, allow the deliberate
+# shell-heavy style of the detection/backup layers.
+skip_list:
+  - role-name              # numbered role dirs (01-base) are intentional
+  - name[casing]
+  - no-changed-when
+  - command-instead-of-module
+  - command-instead-of-shell
+  - risky-shell-pipe
+  - risky-file-permissions
+  - package-latest
+  - yaml[line-length]
+  - jinja[spacing]
+  - var-naming[no-role-prefix]
+
+exclude_paths:
+  - secrets/
+  - reports/
+  - .github/

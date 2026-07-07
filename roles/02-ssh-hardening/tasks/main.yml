@@ -1,0 +1,26 @@
+---
+# Key source, in order of precedence:
+#   deploy_ssh_public_key      inline public key string (wizard sets this)
+#   ssh_public_key_file        path to a .pub file on the control machine
+#   default                    ~/.ssh/clients/<host>.pub (agency layout)
+- name: Install authorized key for deploy user (inline key)
+  ansible.posix.authorized_key:
+    user: "{{ deploy_user }}"
+    key: "{{ deploy_ssh_public_key }}"
+    exclusive: true
+  when: deploy_ssh_public_key is defined
+
+- name: Install authorized key for deploy user (key file)
+  ansible.posix.authorized_key:
+    user: "{{ deploy_user }}"
+    key: "{{ lookup('file', ssh_public_key_file | default('~/.ssh/clients/' + inventory_hostname + '.pub')) }}"
+    exclusive: true
+  when: deploy_ssh_public_key is not defined
+
+- name: Harden sshd_config
+  ansible.builtin.template:
+    src: sshd_config.j2
+    dest: /etc/ssh/sshd_config
+    mode: "0600"
+    validate: "sshd -t -f %s"
+  notify: restart sshd

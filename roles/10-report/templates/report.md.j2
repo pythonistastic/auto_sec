@@ -1,0 +1,80 @@
+# Server Security Report
+
+**Client:** {{ client_name }}
+**Server:** {{ inventory_hostname }} ({{ ansible_host | default(ansible_default_ipv4.address) }})
+**Domain:** {{ client_domain }}
+**Prepared by:** {{ report_prepared_by }}
+**Date:** {{ ansible_date_time.date }}
+
+---
+
+## 1. Preventive measures
+
+- Operating system fully patched, automatic security updates enabled
+  (nightly, reboot window 04:00 {{ timezone }} when required)
+- SSH: key-based authentication only, root login disabled,
+  password login disabled, access restricted to authorized users
+- Firewall: default deny on all inbound traffic, only web ports
+  (80/443) exposed
+- Intrusion throttling: fail2ban active with escalating ban times
+{% if paranoia_level == "high" %}
+- Single Packet Authorization (fwknop): the SSH port is invisible to
+  scanners and opens only for authorized, cryptographically verified
+  requests, for {{ fwknop_open_seconds }} seconds at a time
+{% endif %}
+- Web server hardened: TLS enforced (auto-renewing certificates),
+  security headers active, version disclosure disabled
+- Application runs as an unprivileged system user
+
+## 2. Data protection
+
+{% if db_engine is defined %}
+- Database engine: {{ db_engine }}
+- Database bound to localhost only, verified unreachable from the internet
+- Application database account restricted to least privilege
+- Encryption at rest: documented per provisioning method (see appendix)
+{% else %}
+- No database on this server
+{% endif %}
+
+## 3. Backup and recovery
+
+- Nightly encrypted backups at 0{{ backup_hour }}:{{ backup_minute }} {{ timezone }}
+- Encryption performed on the server before upload, decryption key is
+  held offline by {{ report_prepared_by }}, never stored on the server
+- Destination: Backblaze B2 bucket with versioning, using an access key
+  that has NO delete permission. Even a fully compromised server cannot
+  destroy backup history
+- Retention: {{ backup_retention_daily }} daily, {{ backup_retention_weekly }} weekly, {{ backup_retention_monthly }} monthly
+- Backup success/failure monitored in real time
+- Restore verification: performed monthly on isolated infrastructure
+
+## 4. Detection and response
+
+- System audit trail active: identity changes, privilege changes,
+  SSH trust changes, scheduled task changes, binary tampering
+- Ransomware early warning: mass file-change detection with immediate
+  alerting
+- Behavioral login verification: sessions are monitored for expected
+  usage patterns; anomalous sessions trigger
+  {% if watcher_mode == "active" %}automatic session termination and
+  source blocking{% else %}immediate operator alerts{% endif %}
+- All alerts delivered to the operations team in real time
+
+## 5. Firewall state at time of report
+
+```
+{{ ufw_status.stdout }}
+```
+
+## 6. Intrusion throttling state
+
+```
+{{ f2b_status.stdout | default("n/a") }}
+```
+
+---
+
+*This report was generated automatically by
+[secure-deploy]({{ report_repo_url | default("https://github.com/YOURUSER/secure-deploy") }})
+on behalf of {{ report_prepared_by }}.*

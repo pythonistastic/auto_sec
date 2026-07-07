@@ -1,0 +1,15 @@
+# Secrets and generated per-server config. NEVER commit these.
+*.key
+*.age
+vault.yml
+.vault_pass
+secrets/
+host_vars/*
+!host_vars/example-client.yml
+inventory/*
+!inventory/hosts.yml
+reports/
+
+# Ansible noise
+*.retry
+__pycache__/

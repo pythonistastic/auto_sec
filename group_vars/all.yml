@@ -1,0 +1,42 @@
+---
+# Global defaults. Override per client in host_vars/<client>.yml
+
+timezone: "UTC"
+deploy_user: "deploy"
+
+# SSH
+ssh_port: 22
+ssh_max_auth_tries: 3
+
+# Your office/home static IP kept as break-glass direct SSH access.
+# Set to empty string to disable.
+office_static_ip: ""
+
+# Paranoia: standard | high
+paranoia_level: "standard"
+
+# Backups
+backup_hour: "3"
+backup_minute: "15"
+backup_retention_daily: 7
+backup_retention_weekly: 4
+backup_retention_monthly: 6
+
+# Alerts (Telegram bot)
+telegram_bot_token: "CHANGE_ME"
+telegram_chat_id: "CHANGE_ME"
+
+# Watcher
+watcher_mode: "alert"        # alert | active
+watcher_window_seconds: 60
+# Extra trusted source IPs/CIDRs that never trigger the watcher
+# (office_static_ip is always included automatically).
+watcher_whitelist_ips: []
+# Sessions without a TTY (scp, rsync, ansible, git) are skipped.
+watcher_skip_non_interactive: true
+
+# Let's Encrypt registration email for certbot
+letsencrypt_email: "CHANGE_ME@example.com"
+
+# Name that appears on the generated security report
+report_prepared_by: "Your Company"

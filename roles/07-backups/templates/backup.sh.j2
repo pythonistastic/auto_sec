@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Nightly backup: dump DB + app uploads, encrypt client-side with age,
+# push to B2. The B2 key CANNOT delete, bucket versioning is on, so
+# ransomware on this box cannot destroy backup history.
+set -euo pipefail
+
+STAMP=$(date +%F_%H%M)
+WORK=/opt/backup/tmp
+DEST="b2:{{ b2_bucket }}/{{ inventory_hostname }}"
+TG_TOKEN="{{ telegram_bot_token }}"
+TG_CHAT="{{ telegram_chat_id }}"
+
+notify() {
+  curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+    -d chat_id="${TG_CHAT}" -d text="$1" > /dev/null || true
+}
+
+trap 'notify "BACKUP FAILED on {{ inventory_hostname }} at ${STAMP}"' ERR
+
+mkdir -p "$WORK"
+cd "$WORK"
+
+# 1. Database dump
+{% if db_engine is defined and db_engine == "postgres" %}
+sudo -u postgres pg_dump {{ db_name }} > db_${STAMP}.sql
+{% elif db_engine is defined and db_engine == "mysql" %}
+mysqldump --single-transaction {{ db_name }} > db_${STAMP}.sql
+{% else %}
+echo "no database configured" > db_${STAMP}.sql
+{% endif %}
+
+# 2. App files (uploads and env)
+tar czf files_${STAMP}.tar.gz -C {{ app_dir }} . 2>/dev/null || true
+
+# 3. Bundle and encrypt client-side. Private key NEVER on this server.
+tar czf bundle_${STAMP}.tar.gz db_${STAMP}.sql files_${STAMP}.tar.gz
+age -r "{{ age_public_key }}" -o bundle_${STAMP}.tar.gz.age bundle_${STAMP}.tar.gz
+
+# 4. Upload with checksum verification
+rclone copyto bundle_${STAMP}.tar.gz.age "${DEST}/daily/bundle_${STAMP}.tar.gz.age" --b2-upload-cutoff 100M
+rclone check bundle_${STAMP}.tar.gz.age "${DEST}/daily/" --one-way --include "bundle_${STAMP}.tar.gz.age"
+
+# 5. Weekly and monthly copies (retention pruning happens at B2
+#    lifecycle level in the account console, NOT from this server,
+#    because this key cannot delete)
+if [ "$(date +%u)" = "7" ]; then
+  rclone copyto bundle_${STAMP}.tar.gz.age "${DEST}/weekly/bundle_${STAMP}.tar.gz.age"
+fi
+if [ "$(date +%d)" = "01" ]; then
+  rclone copyto bundle_${STAMP}.tar.gz.age "${DEST}/monthly/bundle_${STAMP}.tar.gz.age"
+fi
+
+# 6. Cleanup local, ping heartbeat
+rm -rf "$WORK"
+notify "Backup OK: {{ inventory_hostname }} ${STAMP} ($(du -h /opt/backup 2>/dev/null | tail -1 | cut -f1 || echo done))"

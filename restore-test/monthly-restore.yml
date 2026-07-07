@@ -1,0 +1,115 @@
+---
+# Runs on YOUR ops machine (localhost), not the client VPS.
+# Pulls latest backup from B2, decrypts, restores into a scratch
+# Postgres container, runs sanity checks, reports, destroys.
+#
+# Schedule monthly:
+#   0 6 1 * * ansible-playbook /path/restore-test/monthly-restore.yml \
+#     -e client=example-client
+#
+# Requires locally: rclone (configured with a READ key), age private
+# key in your vault path, docker.
+
+- name: Monthly restore verification
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+    - "../host_vars/{{ client }}.yml"
+  vars:
+    age_private_key_file: "~/.vault/age-keys/{{ client }}.key"
+    work: "/tmp/restore-test-{{ client }}"
+
+  tasks:
+    - name: Restore, verify, report
+      block:
+        - name: Clean workspace
+          ansible.builtin.file:
+            path: "{{ work }}"
+            state: "{{ item }}"
+          loop: [absent, directory]
+
+        - name: Find latest daily backup in B2
+          ansible.builtin.shell: >
+            rclone lsf b2:{{ b2_bucket }}/{{ client }}/daily/
+            --files-only | sort | tail -1
+          register: latest
+          changed_when: false
+
+        - name: Fail if no backup found
+          ansible.builtin.fail:
+            msg: "No backups found in bucket, investigate immediately"
+          when: latest.stdout | length == 0
+
+        - name: Download latest backup
+          ansible.builtin.command: >
+            rclone copyto
+            b2:{{ b2_bucket }}/{{ client }}/daily/{{ latest.stdout }}
+            {{ work }}/bundle.tar.gz.age
+
+        - name: Decrypt with offline age key
+          ansible.builtin.shell: >
+            age -d -i {{ age_private_key_file }}
+            -o {{ work }}/bundle.tar.gz {{ work }}/bundle.tar.gz.age
+
+        - name: Extract
+          ansible.builtin.unarchive:
+            src: "{{ work }}/bundle.tar.gz"
+            dest: "{{ work }}"
+
+        - name: Start scratch Postgres container
+          ansible.builtin.shell: >
+            docker run -d --name restore-test-{{ client }}
+            -e POSTGRES_PASSWORD=scratch -e POSTGRES_DB={{ db_name }}
+            postgres:16 && sleep 10
+
+        - name: Restore dump into scratch container
+          ansible.builtin.shell: >
+            docker exec -i restore-test-{{ client }}
+            psql -U postgres {{ db_name }} < {{ work }}/db_*.sql
+
+        - name: Sanity check, count tables and total rows
+          ansible.builtin.shell: |
+            docker exec restore-test-{{ client }} psql -U postgres -t {{ db_name }} -c \
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';"
+          register: sanity
+
+        - name: Report result to Telegram
+          ansible.builtin.uri:
+            url: "https://api.telegram.org/bot{{ telegram_bot_token }}/sendMessage"
+            method: POST
+            body_format: form-urlencoded
+            body:
+              chat_id: "{{ telegram_chat_id }}"
+              text: >-
+                RESTORE TEST {{ 'PASSED' if (sanity.stdout | trim | int) > 0 else 'FAILED' }}
+                for {{ client }}. Backup: {{ latest.stdout }}.
+                Tables restored: {{ sanity.stdout | trim }}.
+
+        - name: Fail the play if sanity check failed (so cron surfaces it)
+          ansible.builtin.fail:
+            msg: "Restore verification FAILED for {{ client }}"
+          when: (sanity.stdout | trim | int) == 0
+
+      rescue:
+        - name: Report failure to Telegram
+          ansible.builtin.uri:
+            url: "https://api.telegram.org/bot{{ telegram_bot_token }}/sendMessage"
+            method: POST
+            body_format: form-urlencoded
+            body:
+              chat_id: "{{ telegram_chat_id }}"
+              text: >-
+                RESTORE TEST FAILED for {{ client }}:
+                {{ ansible_failed_result.msg | default('see ansible output') }}
+          failed_when: false
+
+        - name: Surface the failure to cron
+          ansible.builtin.fail:
+            msg: "Restore verification FAILED for {{ client }}"
+
+      always:
+        - name: Destroy scratch container and workspace
+          ansible.builtin.shell: |
+            docker rm -f restore-test-{{ client }} || true
+            rm -rf {{ work }}
+          failed_when: false

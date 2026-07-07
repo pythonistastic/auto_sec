@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Ransomware early warning: if file modification rate in the app dir
+# exceeds threshold, alert immediately (encryption sweeps touch
+# hundreds of files per minute).
+set -uo pipefail
+
+TG_TOKEN="{{ telegram_bot_token }}"
+TG_CHAT="{{ telegram_chat_id }}"
+WATCH_DIR="{{ app_dir }}"
+THRESHOLD=150   # file events per 60s window
+
+notify() {
+  curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+    -d chat_id="${TG_CHAT}" -d text="$1" > /dev/null || true
+}
+
+while true; do
+  COUNT=$(timeout 60 inotifywait -r -q -e modify,create,delete,move "$WATCH_DIR" 2>/dev/null | wc -l)
+  if [ "${COUNT:-0}" -gt "$THRESHOLD" ]; then
+    notify "RANSOMWARE WARNING [{{ inventory_hostname }}]: ${COUNT} file events in 60s under ${WATCH_DIR}. Possible encryption sweep in progress. Consider isolating the server NOW."
+  fi
+done

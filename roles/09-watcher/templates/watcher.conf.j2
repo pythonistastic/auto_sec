@@ -1,0 +1,15 @@
+# Managed by Ansible. Permissions 0600, root only.
+# Rotate the pattern quarterly. Never commit real values to git.
+[watcher]
+pattern = {{ watcher_pattern }}
+window_seconds = {{ watcher_window_seconds }}
+mode = {{ watcher_mode }}
+telegram_bot_token = {{ telegram_bot_token }}
+telegram_chat_id = {{ telegram_chat_id }}
+host_label = {{ inventory_hostname }}
+# Comma-separated IPs or CIDRs that never trigger the watcher
+# (your office, your CI runner, your ops workstation).
+whitelist_ips = {{ ([office_static_ip] + (watcher_whitelist_ips | default([]))) | select | join(",") }}
+# Non-interactive sessions (scp, rsync, ansible, git) have no TTY and
+# never type the pattern. Keep true unless you know what you are doing.
+skip_non_interactive = {{ watcher_skip_non_interactive | default(true) | lower }}

@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""
+Behavioral login pattern watcher.
+
+Concept: valid users know an unwritten rule. Within N seconds of a new
+interactive SSH session, they must run a specific command (the pattern).
+A session whose commands never match the pattern is flagged as a likely
+credential-theft intrusion.
+
+alert mode  -> Telegram alert with session details
+active mode -> alert + terminate THAT session + UFW block on the source IP
+
+Sessions are tracked individually via systemd-logind / audit session IDs,
+so a valid user logged in at the same time as an intruder on the same
+account cannot vouch for the intruder, and enforcement only kills the
+offending session.
+
+Non-interactive sessions (scp, rsync, ansible, git) never type the
+pattern, so they are skipped by default (skip_non_interactive). Trusted
+source IPs/CIDRs (your office, your CI) can be whitelisted.
+
+Reads:
+  /var/log/auth.log                  new session detection (Accepted ...)
+  loginctl                           session identification (TTY, remote IP)
+  ausearch -k exec_log --session N   per-session executed commands (auditd)
+"""
+
+import configparser
+import ipaddress
+import re
+import subprocess
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+CONF = "/opt/watcher/watcher.conf"
+
+cfg = configparser.ConfigParser()
+cfg.read(CONF)
+PATTERN = cfg.get("watcher", "pattern").strip()
+WINDOW = cfg.getint("watcher", "window_seconds")
+MODE = cfg.get("watcher", "mode").strip()
+TG_TOKEN = cfg.get("watcher", "telegram_bot_token").strip()
+TG_CHAT = cfg.get("watcher", "telegram_chat_id").strip()
+HOST = cfg.get("watcher", "host_label").strip()
+SKIP_NON_INTERACTIVE = cfg.getboolean(
+    "watcher", "skip_non_interactive", fallback=True
+)
+WHITELIST = [
+    ipaddress.ip_network(entry.strip(), strict=False)
+    for entry in cfg.get("watcher", "whitelist_ips", fallback="").split(",")
+    if entry.strip()
+]
+
+LOGIN_RE = re.compile(
+    r"Accepted \w+ for (?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d+)"
+)
+
+# Session IDs already claimed by a checker thread, so two rapid logins
+# from the same user/IP each get their own session.
+_claimed: set[str] = set()
+_claimed_lock = threading.Lock()
+
+
+def notify(text: str) -> None:
+    try:
+        data = urllib.parse.urlencode(
+            {"chat_id": TG_CHAT, "text": text}
+        ).encode()
+        urllib.request.urlopen(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data=data,
+            timeout=10,
+        )
+    except Exception:
+        pass  # alerting must never crash the watcher
+
+
+def is_whitelisted(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in WHITELIST)
+
+
+def run(cmd: list[str], timeout: int = 15) -> str:
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        ).stdout
+    except Exception:
+        return ""
+
+
+def session_property(session_id: str, prop: str) -> str:
+    out = run(["loginctl", "show-session", session_id, "-p", prop, "--value"])
+    return out.strip()
+
+
+def find_new_session(user: str, ip: str, deadline: float) -> str | None:
+    """Find the logind session for this login and claim it."""
+    while time.time() < deadline:
+        out = run(["loginctl", "list-sessions", "--no-legend"])
+        for line in out.splitlines():
+            parts = line.split()  # SESSION UID USER SEAT ...
+            if len(parts) < 3:
+                continue
+            sid, sess_user = parts[0], parts[2]
+            if sess_user != user:
+                continue
+            if session_property(sid, "RemoteHost") != ip:
+                continue
+            with _claimed_lock:
+                if sid in _claimed:
+                    continue
+                _claimed.add(sid)
+            return sid
+        time.sleep(1)
+    return None
+
+
+def session_commands(session_id: str) -> list[str]:
+    """Pull execve records for this specific audit session."""
+    audit_ses = session_property(session_id, "Audit") or session_id
+    out = run(["ausearch", "-k", "exec_log", "--session", audit_ses])
+    cmds = []
+    for line in out.splitlines():
+        if "proctitle=" in line:
+            raw = line.split("proctitle=", 1)[1].strip()
+            # proctitle may be hex-encoded
+            if re.fullmatch(r"[0-9A-Fa-f]+", raw):
+                try:
+                    raw = bytes.fromhex(raw).replace(b"\x00", b" ").decode(
+                        errors="replace"
+                    )
+                except ValueError:
+                    pass
+            cmds.append(raw.strip())
+    return cmds
+
+
+def react(user: str, ip: str, session_id: str | None, cmds: list[str]) -> None:
+    preview = "; ".join(cmds[:5]) if cmds else "(no commands captured)"
+    msg = (
+        f"WATCHER ALERT [{HOST}]\n"
+        f"Session for user '{user}' from {ip} did NOT perform the "
+        f"expected pattern within {WINDOW}s.\n"
+        f"First commands: {preview}"
+    )
+    if MODE == "active":
+        actions = []
+        if session_id:
+            run(["loginctl", "terminate-session", session_id])
+            actions.append(f"session {session_id} terminated")
+        run(["ufw", "insert", "1", "deny", "from", ip])
+        actions.append(f"{ip} blocked via UFW")
+        msg += "\nACTION TAKEN: " + ", ".join(actions) + "."
+    else:
+        msg += "\nMode: alert-only. No action taken."
+    notify(msg)
+
+
+def check_session(user: str, ip: str, login_time: float) -> None:
+    if is_whitelisted(ip):
+        return
+    # Give logind a moment to register the session, but never longer
+    # than the enforcement window.
+    session_id = find_new_session(
+        user, ip, deadline=login_time + min(15, WINDOW)
+    )
+    if session_id:
+        if SKIP_NON_INTERACTIVE and not session_property(session_id, "TTY"):
+            # scp/rsync/ansible/git style session: no TTY, no pattern.
+            with _claimed_lock:
+                _claimed.discard(session_id)
+            return
+        remaining = login_time + WINDOW - time.time()
+        if remaining > 0:
+            time.sleep(remaining)
+        cmds = session_commands(session_id)
+        with _claimed_lock:
+            _claimed.discard(session_id)
+        if any(PATTERN in c for c in cmds):
+            return  # pattern matched, trusted session, stay silent
+        # Session may have ended already (short-lived probe): still alert.
+        react(user, ip, session_id, cmds)
+    else:
+        # Could not identify the session (port forwarding, logind race).
+        # Alert, and in active mode block the IP, but never kill blindly.
+        react(user, ip, None, [])
+
+
+def follow_auth_log() -> None:
+    proc = subprocess.Popen(
+        ["tail", "-Fn0", "/var/log/auth.log"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        m = LOGIN_RE.search(line)
+        if not m:
+            continue
+        user, ip = m.group("user"), m.group("ip")
+        threading.Thread(
+            target=check_session,
+            args=(user, ip, time.time()),
+            daemon=True,
+        ).start()
+
+
+if __name__ == "__main__":
+    notify(
+        f"Watcher started on {HOST} (mode: {MODE}, "
+        f"whitelisted networks: {len(WHITELIST)})"
+    )
+    follow_auth_log()

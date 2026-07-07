@@ -1,0 +1,91 @@
+---
+- name: Install Nginx and certbot
+  ansible.builtin.apt:
+    name: [nginx, certbot, python3-certbot-nginx]
+    state: present
+
+- name: Create app service user (non-root, no login shell)
+  ansible.builtin.user:
+    name: app
+    shell: /usr/sbin/nologin
+    system: true
+    create_home: false
+
+- name: Create app directory
+  ansible.builtin.file:
+    path: "{{ app_dir }}"
+    state: directory
+    owner: app
+    group: app
+    mode: "0750"
+
+# --- Node/PM2 branch ---
+- name: Node runtime block
+  when: app_type == "node"
+  block:
+    - name: Install Node.js via NodeSource
+      ansible.builtin.shell: |
+        curl -fsSL https://deb.nodesource.com/setup_{{ node_version }}.x | bash -
+        apt-get install -y nodejs
+      args:
+        creates: /usr/bin/node
+
+    - name: Install PM2 globally
+      community.general.npm:
+        name: pm2
+        global: true
+
+    - name: PM2 startup on boot as app user
+      ansible.builtin.command: pm2 startup systemd -u app --hp {{ app_dir }}
+      args:
+        creates: /etc/systemd/system/pm2-app.service
+
+# --- Docker branch ---
+- name: Docker runtime block
+  when: app_type == "docker"
+  block:
+    - name: Install Docker
+      ansible.builtin.shell: curl -fsSL https://get.docker.com | sh
+      args:
+        creates: /usr/bin/docker
+
+    - name: Add deploy user to docker group
+      ansible.builtin.user:
+        name: "{{ deploy_user }}"
+        groups: docker
+        append: true
+
+- name: Hardened Nginx reverse proxy vhost
+  ansible.builtin.template:
+    src: nginx-vhost.conf.j2
+    dest: "/etc/nginx/sites-available/{{ client_domain }}"
+    mode: "0644"
+  notify: reload nginx
+
+- name: Enable vhost
+  ansible.builtin.file:
+    src: "/etc/nginx/sites-available/{{ client_domain }}"
+    dest: "/etc/nginx/sites-enabled/{{ client_domain }}"
+    state: link
+  notify: reload nginx
+
+- name: Remove default vhost
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: reload nginx
+
+- name: Hide Nginx version globally
+  ansible.builtin.lineinfile:
+    path: /etc/nginx/nginx.conf
+    regexp: "server_tokens"
+    line: "    server_tokens off;"
+    insertafter: "http {"
+  notify: reload nginx
+
+- name: Obtain TLS certificate
+  ansible.builtin.command: >
+    certbot --nginx -d {{ client_domain }}
+    --non-interactive --agree-tos -m {{ letsencrypt_email }} --redirect
+  args:
+    creates: "/etc/letsencrypt/live/{{ client_domain }}/fullchain.pem"

@@ -1,0 +1,5 @@
+---
+- name: restart fwknopd
+  ansible.builtin.service:
+    name: fwknop-server
+    state: restarted

@@ -1,0 +1,38 @@
+---
+# Single Packet Authorization. SSH port stays CLOSED until a valid
+# encrypted packet arrives, then opens for the sender's IP only.
+# SAFETY: confirm provider console (Contabo VNC) access before enabling,
+# and keep office_static_ip break-glass rule until comfortable.
+
+- name: Install fwknop server
+  ansible.builtin.apt:
+    name: fwknop-server
+    state: present
+
+- name: Configure fwknopd access
+  ansible.builtin.template:
+    src: access.conf.j2
+    dest: /etc/fwknop/access.conf
+    mode: "0600"
+  notify: restart fwknopd
+
+- name: Configure fwknopd main config
+  ansible.builtin.template:
+    src: fwknopd.conf.j2
+    dest: /etc/fwknop/fwknopd.conf
+    mode: "0600"
+  notify: restart fwknopd
+
+- name: Remove open SSH rule from UFW (fwknop takes over)
+  community.general.ufw:
+    rule: limit
+    port: "{{ ssh_port }}"
+    proto: tcp
+    delete: true
+  failed_when: false
+
+- name: Enable fwknopd
+  ansible.builtin.service:
+    name: fwknop-server
+    state: started
+    enabled: true

@@ -1,0 +1,89 @@
+---
+# Postgres branch
+- name: Postgres block
+  when: db_engine == "postgres"
+  block:
+    - name: Install PostgreSQL
+      ansible.builtin.apt:
+        name: [postgresql, postgresql-contrib, python3-psycopg2]
+        state: present
+
+    - name: Bind Postgres to localhost only
+      ansible.builtin.lineinfile:
+        path: "/etc/postgresql/{{ pg_version | default('16') }}/main/postgresql.conf"
+        regexp: "^#?listen_addresses"
+        line: "listen_addresses = '127.0.0.1'"
+      notify: restart postgres
+
+    - name: Create app database
+      community.postgresql.postgresql_db:
+        name: "{{ db_name }}"
+      become: true
+      become_user: postgres
+
+    - name: Create least-privilege app user
+      community.postgresql.postgresql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_password }}"
+      become: true
+      become_user: postgres
+
+    - name: Grant only what the app needs (no superuser, no createdb)
+      community.postgresql.postgresql_privs:
+        db: "{{ db_name }}"
+        role: "{{ db_user }}"
+        type: schema
+        objs: public
+        privs: USAGE,CREATE
+      become: true
+      become_user: postgres
+
+    - name: Enable slow query logging
+      ansible.builtin.lineinfile:
+        path: "/etc/postgresql/{{ pg_version | default('16') }}/main/postgresql.conf"
+        regexp: "^#?log_min_duration_statement"
+        line: "log_min_duration_statement = 1000"
+      notify: restart postgres
+
+# MySQL branch
+- name: MySQL block
+  when: db_engine == "mysql"
+  block:
+    - name: Install MySQL
+      ansible.builtin.apt:
+        name: [mysql-server, python3-pymysql]
+        state: present
+
+    - name: Bind MySQL to localhost only
+      ansible.builtin.lineinfile:
+        path: /etc/mysql/mysql.conf.d/mysqld.cnf
+        regexp: "^bind-address"
+        line: "bind-address = 127.0.0.1"
+      notify: restart mysql
+
+    - name: Create app database
+      ansible.mysql.mysql_db:
+        name: "{{ db_name }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Create least-privilege app user (localhost only, own schema only)
+      ansible.mysql.mysql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_password }}"
+        host: localhost
+        priv: "{{ db_name }}.*:SELECT,INSERT,UPDATE,DELETE,CREATE,INDEX,ALTER,REFERENCES"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+# Verification, applies to both
+- name: Verify DB is NOT reachable externally
+  ansible.builtin.wait_for:
+    host: "{{ ansible_default_ipv4.address }}"
+    port: "{{ 5432 if db_engine == 'postgres' else 3306 }}"
+    state: stopped
+    timeout: 5
+
+# Encryption at rest note:
+# Full-disk LUKS must be set up at provision time (or use provider
+# encrypted volumes). For PDPL documentation, the report role records
+# the encryption method used. Application-level field encryption for
+# highly sensitive columns is recommended in addition.

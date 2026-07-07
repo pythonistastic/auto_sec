@@ -1,0 +1,30 @@
+---
+# Generates the client-facing security report. This is the commercial
+# deliverable that turns the script into a product.
+
+- name: Gather UFW status
+  ansible.builtin.command: ufw status verbose
+  register: ufw_status
+  changed_when: false
+
+- name: Gather fail2ban status
+  ansible.builtin.command: fail2ban-client status
+  register: f2b_status
+  changed_when: false
+  failed_when: false
+
+- name: Render security report (Markdown)
+  ansible.builtin.template:
+    src: report.md.j2
+    dest: "/root/security-report-{{ inventory_hostname }}.md"
+    mode: "0600"
+
+- name: Fetch report to workstation
+  ansible.builtin.fetch:
+    src: "/root/security-report-{{ inventory_hostname }}.md"
+    dest: "reports/"
+    flat: true
+
+# Convert the fetched Markdown to branded PDF locally with your own
+# tooling (pandoc with Coders Technologies letterhead template), then
+# send to the client.

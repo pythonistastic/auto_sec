@@ -1,0 +1,48 @@
+---
+- name: Install rclone and age
+  ansible.builtin.apt:
+    name: [rclone, age]
+    state: present
+
+- name: Create backup working directory
+  ansible.builtin.file:
+    path: /opt/backup
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Configure rclone remote for B2 (scoped key, read+write, NO delete)
+  ansible.builtin.copy:
+    dest: /root/.config/rclone/rclone.conf
+    mode: "0600"
+    content: |
+      [b2]
+      type = b2
+      account = {{ b2_key_id }}
+      key = {{ b2_app_key }}
+
+- name: Install backup script
+  ansible.builtin.template:
+    src: backup.sh.j2
+    dest: /opt/backup/backup.sh
+    mode: "0700"
+
+- name: Nightly backup cron
+  ansible.builtin.cron:
+    name: "nightly encrypted backup to B2"
+    hour: "{{ backup_hour }}"
+    minute: "{{ backup_minute }}"
+    job: "/opt/backup/backup.sh >> /var/log/backup.log 2>&1"
+
+- name: Logrotate for backup log
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/backup
+    mode: "0644"
+    content: |
+      /var/log/backup.log {
+          weekly
+          rotate 8
+          compress
+          missingok
+      }

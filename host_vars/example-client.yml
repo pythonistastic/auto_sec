@@ -1,0 +1,43 @@
+---
+# Per-client configuration. Copy to host_vars/<client>.yml and fill in.
+
+client_name: "Example Client LLC"
+client_domain: "app.example.com"
+
+paranoia_level: "high"        # standard | high
+
+# App runtime: node | docker
+app_type: "node"
+app_dir: "/opt/app"
+app_port: 3000
+node_version: "20"
+
+# Database: postgres | mysql (omit db_engine entirely for no DB)
+db_engine: "postgres"
+db_name: "appdb"
+db_user: "appuser"
+# Store the real password in ansible-vault, this is a placeholder
+db_password: "CHANGE_ME_USE_VAULT"
+
+# Backblaze B2 (application key scoped: read + write, NO delete)
+b2_bucket: "client-backups-example"
+b2_key_id: "CHANGE_ME"
+b2_app_key: "CHANGE_ME_USE_VAULT"
+
+# age public key for client-side backup encryption.
+# Private key stays in your vault, NEVER on the server.
+age_public_key: "age1CHANGEME..."
+
+# fwknop (only used when paranoia_level is high)
+fwknop_key: "CHANGE_ME_USE_VAULT"
+fwknop_hmac_key: "CHANGE_ME_USE_VAULT"
+fwknop_open_seconds: 30
+
+# Watcher behavioral pattern: first command a valid user must run
+# within watcher_window_seconds of login. Keep unique per client,
+# rotate quarterly, never commit real values.
+watcher_pattern: "cd /opt/app/logs"
+watcher_mode: "alert"         # alert | active
+# Trusted source IPs/CIDRs that never trigger the watcher, e.g. your
+# office or CI runner. office_static_ip is included automatically.
+watcher_whitelist_ips: []

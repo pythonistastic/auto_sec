@@ -1,0 +1,18 @@
+---
+# Master playbook. Runs all layers in order.
+# Usage: ansible-playbook -i inventory/hosts.yml site.yml -l <client>
+
+- name: Secure deployment pipeline
+  hosts: all
+  become: true
+  roles:
+    - { role: 01-base, tags: ["base"] }
+    - { role: 02-ssh-hardening, tags: ["ssh"] }
+    - { role: 03-firewall, tags: ["firewall"] }
+    - { role: 04-fwknop, tags: ["fwknop"], when: paranoia_level == "high" }
+    - { role: 05-app-runtime, tags: ["app"] }
+    - { role: 06-database, tags: ["database"], when: db_engine is defined }
+    - { role: 07-backups, tags: ["backups"], when: b2_bucket is defined }
+    - { role: 08-detection, tags: ["detection"] }
+    - { role: 09-watcher, tags: ["watcher"] }
+    - { role: 10-report, tags: ["report"] }

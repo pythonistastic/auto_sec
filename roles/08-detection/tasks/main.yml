@@ -1,0 +1,83 @@
+---
+- name: Install auditd and inotify tools
+  ansible.builtin.apt:
+    name: [auditd, audispd-plugins, inotify-tools]
+    state: present
+
+- name: Audit rules for intrusion indicators
+  ansible.builtin.copy:
+    dest: /etc/audit/rules.d/hardening.rules
+    mode: "0640"
+    content: |
+      ## Managed by Ansible
+      ## Identity changes
+      -w /etc/passwd -p wa -k identity
+      -w /etc/shadow -p wa -k identity
+      -w /etc/group -p wa -k identity
+      -w /etc/sudoers -p wa -k privilege
+      -w /etc/sudoers.d/ -p wa -k privilege
+
+      ## SSH trust changes (attacker persistence)
+      -w /home/{{ deploy_user }}/.ssh/authorized_keys -p wa -k ssh_trust
+      -w /root/.ssh/ -p wa -k ssh_trust
+
+      ## Scheduled task persistence
+      -w /etc/crontab -p wa -k cron
+      -w /etc/cron.d/ -p wa -k cron
+      -w /var/spool/cron/ -p wa -k cron
+
+      ## Binary tampering
+      -w /usr/bin/ -p wa -k bin_tamper
+      -w /usr/sbin/ -p wa -k bin_tamper
+
+      ## Record all executed commands per session (feeds the watcher)
+      -a always,exit -F arch=b64 -S execve -k exec_log
+  notify: restart auditd
+
+- name: Ensure detect dir
+  ansible.builtin.file:
+    path: /opt/detect
+    state: directory
+    mode: "0700"
+
+- name: Install detection alert script
+  ansible.builtin.template:
+    src: detect-alert.sh.j2
+    dest: /opt/detect/detect-alert.sh
+    mode: "0700"
+
+- name: Install ransomware early-warning watcher (mass file change rate)
+  ansible.builtin.template:
+    src: ransomware-canary.sh.j2
+    dest: /opt/detect/ransomware-canary.sh
+    mode: "0700"
+
+- name: Systemd unit for ransomware canary
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ransomware-canary.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Mass file-change ransomware early warning
+      After=network.target
+
+      [Service]
+      ExecStart=/opt/detect/ransomware-canary.sh
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: reload systemd
+
+- name: Enable ransomware canary
+  ansible.builtin.service:
+    name: ransomware-canary
+    state: started
+    enabled: true
+
+- name: Cron to scan audit log every 5 min and alert
+  ansible.builtin.cron:
+    name: "audit alert scan"
+    minute: "*/5"
+    job: "/opt/detect/detect-alert.sh >> /var/log/detect.log 2>&1"

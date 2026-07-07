@@ -1,0 +1,10 @@
+---
+- name: reload systemd watcher
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: restart watcher
+  ansible.builtin.service:
+    name: login-watcher
+    state: restarted
+  failed_when: false

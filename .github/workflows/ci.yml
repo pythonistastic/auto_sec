@@ -1,0 +1,35 @@
+---
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  ansible:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Ansible and ansible-lint
+        run: pip install ansible ansible-lint
+      - name: Install Galaxy collections
+        run: ansible-galaxy collection install -r requirements.yml
+      - name: Syntax check main playbook
+        run: ansible-playbook site.yml -i inventory/hosts.yml --syntax-check
+      - name: Syntax check restore-test playbook
+        run: >
+          ansible-playbook restore-test/monthly-restore.yml
+          -e client=example-client --syntax-check
+      - name: Lint
+        run: ansible-lint
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck scripts
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck scripts/*.sh

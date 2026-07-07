@@ -1,0 +1,10 @@
+---
+- name: restart postgres
+  ansible.builtin.service:
+    name: postgresql
+    state: restarted
+
+- name: restart mysql
+  ansible.builtin.service:
+    name: mysql
+    state: restarted
