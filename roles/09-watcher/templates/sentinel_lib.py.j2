@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+sentinel_lib - shared plumbing for the secure-deploy detection suite.
+
+Three detectors import this module:
+  watcher.py        SSH behavioral login pattern (tripwire second factor)
+  revshell_scan.py  reverse shells + service/app users spawning shells
+  recon_watch.py    bursts of enumeration commands ("looking around")
+
+Design rules that live here so every detector obeys them:
+  * Alerting must never crash a detector (notify swallows all errors).
+  * In active mode we CAPTURE FORENSIC EVIDENCE BEFORE we kill anything,
+    so automated response never destroys the only record of the intrusion.
+  * Trusted IPs/CIDRs are never acted on.
+
+All configuration lives in /opt/watcher/watcher.conf. The [watcher]
+section holds values shared by every detector (telegram creds, host
+label, mode, whitelist); each detector also reads its own section.
+"""
+
+import configparser
+import ipaddress
+import os
+import subprocess
+import time
+import urllib.parse
+import urllib.request
+
+CONF = "/opt/watcher/watcher.conf"
+EVIDENCE_DIR = "/var/log/sentinel"
+
+_cfg = configparser.ConfigParser()
+_cfg.read(CONF)
+
+# --- shared config (the [watcher] section) --------------------------------
+MODE = _cfg.get("watcher", "mode", fallback="alert").strip()
+HOST = _cfg.get("watcher", "host_label", fallback="server").strip()
+TG_TOKEN = _cfg.get("watcher", "telegram_bot_token", fallback="").strip()
+TG_CHAT = _cfg.get("watcher", "telegram_chat_id", fallback="").strip()
+
+WHITELIST = [
+    ipaddress.ip_network(entry.strip(), strict=False)
+    for entry in _cfg.get("watcher", "whitelist_ips", fallback="").split(",")
+    if entry.strip()
+]
+
+
+def get(section: str, key: str, fallback=None):
+    return _cfg.get(section, key, fallback=fallback)
+
+
+def getint(section: str, key: str, fallback: int) -> int:
+    return _cfg.getint(section, key, fallback=fallback)
+
+
+def getbool(section: str, key: str, fallback: bool) -> bool:
+    return _cfg.getboolean(section, key, fallback=fallback)
+
+
+def getlist(section: str, key: str, fallback: str = "") -> list[str]:
+    raw = _cfg.get(section, key, fallback=fallback)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+# --- utilities ------------------------------------------------------------
+def run(cmd: list[str], timeout: int = 15) -> str:
+    """Run a command, return stdout, never raise."""
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        ).stdout
+    except Exception:
+        return ""
+
+
+def notify(text: str) -> None:
+    """Send a Telegram message. Alerting must never crash a detector."""
+    if not TG_TOKEN or TG_TOKEN == "CHANGE_ME" or not TG_CHAT:
+        return
+    try:
+        data = urllib.parse.urlencode({"chat_id": TG_CHAT, "text": text}).encode()
+        urllib.request.urlopen(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data=data,
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def is_whitelisted(ip: str | None) -> bool:
+    if not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in WHITELIST)
+
+
+def _stamp() -> str:
+    return time.strftime("%Y%m%d-%H%M%S", time.localtime())
+
+
+def peer_ips_for_pid(pid: int) -> list[str]:
+    """Remote peer addresses of a process's TCP sockets, via ss."""
+    out = run(["ss", "-tanp"])
+    peers = []
+    needle = f"pid={pid},"
+    for line in out.splitlines():
+        if needle not in line:
+            continue
+        cols = line.split()
+        # ss columns: State Recv Send Local Peer Process
+        if len(cols) >= 5:
+            peer = cols[4]
+            host = peer.rsplit(":", 1)[0].strip("[]")
+            if host and host not in ("0.0.0.0", "*", "::"):
+                peers.append(host)
+    return peers
+
+
+def capture_evidence(tag: str, pid: int | None = None,
+                     user: str | None = None, ip: str | None = None,
+                     extra: str = "") -> str:
+    """
+    Snapshot forensic state to a file and return its path. Called BEFORE
+    any kill/block so response never destroys the record. Best-effort:
+    a failure here must not stop alerting.
+    """
+    try:
+        os.makedirs(EVIDENCE_DIR, exist_ok=True)
+        path = f"{EVIDENCE_DIR}/incident-{tag}-{_stamp()}.txt"
+        with open(path, "w") as fh:
+            fh.write(f"== secure-deploy incident: {tag} ==\n")
+            fh.write(f"host={HOST} time={time.asctime()}\n")
+            fh.write(f"pid={pid} user={user} ip={ip}\n")
+            if extra:
+                fh.write(f"detail={extra}\n")
+            fh.write("\n-- process tree (ps auxf) --\n")
+            fh.write(run(["ps", "auxf"]))
+            fh.write("\n-- network sockets (ss -tanp) --\n")
+            fh.write(run(["ss", "-tanp"]))
+            if pid:
+                fh.write(f"\n-- /proc/{pid}/fd --\n")
+                fh.write(run(["ls", "-l", f"/proc/{pid}/fd"]))
+                fh.write(f"\n-- /proc/{pid}/cmdline --\n")
+                try:
+                    with open(f"/proc/{pid}/cmdline", "rb") as cf:
+                        fh.write(cf.read().replace(b"\x00", b" ").decode(
+                            errors="replace"))
+                except Exception:
+                    pass
+                fh.write(f"\n-- exe / cwd --\n")
+                fh.write(run(["ls", "-l", f"/proc/{pid}/exe",
+                              f"/proc/{pid}/cwd"]))
+            if user:
+                fh.write("\n-- recent commands (auditd exec_log) --\n")
+                fh.write(run(["ausearch", "-k", "exec_log", "-ua", user,
+                              "-ts", "recent"]))
+        os.chmod(path, 0o600)
+        return path
+    except Exception:
+        return "(evidence capture failed)"
+
+
+def block_ip(ip: str | None) -> bool:
+    if not ip or is_whitelisted(ip):
+        return False
+    run(["ufw", "insert", "1", "deny", "from", ip])
+    return True
+
+
+def kill_pid(pid: int) -> None:
+    run(["kill", "-KILL", str(pid)])
+
+
+def terminate_session(session_id: str) -> None:
+    run(["loginctl", "terminate-session", session_id])
+
+
+def respond(tag: str, message: str, *, pid: int | None = None,
+            user: str | None = None, ip: str | None = None,
+            session_id: str | None = None, extra: str = "") -> None:
+    """
+    Unified alert/response path for every detector.
+    alert mode  -> capture evidence + notify.
+    active mode -> capture evidence FIRST, then kill/block, then notify.
+    """
+    if is_whitelisted(ip):
+        return
+    evidence = capture_evidence(tag, pid=pid, user=user, ip=ip, extra=extra)
+    lines = [f"SENTINEL [{HOST}] {tag}", message, f"Evidence: {evidence}"]
+
+    if MODE == "active":
+        actions = []
+        # Evidence is already on disk at this point.
+        if session_id:
+            terminate_session(session_id)
+            actions.append(f"session {session_id} terminated")
+        if pid:
+            kill_pid(pid)
+            actions.append(f"pid {pid} killed")
+        if block_ip(ip):
+            actions.append(f"{ip} blocked (ufw)")
+        lines.append("ACTION: " + ("; ".join(actions) if actions
+                                    else "no reversible target, alert only"))
+    else:
+        lines.append("Mode: alert-only. No action taken.")
+
+    notify("\n".join(lines))

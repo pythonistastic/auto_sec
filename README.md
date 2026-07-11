@@ -9,10 +9,12 @@ Takes a fresh Ubuntu/Debian server from zero to:
 - SSH locked to keys-only for a single deploy user, root login disabled
 - Default-deny firewall with fail2ban, optional *invisible* SSH port
   (Single Packet Authorization via fwknop — the port doesn't exist
-  until you knock)
-- A behavioral **login watcher**: every interactive SSH session must run
-  a secret command within a time window, or it's treated as a breach —
-  alert, or kill the session and block the IP
+  until you knock), and optional **egress lockdown** (default-deny
+  outbound) that kills most reverse-shell callbacks
+- A three-detector **breach detection suite** (see below): SSH login
+  tripwire, reverse-shell scanner, and recon-burst detector — all
+  sharing one alert/response pipeline that captures forensic evidence
+  *before* it ever kills anything
 - auditd tripwires on identity files, SSH trust, cron and binaries,
   plus a ransomware early-warning canary (mass file-change detection)
 - Nightly client-side-encrypted backups (age) to a Backblaze B2 bucket
@@ -57,7 +59,7 @@ self-corrects drift; add it to cron for continuous enforcement.
 | 06 | database | Protective | Localhost only, least privilege |
 | 07 | backups | Recovery | Encrypted nightly backups to no-delete B2 bucket |
 | 08 | detection | Detective | auditd tripwires, ransomware canary, Telegram alerts |
-| 09 | watcher | Detective/Reactive | Behavioral login pattern watcher |
+| 09 | watcher | Detective/Reactive | Breach detection suite (login tripwire + reverse-shell scanner + recon-burst detector) |
 | 10 | report | Deliverable | Generated security report |
 
 Partial runs with tags:
@@ -67,27 +69,67 @@ ansible-playbook -i inventory site.yml -l myserver --tags backups
 ansible-playbook -i inventory site.yml -l myserver --tags "firewall,detection"
 ```
 
-## The watcher, honestly
+## The detection suite, honestly
 
-The watcher is a **tripwire second factor**, not machine-learning
-anomaly detection. Legitimate humans know the secret: type a command
-containing the pattern within N seconds of logging in. An attacker with
-a stolen SSH key doesn't know the ritual, goes straight for the data,
-and trips the wire.
+Role 09 installs three small detectors that share one alert/response
+pipeline (`sentinel_lib.py`). None is machine learning; each is a cheap,
+explainable heuristic aimed at a single-purpose server with 1–5 admins.
+They are **detection layers, not authentication** — they assume an
+attacker may already be inside and try to catch the next move. Run the
+whole suite in `alert` mode for at least a week before switching
+`watcher_mode` to `active`, and keep a break-glass IP configured.
 
-Design notes:
+**1. SSH login pattern watcher** (`watcher.py`) — a tripwire second
+factor. A valid human runs a command containing a secret pattern within
+N seconds of an interactive SSH login; an attacker with a stolen key
+doesn't know the ritual and trips the wire. Sessions are tracked
+individually via systemd-logind / audit session IDs, so a valid user
+logged in at the same time can't vouch for an intruder on the same
+account, and enforcement kills only the offending session.
+Non-interactive sessions (scp/rsync/Ansible/git) are skipped.
+*Limitation:* it only sees SSH logins — which is why the next two exist.
 
-- Sessions are tracked individually (systemd-logind / audit session
-  IDs), so a valid user logged in at the same time cannot vouch for an
-  intruder on the same account — and enforcement kills only the
-  offending session.
-- Non-interactive sessions (`scp`, `rsync`, Ansible itself, git) are
-  skipped automatically; trusted IPs/CIDRs can be whitelisted
-  (`watcher_whitelist_ips`).
-- **Run in `alert` mode for at least a week** before switching to
-  `active`, and keep your break-glass IP configured. Rotate the
-  pattern quarterly. Treat it as one detection layer among several,
-  not a guarantee.
+**2. Reverse-shell scanner** (`revshell_scan.py`) — watches the process
+table, not the auth log, so it sees intrusions that never log in. It
+flags (a) an interactive shell whose stdin/stdout is a network socket —
+the classic `bash -i >& /dev/tcp/...` reverse shell, on *any* port
+including 443 — and (b) a shell owned by the app/service user or
+parented by a service process (node/nginx/php-fpm/...), meaning your app
+was made to spawn a shell. *Tuning:* apps that legitimately shell out
+(npm scripts, `child_process`) can be exempted via
+`revshell_allowed_parent_cmdlines`; signal (a) is safe everywhere.
+
+**3. Recon-burst detector** (`recon_watch.py`) — vector-independent.
+It watches auditd's record of what everyone runs and fires when one
+session runs a burst of enumeration commands (`whoami`, `id`,
+`cat /etc/passwd`, `find … -perm`, `sudo -l`, reading `.ssh`/`.env`/`.aws`
+…) within a short window. This is the universal first move after *any*
+breach — "looking around for the data" — so it catches stolen-key
+sessions, reverse shells, and insiders alike.
+
+**Forensics-first response.** In `active` mode the pipeline snapshots
+evidence — full process tree, open sockets, the offending process's
+file descriptors, and recent audited commands — into
+`/var/log/sentinel/incident-*.txt` **before** it terminates a session or
+blocks an IP. Automated response never destroys the only record of the
+intrusion, and you get an artifact to investigate rather than just a
+dead connection.
+
+**What this is not.** It won't stop a patient attacker who moves slowly,
+avoids shells, and tunnels C2 over 443 — no host heuristic will. It is a
+layered tripwire that raises the cost and noise of the common cases
+(stolen keys, off-the-shelf reverse shells, smash-and-grab recon). PRs
+with additional detectors and evasion notes are very welcome.
+
+### Egress lockdown
+
+`egress_lockdown: true` flips the outbound firewall to default-deny,
+permitting only DNS, NTP, HTTP and HTTPS (plus `egress_allow_extra`).
+That alone refuses the arbitrary-high-port callbacks most reverse shells
+use. It is **off by default** because it can break apps that reach
+external services on non-standard ports, and because C2 tunnelled over
+443 still gets out — that case is what detector #2 is for. Turn it on
+once you know your app's outbound needs.
 
 ## Paranoia levels
 

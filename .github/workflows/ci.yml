@@ -25,6 +25,22 @@ jobs:
       - name: Lint
         run: ansible-lint
 
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile-check detector templates
+        run: |
+          mkdir -p /tmp/pyc
+          for f in roles/09-watcher/templates/*.py.j2; do
+            out="/tmp/pyc/$(basename "${f%.j2}")"
+            sed 's/{{[^}]*}}/PLACEHOLDER/g' "$f" > "$out"
+          done
+          python -m py_compile /tmp/pyc/*.py
+
   shell:
     runs-on: ubuntu-latest
     steps:

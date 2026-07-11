@@ -1,5 +1,7 @@
 # Managed by Ansible. Permissions 0600, root only.
 # Rotate the pattern quarterly. Never commit real values to git.
+
+# [watcher] holds values shared by ALL detectors plus the SSH pattern.
 [watcher]
 pattern = {{ watcher_pattern }}
 window_seconds = {{ watcher_window_seconds }}
@@ -7,9 +9,32 @@ mode = {{ watcher_mode }}
 telegram_bot_token = {{ telegram_bot_token }}
 telegram_chat_id = {{ telegram_chat_id }}
 host_label = {{ inventory_hostname }}
-# Comma-separated IPs or CIDRs that never trigger the watcher
-# (your office, your CI runner, your ops workstation).
+# Comma-separated IPs or CIDRs that never trigger any detector
+# (your office, CI runner, ops workstation).
 whitelist_ips = {{ ([office_static_ip] + (watcher_whitelist_ips | default([]))) | select | join(",") }}
-# Non-interactive sessions (scp, rsync, ansible, git) have no TTY and
+# Non-interactive SSH sessions (scp, rsync, ansible, git) have no TTY and
 # never type the pattern. Keep true unless you know what you are doing.
 skip_non_interactive = {{ watcher_skip_non_interactive | default(true) | lower }}
+
+# Reverse-shell / unexpected-shell scanner (watches the process table).
+[revshell]
+enabled = {{ revshell_enabled | default(true) | lower }}
+scan_interval = {{ revshell_scan_interval | default(5) }}
+shell_names = {{ revshell_shell_names | default('bash,sh,dash,zsh,ksh,ash,busybox') }}
+netcat_names = {{ revshell_netcat_names | default('nc,ncat,netcat,socat') }}
+app_users = {{ revshell_app_users | default('app,www-data') }}
+service_parents = {{ revshell_service_parents | default('node,nginx,apache2,php-fpm,python,python3,gunicorn,uwsgi,pm2') }}
+# cmdline substrings allowed to spawn shells (your deploy wrapper etc).
+allowed_parent_cmdlines = {{ revshell_allowed_parent_cmdlines | default('') }}
+
+# Recon-burst detector (watches auditd exec_log for enumeration bursts).
+[recon]
+enabled = {{ recon_enabled | default(true) | lower }}
+poll_interval = {{ recon_poll_interval | default(10) }}
+window_seconds = {{ recon_window_seconds | default(45) }}
+threshold = {{ recon_threshold | default(4) }}
+# Leave recon_patterns unset to use the built-in list. To override,
+# set recon_patterns in host_vars as a comma-separated list of regexes.
+{% if recon_patterns is defined %}
+recon_patterns = {{ recon_patterns }}
+{% endif %}

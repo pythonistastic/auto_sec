@@ -35,6 +35,22 @@ watcher_whitelist_ips: []
 # Sessions without a TTY (scp, rsync, ansible, git) are skipped.
 watcher_skip_non_interactive: true
 
+# Detection suite (all default to alert mode via watcher_mode)
+# Reverse-shell / unexpected-shell scanner (watches the process table).
+revshell_enabled: true
+# Recon-burst detector (watches auditd for enumeration bursts).
+recon_enabled: true
+
+# Egress lockdown: default-deny OUTBOUND traffic, allowing only
+# DNS/NTP/HTTP/HTTPS plus egress_allow_extra. Stops arbitrary-high-port
+# reverse shells. Off by default because it can break apps that call
+# external services on non-standard ports. 443-tunnelled C2 still needs
+# the detection layers.
+egress_lockdown: false
+# Extra outbound ports to permit when egress_lockdown is on, e.g.
+#   - { port: 587, proto: tcp }   # SMTP submission
+egress_allow_extra: []
+
 # Let's Encrypt registration email for certbot
 letsencrypt_email: "CHANGE_ME@example.com"
 

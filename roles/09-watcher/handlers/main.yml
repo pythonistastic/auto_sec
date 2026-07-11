@@ -8,3 +8,15 @@
     name: login-watcher
     state: restarted
   failed_when: false
+
+- name: restart revshell scanner
+  ansible.builtin.service:
+    name: revshell-scan
+    state: restarted
+  failed_when: false
+
+- name: restart recon watcher
+  ansible.builtin.service:
+    name: recon-watch
+    state: restarted
+  failed_when: false

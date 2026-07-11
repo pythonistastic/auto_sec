@@ -1,54 +1,106 @@
 ---
-# Behavioral login watcher. Every new SSH session must run the secret
-# pattern command within the time window, otherwise alert (or in
-# active mode, kill the session and block the source IP).
+# Detection suite (three cooperating detectors sharing one alert/response
+# pipeline). All default to alert mode; active mode captures forensic
+# evidence BEFORE killing/blocking anything.
+#
+#   watcher.py        SSH behavioral login pattern (tripwire second factor)
+#   revshell_scan.py  reverse shells + service/app users spawning shells
+#   recon_watch.py    bursts of enumeration commands, any entry vector
 
-- name: Ensure watcher dependencies (rsyslog writes auth.log on minimal images)
+- name: Ensure detection dependencies
   ansible.builtin.apt:
-    name: [rsyslog, python3]
+    name: [rsyslog, python3, iproute2, auditd]
     state: present
 
-- name: Create watcher directory
+- name: Create sentinel directory
   ansible.builtin.file:
     path: /opt/watcher
     state: directory
     mode: "0700"
 
-- name: Install watcher config (pattern lives here, 0600, rotate quarterly)
+- name: Create evidence directory (incident snapshots)
+  ansible.builtin.file:
+    path: /var/log/sentinel
+    state: directory
+    mode: "0700"
+
+- name: Install sentinel config (secrets live here, 0600, rotate quarterly)
   ansible.builtin.template:
     src: watcher.conf.j2
     dest: /opt/watcher/watcher.conf
     mode: "0600"
-  notify: restart watcher
+  notify:
+    - restart watcher
+    - restart revshell scanner
+    - restart recon watcher
 
-- name: Install watcher service script
+- name: Install shared library
   ansible.builtin.template:
-    src: watcher.py.j2
-    dest: /opt/watcher/watcher.py
+    src: sentinel_lib.py.j2
+    dest: /opt/watcher/sentinel_lib.py
     mode: "0700"
-  notify: restart watcher
+  notify:
+    - restart watcher
+    - restart revshell scanner
+    - restart recon watcher
 
-- name: Systemd unit for watcher
+- name: Install detector scripts
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/opt/watcher/{{ item }}"
+    mode: "0700"
+  loop:
+    - watcher.py
+    - revshell_scan.py
+    - recon_watch.py
+  notify:
+    - restart watcher
+    - restart revshell scanner
+    - restart recon watcher
+
+- name: Systemd units for the detectors
   ansible.builtin.copy:
-    dest: /etc/systemd/system/login-watcher.service
+    dest: "/etc/systemd/system/{{ item.unit }}"
     mode: "0644"
     content: |
       [Unit]
-      Description=Behavioral login pattern watcher
-      After=auditd.service rsyslog.service
+      Description={{ item.desc }}
+      After=auditd.service rsyslog.service network.target
       Wants=auditd.service
 
       [Service]
-      ExecStart=/usr/bin/python3 /opt/watcher/watcher.py
+      ExecStart=/usr/bin/python3 /opt/watcher/{{ item.script }}
       Restart=always
       RestartSec=5
 
       [Install]
       WantedBy=multi-user.target
+  loop:
+    - { unit: "login-watcher.service", script: "watcher.py",
+        desc: "SSH behavioral login pattern watcher" }
+    - { unit: "revshell-scan.service", script: "revshell_scan.py",
+        desc: "Reverse-shell and unexpected-shell scanner" }
+    - { unit: "recon-watch.service", script: "recon_watch.py",
+        desc: "Recon-burst detector" }
   notify: reload systemd watcher
 
-- name: Enable watcher
+- name: Flush handlers so units are registered before enabling
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable SSH login watcher
   ansible.builtin.service:
     name: login-watcher
     state: started
     enabled: true
+
+- name: Enable reverse-shell scanner
+  ansible.builtin.service:
+    name: revshell-scan
+    state: "{{ 'started' if (revshell_enabled | default(true)) else 'stopped' }}"
+    enabled: "{{ revshell_enabled | default(true) }}"
+
+- name: Enable recon-burst detector
+  ansible.builtin.service:
+    name: recon-watch
+    state: "{{ 'started' if (recon_enabled | default(true)) else 'stopped' }}"
+    enabled: "{{ recon_enabled | default(true) }}"

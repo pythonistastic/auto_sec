@@ -55,10 +55,21 @@
   SSH trust changes, scheduled task changes, binary tampering
 - Ransomware early warning: mass file-change detection with immediate
   alerting
-- Behavioral login verification: sessions are monitored for expected
-  usage patterns; anomalous sessions trigger
-  {% if watcher_mode == "active" %}automatic session termination and
-  source blocking{% else %}immediate operator alerts{% endif %}
+- Breach detection suite, three independent detectors:
+  - Behavioral login verification (interactive SSH sessions must match
+    an expected usage pattern)
+  - Reverse-shell detection (shells attached to a network socket, or the
+    application account spawning a shell)
+  - Recon-burst detection (a session running a rapid series of system
+    enumeration commands)
+- Response mode: {% if watcher_mode == "active" %}automatic — offending
+  session terminated and source blocked, after forensic evidence is
+  captured{% else %}alert-only — immediate operator notification with
+  captured evidence{% endif %}
+{% if egress_lockdown | default(false) %}
+- Egress lockdown active: outbound traffic default-denied except
+  required service ports, refusing reverse-shell callbacks
+{% endif %}
 - All alerts delivered to the operations team in real time
 
 ## 5. Firewall state at time of report

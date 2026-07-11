@@ -209,8 +209,24 @@ if confirm "Keep a break-glass IP allowed on the SSH port (recommended)?"; then
   OFFICE_IP="$REPLY"
 fi
 
+# ------------------------------------------------------------ egress lockdown
+say "Egress lockdown (outbound firewall)"
+note "Default-deny OUTBOUND traffic, allowing only DNS/NTP/HTTP/HTTPS."
+note "Blocks the most common reverse shells (callbacks to random high"
+note "ports). Can break apps that call external services on odd ports;"
+note "you can add allowed ports later in host_vars (egress_allow_extra)."
+EGRESS="false"
+confirm "Enable egress lockdown?" n && EGRESS="true"
+
 # ----------------------------------------------------------------- watcher
-say "Behavioral login watcher"
+say "Detection suite"
+note "Three detectors run automatically (all in the mode you pick below):"
+note "  - reverse-shell scanner (catches shells with a network socket, and"
+note "    the app/service user spawning a shell - i.e. a web exploit)"
+note "  - recon-burst detector (fires when a session runs many enumeration"
+note "    commands fast - 'looking around', any entry vector)"
+note "  - SSH login pattern watcher, configured here:"
+echo
 note "Every interactive SSH login must run a secret command within a time"
 note "window, or it is treated as a breach. Pick something natural you"
 note "will actually type, and keep it secret (it is your duress signal)."
@@ -237,6 +253,7 @@ say "Writing ${HOSTVARS}"
   echo
   echo "paranoia_level: \"${PARANOIA}\""
   echo "office_static_ip: \"${OFFICE_IP}\""
+  echo "egress_lockdown: ${EGRESS}"
   echo
   echo "deploy_ssh_public_key: \"${DEPLOY_PUBKEY}\""
   echo

@@ -32,6 +32,12 @@
 
       ## Record all executed commands per session (feeds the watcher)
       -a always,exit -F arch=b64 -S execve -k exec_log
+
+      ## Shell spawns get their own key for fast forensic lookup
+      ## (ausearch -k shell_exec) when the reverse-shell scanner fires
+      -w /bin/bash -p x -k shell_exec
+      -w /bin/sh -p x -k shell_exec
+      -w /bin/dash -p x -k shell_exec
   notify: restart auditd
 
 - name: Ensure detect dir

