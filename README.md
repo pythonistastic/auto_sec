@@ -121,6 +121,23 @@ layered tripwire that raises the cost and noise of the common cases
 (stolen keys, off-the-shelf reverse shells, smash-and-grab recon). PRs
 with additional detectors and evasion notes are very welcome.
 
+### Validate the detectors actually fire
+
+Don't take the suite on faith. On a **throwaway/staging** server that has
+been hardened by the playbook, run:
+
+```bash
+sudo tests/redteam.sh
+```
+
+It safely reproduces each attack — a loopback-only reverse shell, the app
+user spawning a shell, and a burst of enumeration commands — then checks
+that a matching incident file appeared in `/var/log/sentinel` and that
+your Telegram lit up. Run it in `alert` mode (it refuses `active` mode
+unless you set `REDTEAM_FORCE=1`, since active mode would kill the test
+processes). This is also the fastest way to confirm a new detector works
+before sending a PR.
+
 ### Egress lockdown
 
 `egress_lockdown: true` flips the outbound firewall to default-deny,

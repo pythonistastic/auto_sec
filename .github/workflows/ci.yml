@@ -48,4 +48,4 @@ jobs:
       - name: ShellCheck scripts
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck scripts/*.sh
+          shellcheck scripts/*.sh tests/*.sh

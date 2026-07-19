@@ -44,6 +44,10 @@ python3 -m py_compile roles/09-watcher/templates/*.py.j2   # after stripping {{ 
 
 CI runs the first four automatically on every push and pull request.
 
+To validate a detector end-to-end on real hardware, run
+`sudo tests/redteam.sh` on a throwaway server the playbook has hardened.
+If you add a detector, add a matching trigger + assertion there.
+
 ## Security disclosure
 
 Found a vulnerability in the playbook itself (something that would
