@@ -76,8 +76,6 @@ SSH_KEY_FILE=""
 if [ "$MODE" = "remote" ]; then
   ask_required "Server public IP address"
   SERVER_IP="$REPLY"
-  ask "Path to YOUR private SSH key for this server" "$HOME/.ssh/id_ed25519"
-  SSH_KEY_FILE="$REPLY"
 fi
 
 # ------------------------------------------------------------- identity
@@ -91,20 +89,75 @@ LE_EMAIL="$REPLY"
 
 # ---------------------------------------------------------------- deploy key
 say "SSH access"
-note "The playbook creates a 'deploy' user and installs ONE public key"
-note "for it (password logins and root logins are disabled)."
+note "New to SSH keys? Here is all you need to know:"
+note "  A key comes in a PAIR - a PRIVATE key that stays secret on your"
+note "  computer, and a PUBLIC key that is safe to share and gets installed"
+note "  on the server. You log in by proving you hold the private key. This"
+note "  is far safer than a password, so the playbook turns passwords OFF."
+note "The playbook creates a 'deploy' user and installs your PUBLIC key."
+echo
+
+validate_pubkey() {  # $1 = key string
+  case "$1" in
+    ssh-ed25519\ *|ssh-rsa\ *|ecdsa-*\ *|sk-ssh-*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 DEPLOY_PUBKEY=""
 if [ "$MODE" = "local" ]; then
-  note "Paste the public key of the machine you will SSH in FROM"
-  note "(your laptop), e.g. the contents of ~/.ssh/id_ed25519.pub there."
-  ask_required "Public key"
-  DEPLOY_PUBKEY="$REPLY"
+  # Wizard runs ON the server; the key must be made on the user's OWN
+  # computer (the one they will connect FROM), so we can only guide them.
+  note "You will connect FROM another computer (your laptop). Create the"
+  note "key THERE, not on this server. On your laptop, open a terminal:"
+  note ""
+  note "  ssh-keygen -t ed25519 -C \"${SERVER}\""
+  note "     (press Enter to accept the defaults; a passphrase is optional)"
+  note ""
+  note "Then print the PUBLIC half and copy the whole line:"
+  note "  macOS/Linux:  cat ~/.ssh/id_ed25519.pub"
+  note "  Windows:      type \$env:USERPROFILE\\.ssh\\id_ed25519.pub"
+  note ""
+  while :; do
+    ask_required "Paste the public key (starts with 'ssh-ed25519')"
+    if validate_pubkey "$REPLY"; then DEPLOY_PUBKEY="$REPLY"; break; fi
+    warn "That does not look like a public key. It should start with"
+    warn "'ssh-ed25519' (or 'ssh-rsa') and be a single line."
+  done
 else
-  DEFAULT_PUB="${SSH_KEY_FILE}.pub"
-  ask "Path to the PUBLIC key to install for the deploy user" "$DEFAULT_PUB"
-  PUB_PATH="${REPLY/#\~/$HOME}"
-  [ -f "$PUB_PATH" ] || die "File not found: $PUB_PATH"
+  # Remote mode: the wizard runs on the machine the user connects FROM,
+  # so we can find or CREATE the key right here.
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  EXISTING=()
+  for k in "$HOME"/.ssh/*.pub; do [ -e "$k" ] && EXISTING+=("$k"); done
+
+  if [ "${#EXISTING[@]}" -gt 0 ]; then
+    note "Found existing SSH key(s) on this machine:"
+    for k in "${EXISTING[@]}"; do note "  ${k%.pub}"; done
+    ask "Path to the PRIVATE key to use for this server" "${EXISTING[0]%.pub}"
+    SSH_KEY_FILE="${REPLY/#\~/$HOME}"
+  else
+    note "No SSH key found on this machine yet."
+    if confirm "Generate a new one now (recommended)?"; then
+      SSH_KEY_FILE="$HOME/.ssh/${SERVER}_key"
+      ssh-keygen -t ed25519 -N "" -C "${SERVER}" -f "$SSH_KEY_FILE" >/dev/null
+      say "Created your key pair:"
+      note "  private: ${SSH_KEY_FILE}   (keep secret, never share/commit)"
+      note "  public:  ${SSH_KEY_FILE}.pub (this is what goes on the server)"
+    else
+      ask_required "OK - path to an existing PRIVATE key"
+      SSH_KEY_FILE="${REPLY/#\~/$HOME}"
+    fi
+  fi
+
+  # Make sure we have the matching public key (derive it if missing).
+  PUB_PATH="${SSH_KEY_FILE}.pub"
+  if [ ! -f "$PUB_PATH" ] && [ -f "$SSH_KEY_FILE" ]; then
+    ssh-keygen -y -f "$SSH_KEY_FILE" > "$PUB_PATH" 2>/dev/null || true
+  fi
+  [ -f "$PUB_PATH" ] || die "Could not find or derive the public key ${PUB_PATH}."
   DEPLOY_PUBKEY="$(cat "$PUB_PATH")"
+  validate_pubkey "$DEPLOY_PUBKEY" || die "\"$PUB_PATH\" does not look like a valid public key."
 fi
 
 # --------------------------------------------------------------------- app
@@ -332,10 +385,17 @@ if [ "$MODE" = "local" ]; then
   note "  ${RUN_CMD}"
 else
   RUN_CMD="ansible-playbook -i inventory site.yml -l ${SERVER} -u root"
-  note "First run on a fresh VPS (as root):"
+  note "First run on a fresh VPS (connects as root):"
   note "  ${RUN_CMD}"
-  note "Subsequent runs (deploy user):"
+  note "If your provider gave you a ROOT PASSWORD (not a key), add"
+  note "--ask-pass so Ansible can log in the first time (needs 'sshpass'):"
+  note "  ${RUN_CMD} --ask-pass"
+  note ""
+  note "Subsequent runs use the deploy user + your key automatically:"
   note "  ansible-playbook -i inventory site.yml -l ${SERVER}"
+  note ""
+  note "After hardening, passwords and root login are OFF. Connect with:"
+  note "  ssh -i ${SSH_KEY_FILE} deploy@${SERVER_IP}"
 fi
 echo
 note "Re-running is always safe: the playbook is idempotent and"

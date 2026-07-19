@@ -45,6 +45,16 @@ interactive wizard that:
 Re-running the playbook is always safe. It's idempotent and
 self-corrects drift; add it to cron for continuous enforcement.
 
+**New to SSH keys?** You don't need to prepare anything first. An SSH key
+is a pair — a **private** half that stays secret on your computer and a
+**public** half that's safe to put on the server. When you run the wizard
+from your workstation, it looks for an existing key and, if you don't
+have one, offers to create it for you (and explains what it made). If
+you're running the wizard *on the server itself*, it prints the exact
+`ssh-keygen` command to run on your own laptop and asks you to paste the
+public half. Either way it walks you through it — no prior knowledge
+assumed.
+
 **Supported targets:** Ubuntu 22.04/24.04, Debian 12.
 
 ## Connecting to the server after hardening
