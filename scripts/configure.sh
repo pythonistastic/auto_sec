@@ -22,6 +22,19 @@ note() { printf '    %s\n' "$*"; }
 warn() { printf '\033[1;33mWARNING:\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
+banner() {
+  printf '\033[1;32m'
+  cat <<'ART'
+ █████╗ ██╗   ██╗████████╗ ██████╗         ███████╗███████╗ ██████╗
+██╔══██╗██║   ██║╚══██╔══╝██╔═══██╗        ██╔════╝██╔════╝██╔════╝
+███████║██║   ██║   ██║   ██║   ██║        ███████╗█████╗  ██║
+██╔══██║██║   ██║   ██║   ██║   ██║        ╚════██║██╔══╝  ██║
+██║  ██║╚██████╔╝   ██║   ╚██████╔╝███████╗███████║███████╗╚██████╗
+╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝ ╚══════╝╚══════╝╚══════╝ ╚═════╝
+ART
+  printf '\033[0m\033[2m   one-command server hardening + breach detection\033[0m\n'
+}
+
 ask() { # ask "Prompt" "default" -> REPLY
   local prompt="$1" default="${2:-}"
   if [ -n "$default" ]; then
@@ -52,10 +65,10 @@ command -v openssl >/dev/null || die "openssl is required (run bootstrap.sh firs
 command -v age-keygen >/dev/null || die "age is required (run bootstrap.sh first)."
 
 echo
-echo "===================================================================="
-echo " secure-deploy configuration wizard"
-echo " Answers are written to host_vars/<server>.yml (gitignored)."
-echo "===================================================================="
+banner
+echo
+say "Configuration wizard"
+note "Answers are written to host_vars/<server>.yml (gitignored)."
 echo
 
 # ------------------------------------------------------------------ mode
