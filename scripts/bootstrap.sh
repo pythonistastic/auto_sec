@@ -4,14 +4,14 @@
 # On your workstation (managing a remote server) or directly on a fresh
 # Ubuntu/Debian server (self-host mode):
 #
-#   git clone https://github.com/YOURUSER/secure-deploy.git
-#   cd secure-deploy && ./scripts/bootstrap.sh
+#   git clone https://github.com/pythonistastic/auto_sec.git
+#   cd auto_sec && ./scripts/bootstrap.sh
 #
 # Installs Ansible + required tools, pulls the Galaxy collections,
 # then hands off to the interactive configuration wizard.
 set -euo pipefail
 
-REPO_URL="${SECURE_DEPLOY_REPO:-https://github.com/YOURUSER/secure-deploy.git}"
+REPO_URL="${SECURE_DEPLOY_REPO:-https://github.com/pythonistastic/auto_sec.git}"
 
 say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARNING:\033[0m %s\n' "$*"; }
@@ -23,7 +23,7 @@ if [ -f "${SCRIPT_DIR}/../site.yml" ]; then
   REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 else
   # Running standalone (e.g. curl | bash): clone the repo first.
-  REPO_DIR="${HOME}/secure-deploy"
+  REPO_DIR="${HOME}/auto_sec"
   if [ ! -d "${REPO_DIR}" ]; then
     say "Cloning ${REPO_URL} into ${REPO_DIR}"
     git clone "${REPO_URL}" "${REPO_DIR}" 2>/dev/null \

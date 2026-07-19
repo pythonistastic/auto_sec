@@ -1,4 +1,4 @@
-# secure-deploy
+# auto_sec
 
 One-command hardening for a Linux VPS: preventive lockdown, behavioral
 breach detection, and ransomware-proof encrypted backups — as an
@@ -27,8 +27,8 @@ On your workstation (managing a remote server) **or** directly on the
 server you want to harden:
 
 ```bash
-git clone https://github.com/YOURUSER/secure-deploy.git
-cd secure-deploy
+git clone https://github.com/pythonistastic/auto_sec.git
+cd auto_sec
 ./scripts/bootstrap.sh
 ```
 
