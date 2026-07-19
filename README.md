@@ -11,10 +11,10 @@ Takes a fresh Ubuntu/Debian server from zero to:
   (Single Packet Authorization via fwknop — the port doesn't exist
   until you knock), and optional **egress lockdown** (default-deny
   outbound) that kills most reverse-shell callbacks
-- A three-detector **breach detection suite** (see below): SSH login
-  tripwire, reverse-shell scanner, and recon-burst detector — all
-  sharing one alert/response pipeline that captures forensic evidence
-  *before* it ever kills anything
+- A **breach detection suite** (see below): a reverse-shell scanner and
+  a recon-burst detector on by default (plus an experimental SSH login
+  tripwire), sharing one alert/response pipeline that captures forensic
+  evidence *before* it ever kills anything
 - auditd tripwires on identity files, SSH trust, cron and binaries,
   plus a ransomware early-warning canary (mass file-change detection)
 - Nightly client-side-encrypted backups (age) to a Backblaze B2 bucket
@@ -47,6 +47,63 @@ self-corrects drift; add it to cron for continuous enforcement.
 
 **Supported targets:** Ubuntu 22.04/24.04, Debian 12.
 
+## Connecting to the server after hardening
+
+Role 02 disables password authentication **and** root login, and
+restricts SSH to the single `deploy` user. After the first run you can
+no longer `ssh root@host` with a password — connect as `deploy` with the
+private key whose public half you installed:
+
+```bash
+ssh -i /path/to/your_private_key deploy@your.server.ip
+# deploy has passwordless sudo:
+sudo whoami   # -> root
+```
+
+The private key stays on your machine; the server only ever holds the
+**public** key in `/home/deploy/.ssh/authorized_keys`. If you used the
+wizard, the connection details are written to `inventory/<server>.yml`,
+so later playbook runs are just:
+
+```bash
+ansible-playbook -i inventory site.yml -l <server>
+```
+
+**Don't lock yourself out.** Before the first run, make sure the public
+key you install matches a private key you actually hold. Keep a
+break-glass path until you've confirmed access:
+
+- set `office_static_ip` so your IP keeps direct SSH access, and/or
+- keep your provider's console/VNC (e.g. Contabo) reachable.
+
+With `paranoia_level: high`, the SSH port is also invisible until you
+send a valid fwknop knock — see
+[roles/04-fwknop/CLIENT-SIDE.md](roles/04-fwknop/CLIENT-SIDE.md):
+
+```bash
+fwknop -n <server> && ssh -i /path/to/key deploy@your.server.ip
+```
+
+## Tested on real hardware
+
+The detection suite isn't just linted — it's been validated end-to-end
+on a throwaway **Ubuntu 22.04** VPS. A full hardening run completed with
+no lockout, and `tests/redteam.sh` fired every default detector against
+real attacks:
+
+| Detector | Attack simulated | Result |
+|----------|------------------|--------|
+| reverse-shell | `bash -i` wired to a socket (loopback) | ✅ caught, evidence captured |
+| service-shell | the `app` user spawning a shell | ✅ caught |
+| recon-burst | a burst of enumeration commands | ✅ caught |
+
+That testing also shook out real bugs that no linter would find — an
+`ausearch` hang that starved a detector, auditd rules not loading on a
+`systemctl restart`, and a reverse-shell false positive on journald's
+socket — all fixed. Run `sudo tests/redteam.sh` on your own staging box
+to reproduce it. (The SSH login tripwire is off by default because live
+testing showed it false-positives on automation; see below.)
+
 ## The layers
 
 | # | Role | Type | Purpose |
@@ -59,7 +116,7 @@ self-corrects drift; add it to cron for continuous enforcement.
 | 06 | database | Protective | Localhost only, least privilege |
 | 07 | backups | Recovery | Encrypted nightly backups to no-delete B2 bucket |
 | 08 | detection | Detective | auditd tripwires, ransomware canary, Telegram alerts |
-| 09 | watcher | Detective/Reactive | Breach detection suite (login tripwire + reverse-shell scanner + recon-burst detector) |
+| 09 | watcher | Detective/Reactive | Breach detection suite: reverse-shell scanner + recon-burst detector (+ experimental login tripwire) |
 | 10 | report | Deliverable | Generated security report |
 
 Partial runs with tags:
