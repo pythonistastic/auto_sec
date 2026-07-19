@@ -21,6 +21,43 @@ Takes a fresh Ubuntu/Debian server from zero to:
   whose key **cannot delete** — malware on the box can't destroy history
 - Telegram alerts for everything, and a generated security report
 
+## Before you start (beginners)
+
+You run this from a **control machine** — that can be your own computer,
+or the server itself. Pick whichever is simpler for you:
+
+### Option A — run it *on the server* (easiest, nothing to install locally)
+
+You only need an SSH client to reach the server, which is already built
+into Windows 10/11, macOS, and Linux. SSH into your fresh VPS as root
+(your provider emails you the IP and root password), then run the
+[Quick start](#quick-start) commands right there:
+
+```bash
+ssh root@YOUR.SERVER.IP        # enter the root password when asked
+```
+
+The wizard runs in "local" mode and prints the one `ssh-keygen` command
+to run on your laptop for future logins. This is the least-friction path
+for a first-timer.
+
+### Option B — run it *from your own computer* (to manage servers remotely)
+
+This needs **git** and **Ansible**, which only run in a Unix-like
+environment:
+
+- **Windows:** install WSL (Windows Subsystem for Linux). In an
+  Administrator PowerShell run `wsl --install`, reboot, and let it open
+  Ubuntu. Do everything below *inside that Ubuntu window*.
+- **macOS:** install [Homebrew](https://brew.sh), then `brew install git`.
+- **Linux:** git is usually already present.
+
+`./scripts/bootstrap.sh` installs Ansible for you on the first run, so
+you don't have to install it by hand.
+
+You do **not** need to prepare an SSH key in advance — the wizard makes
+one for you if you don't have it (see "New to SSH keys?" below).
+
 ## Quick start
 
 On your workstation (managing a remote server) **or** directly on the
