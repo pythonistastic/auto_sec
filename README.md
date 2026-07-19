@@ -31,6 +31,15 @@ Takes a fresh Ubuntu/Debian server from zero to:
   whose key **cannot delete** — malware on the box can't destroy history
 - Telegram alerts for everything, and a generated security report
 
+> ⚠️ **Early-stage project — no guarantees.** auto_sec raises the bar; it
+> does **not** make a server unhackable and does not promise "full
+> security." Security is a moving target and this project is young. It is
+> not a substitute for understanding your own threat model, keeping your
+> software patched, and **doing your own research**. Read what the
+> playbook does before running it, try it on a throwaway server first,
+> and never rely on any single tool. Use at your own risk — see the
+> [no-warranty terms](LICENSE) and the [Disclaimer](#disclaimer) below.
+
 ## Before you start (beginners)
 
 You run this from a **control machine** — that can be your own computer,
@@ -320,6 +329,31 @@ scripts/configure.sh     interactive config generator
 restore-test/            monthly backup restore verification
 roles/01..10-*           the layers
 ```
+
+## Disclaimer
+
+auto_sec is **early-stage software provided as-is, with no warranty of
+any kind** (see [LICENSE](LICENSE)). It does **not** promise complete
+security and cannot make any server "unhackable."
+
+- Security is layered and always evolving. This project automates a set
+  of sensible, well-understood hardening and detection measures — it is a
+  strong starting point, **not** a finished or certified security
+  solution.
+- **Do your own research.** Understand your own threat model, read what
+  the playbook changes before you run it, and keep your OS and
+  application dependencies patched. No tool replaces that.
+- **Test first.** Always trial it on a throwaway/staging server before
+  touching anything you care about, and keep break-glass access
+  (provider console, a whitelisted IP) until you're confident.
+- The detection layers are tripwires that raise the cost of common
+  attacks; a patient, skilled attacker can still evade them. Treat alerts
+  as signals to investigate, not proof of total safety.
+- You are responsible for how you deploy and operate this on your own
+  systems.
+
+Found a weakness in the playbook itself? Please open a private security
+advisory (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## License
 
