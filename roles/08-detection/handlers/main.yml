@@ -1,8 +1,10 @@
 ---
+# `systemctl restart auditd` does NOT reliably reload rules from
+# rules.d on Debian/Ubuntu (systemd refuses to signal auditd, and rules
+# are compiled by augenrules). Load them explicitly instead.
 - name: restart auditd
-  ansible.builtin.service:
-    name: auditd
-    state: restarted
+  ansible.builtin.command: augenrules --load
+  changed_when: true
 
 - name: reload systemd
   ansible.builtin.systemd:

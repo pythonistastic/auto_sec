@@ -21,6 +21,7 @@ label, mode, whitelist); each detector also reads its own section.
 import configparser
 import ipaddress
 import os
+import re
 import subprocess
 import time
 import urllib.parse
@@ -28,6 +29,7 @@ import urllib.request
 
 CONF = "/opt/watcher/watcher.conf"
 EVIDENCE_DIR = "/var/log/sentinel"
+AUDIT_LOG = "/var/log/audit/audit.log"
 
 _cfg = configparser.ConfigParser()
 _cfg.read(CONF)
@@ -120,6 +122,61 @@ def peer_ips_for_pid(pid: int) -> list[str]:
     return peers
 
 
+# --- audit log parsing (we read the file directly; ausearch has been
+#     observed to hang on some hosts, which would silently starve the
+#     detectors, so we never shell out to it) ------------------------------
+_EVENT_RE = re.compile(r"audit\((\d+\.\d+:\d+)\)")
+
+
+def _decode_proctitle(line: str) -> str:
+    seg = line.split("proctitle=", 1)[1].lstrip()
+    if seg.startswith('"'):
+        return seg[1:].split('"', 1)[0]
+    tokens = seg.split()
+    token = tokens[0] if tokens else ""
+    if token and re.fullmatch(r"[0-9A-Fa-f]+", token):
+        try:
+            return bytes.fromhex(token).replace(b"\x00", b" ").decode(
+                errors="replace").strip()
+        except ValueError:
+            return token
+    return token
+
+
+def _field(line: str, name: str) -> str | None:
+    m = re.search(rf"\b{name}=(\S+)", line)
+    return m.group(1) if m else None
+
+
+def iter_audit_execve(lines):
+    """
+    Given an iterable of raw audit.log lines (e.g. a `tail -F` stream),
+    yield (ses, auid, command) for each completed execve event tagged
+    exec_log. Records for one event are contiguous: a SYSCALL line
+    carries ses/auid, the PROCTITLE line carries the command.
+    """
+    pending: dict[str, tuple[str | None, str | None]] = {}
+    for line in lines:
+        m = _EVENT_RE.search(line)
+        if not m:
+            continue
+        eid = m.group(1)
+        if "type=SYSCALL" in line and 'key="exec_log"' in line:
+            pending[eid] = (_field(line, "ses"), _field(line, "auid"))
+            if len(pending) > 2048:
+                pending.pop(next(iter(pending)))
+        elif "type=PROCTITLE" in line and eid in pending:
+            ses, auid = pending.pop(eid)
+            if ses and ses not in ("unset", "4294967295"):
+                yield ses, auid, _decode_proctitle(line)
+
+
+def snapshot_execve(max_lines: int = 4000):
+    """Recent execve events from the tail of the audit log (fast, bounded)."""
+    out = run(["tail", "-n", str(max_lines), AUDIT_LOG], timeout=10)
+    return list(iter_audit_execve(out.splitlines()))
+
+
 def capture_evidence(tag: str, pid: int | None = None,
                      user: str | None = None, ip: str | None = None,
                      extra: str = "") -> str:
@@ -154,10 +211,8 @@ def capture_evidence(tag: str, pid: int | None = None,
                 fh.write(f"\n-- exe / cwd --\n")
                 fh.write(run(["ls", "-l", f"/proc/{pid}/exe",
                               f"/proc/{pid}/cwd"]))
-            if user:
-                fh.write("\n-- recent commands (auditd exec_log) --\n")
-                fh.write(run(["ausearch", "-k", "exec_log", "-ua", user,
-                              "-ts", "recent"]))
+            fh.write("\n-- recent audit execve (tail of audit.log) --\n")
+            fh.write(run(["tail", "-n", "200", AUDIT_LOG], timeout=10))
         os.chmod(path, 0o600)
         return path
     except Exception:

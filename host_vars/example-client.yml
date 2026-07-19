@@ -42,9 +42,12 @@ watcher_mode: "alert"         # alert | active (applies to ALL detectors)
 # office or CI runner. office_static_ip is included automatically.
 watcher_whitelist_ips: []
 
-# Detection suite toggles (all on by default)
+# Detection suite toggles
 revshell_enabled: true        # reverse-shell / unexpected-shell scanner
 recon_enabled: true           # recon-command burst detector
+# SSH login-pattern watcher: experimental, off by default (racy under
+# concurrent same-IP logins). See README. Enable at your own risk.
+ssh_pattern_watcher_enabled: false
 # Users the app runs as - a shell owned by these is treated as a breach.
 # revshell_app_users: "app,www-data"
 # If your Node app legitimately shells out via a known wrapper, exempt it:

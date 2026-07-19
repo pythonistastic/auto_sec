@@ -38,8 +38,17 @@ watcher_skip_non_interactive: true
 # Detection suite (all default to alert mode via watcher_mode)
 # Reverse-shell / unexpected-shell scanner (watches the process table).
 revshell_enabled: true
-# Recon-burst detector (watches auditd for enumeration bursts).
+# Recon-burst detector (watches auditd for enumeration bursts). This is
+# the robust, vector-independent detector - it catches an intruder
+# "looking around" however they got in.
 recon_enabled: true
+# SSH login-pattern watcher (the "tripwire second factor"). EXPERIMENTAL
+# and OFF by default: reacting to a login and then inspecting the session
+# is racy under concurrent same-IP logins (it can misattribute a session
+# and false-positive on automation). Enable only if you understand this
+# and whitelist your automation/ops IPs via watcher_whitelist_ips. The
+# recon and reverse-shell detectors cover the real breach cases.
+ssh_pattern_watcher_enabled: false
 
 # Egress lockdown: default-deny OUTBOUND traffic, allowing only
 # DNS/NTP/HTTP/HTTPS plus egress_allow_extra. Stops arbitrary-high-port

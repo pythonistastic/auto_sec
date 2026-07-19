@@ -4,6 +4,12 @@
     name: [auditd, audispd-plugins, inotify-tools]
     state: present
 
+- name: Ensure auditd is running and enabled
+  ansible.builtin.service:
+    name: auditd
+    state: started
+    enabled: true
+
 - name: Audit rules for intrusion indicators
   ansible.builtin.copy:
     dest: /etc/audit/rules.d/hardening.rules

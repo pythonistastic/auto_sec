@@ -80,14 +80,20 @@ whole suite in `alert` mode for at least a week before switching
 `watcher_mode` to `active`, and keep a break-glass IP configured.
 
 **1. SSH login pattern watcher** (`watcher.py`) — a tripwire second
-factor. A valid human runs a command containing a secret pattern within
-N seconds of an interactive SSH login; an attacker with a stolen key
-doesn't know the ritual and trips the wire. Sessions are tracked
-individually via systemd-logind / audit session IDs, so a valid user
-logged in at the same time can't vouch for an intruder on the same
-account, and enforcement kills only the offending session.
-Non-interactive sessions (scp/rsync/Ansible/git) are skipped.
-*Limitation:* it only sees SSH logins — which is why the next two exist.
+factor, **experimental and OFF by default**
+(`ssh_pattern_watcher_enabled: false`). The idea: a valid human runs a
+command containing a secret pattern within N seconds of an interactive
+SSH login; an attacker with a stolen key doesn't know the ritual and
+trips the wire. In live testing this proved **racy under concurrent
+same-IP logins**: it reacts to an auth-log login and then inspects the
+session, and reliably telling an interactive human apart from
+`ssh host "sudo …"` automation (Ansible, CI, git) is hard — `sudo`'s
+`use_pty` and session-attribution races produce false positives. It's
+shipped for people who want to experiment (enable it and whitelist your
+automation IPs via `watcher_whitelist_ips`), but the two detectors below
+are the ones that carry the load, and detector #3 already delivers the
+"catch them looking around" goal more robustly. PRs that make login
+attribution reliable are very welcome.
 
 **2. Reverse-shell scanner** (`revshell_scan.py`) — watches the process
 table, not the auth log, so it sees intrusions that never log in. It

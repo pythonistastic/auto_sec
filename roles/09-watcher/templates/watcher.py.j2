@@ -22,6 +22,7 @@ Reads:
   ausearch -k exec_log --session N   per-session executed commands
 """
 
+import os
 import re
 import subprocess
 import sys
@@ -49,6 +50,37 @@ def session_property(session_id: str, prop: str) -> str:
     ).strip()
 
 
+def session_is_interactive(session_id: str) -> bool:
+    """
+    True only for a human shell login. The reliable signal is the
+    presence of a LOGIN SHELL (argv[0] begins with '-', e.g. '-bash')
+    among the session's processes. sshd starts a login shell only for
+    an interactive login; `ssh host "cmd"` runs `bash -c "cmd"` (and,
+    with sudo, `sudo ...`) - never a login shell. This is not fooled by
+    sudo's `Defaults use_pty`, which a plain TTY check is (verified on
+    Ubuntu 22.04: automation sessions get a pty yet have no login shell).
+
+    Processes are tied to the session by /proc/<pid>/sessionid, which
+    equals the logind session's Audit id.
+    """
+    audit_ses = session_property(session_id, "Audit")
+    if not audit_ses or not audit_ses.isdigit():
+        return False
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/sessionid") as fh:
+                if fh.read().strip() != audit_ses:
+                    continue
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                if fh.read().split(b"\x00", 1)[0].startswith(b"-"):
+                    return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
 def find_new_session(user: str, ip: str, deadline: float) -> str | None:
     while time.time() < deadline:
         out = S.run(["loginctl", "list-sessions", "--no-legend"])
@@ -71,21 +103,10 @@ def find_new_session(user: str, ip: str, deadline: float) -> str | None:
 
 
 def session_commands(session_id: str) -> list[str]:
+    # Read straight from the audit log (never ausearch - it can hang).
     audit_ses = session_property(session_id, "Audit") or session_id
-    out = S.run(["ausearch", "-k", "exec_log", "--session", audit_ses])
-    cmds = []
-    for line in out.splitlines():
-        if "proctitle=" in line:
-            raw = line.split("proctitle=", 1)[1].strip()
-            if re.fullmatch(r"[0-9A-Fa-f]+", raw):
-                try:
-                    raw = bytes.fromhex(raw).replace(b"\x00", b" ").decode(
-                        errors="replace"
-                    )
-                except ValueError:
-                    pass
-            cmds.append(raw.strip())
-    return cmds
+    return [cmd for (ses, _auid, cmd) in S.snapshot_execve()
+            if ses == audit_ses]
 
 
 def check_session(user: str, ip: str, login_time: float) -> None:
@@ -95,7 +116,8 @@ def check_session(user: str, ip: str, login_time: float) -> None:
         user, ip, deadline=login_time + min(15, WINDOW)
     )
     if session_id:
-        if SKIP_NON_INTERACTIVE and not session_property(session_id, "TTY"):
+        if SKIP_NON_INTERACTIVE and not session_is_interactive(session_id):
+            # scp/rsync/ansible/git/sudo-over-ssh: not a human shell login.
             with _claimed_lock:
                 _claimed.discard(session_id)
             return
@@ -115,11 +137,15 @@ def check_session(user: str, ip: str, login_time: float) -> None:
             user=user, ip=ip, session_id=session_id,
         )
     else:
-        S.respond(
-            "ssh-session-unidentified",
-            f"Login by '{user}' from {ip} but the session could not be "
-            f"tied to a logind session (port-forward or race).",
-            user=user, ip=ip,
+        # Could not tie the login to a logind session in time. This is
+        # usually a short-lived non-interactive connection (a race), not
+        # an attack, and post-breach activity is caught by the revshell
+        # and recon detectors. Log to journald only, never alert.
+        print(
+            f"[watcher] login by '{user}' from {ip} not matched to a "
+            f"logind session; ignoring (likely non-interactive).",
+            file=sys.stderr,
+            flush=True,
         )
 
 

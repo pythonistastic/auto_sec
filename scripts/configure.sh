@@ -220,23 +220,34 @@ confirm "Enable egress lockdown?" n && EGRESS="true"
 
 # ----------------------------------------------------------------- watcher
 say "Detection suite"
-note "Three detectors run automatically (all in the mode you pick below):"
+note "Two robust detectors run automatically (in the mode you pick below):"
 note "  - reverse-shell scanner (catches shells with a network socket, and"
 note "    the app/service user spawning a shell - i.e. a web exploit)"
 note "  - recon-burst detector (fires when a session runs many enumeration"
 note "    commands fast - 'looking around', any entry vector)"
-note "  - SSH login pattern watcher, configured here:"
 echo
-note "Every interactive SSH login must run a secret command within a time"
-note "window, or it is treated as a breach. Pick something natural you"
-note "will actually type, and keep it secret (it is your duress signal)."
-ask "Secret pattern (substring of a command)" "cd /opt/app"
-WATCHER_PATTERN="$REPLY"
-ask "Watcher mode: alert (notify only) or active (kill session + block IP)" "alert"
+note "There is also an EXPERIMENTAL SSH login-pattern watcher (a tripwire"
+note "second factor). It is off by default because it can false-positive on"
+note "automation (Ansible/CI). You can enable it below."
+SSH_WATCHER="false"
+if confirm "Enable the experimental SSH login-pattern watcher?" n; then
+  SSH_WATCHER="true"
+  note "Every interactive SSH login must run a secret command within a time"
+  note "window, or it is treated as a breach. Pick something natural you"
+  note "will actually type, and keep it secret (it is your duress signal)."
+  ask "Secret pattern (substring of a command)" "cd /opt/app"
+  WATCHER_PATTERN="$REPLY"
+else
+  WATCHER_PATTERN="cd /opt/app"
+fi
+
+# Response mode applies to ALL detectors.
+say "Response mode (applies to every detector)"
+ask "Mode: alert (notify only) or active (kill session/process + block IP)" "alert"
 WATCHER_MODE="$REPLY"
 [ "$WATCHER_MODE" = "alert" ] || [ "$WATCHER_MODE" = "active" ] || die "Must be alert or active."
 if [ "$WATCHER_MODE" = "active" ]; then
-  warn "active mode will terminate sessions that miss the pattern."
+  warn "active mode terminates offending sessions/processes and blocks IPs."
   warn "Run in alert mode for at least a week first to tune false positives."
 fi
 
@@ -288,6 +299,7 @@ say "Writing ${HOSTVARS}"
   echo "watcher_pattern: \"${WATCHER_PATTERN}\""
   echo "watcher_mode: \"${WATCHER_MODE}\""
   echo "watcher_whitelist_ips: []"
+  echo "ssh_pattern_watcher_enabled: ${SSH_WATCHER}"
 } > "$HOSTVARS"
 chmod 600 "$HOSTVARS"
 

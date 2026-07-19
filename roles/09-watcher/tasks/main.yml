@@ -87,11 +87,11 @@
 - name: Flush handlers so units are registered before enabling
   ansible.builtin.meta: flush_handlers
 
-- name: Enable SSH login watcher
+- name: Enable SSH login watcher (experimental, opt-in)
   ansible.builtin.service:
     name: login-watcher
-    state: started
-    enabled: true
+    state: "{{ 'started' if (ssh_pattern_watcher_enabled | default(false)) else 'stopped' }}"
+    enabled: "{{ ssh_pattern_watcher_enabled | default(false) }}"
 
 - name: Enable reverse-shell scanner
   ansible.builtin.service:

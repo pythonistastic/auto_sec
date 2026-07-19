@@ -156,13 +156,20 @@ def scan_once() -> None:
 
         reason = None
         tag = None
+        ip = None
         # --- #1 socket-stdio shell (any user) ---
+        # Require a real network (TCP) peer, not just any socket: systemd
+        # wires a service's stdout/stderr to journald's UNIX socket, so a
+        # bash-based service would otherwise look like a reverse shell.
         if (is_shell or is_netcat) and stdio_has_socket(pid):
-            tag = "reverse-shell"
-            reason = (f"{name} (pid {pid}, user {user}) has a network socket "
-                      f"on its stdio - classic reverse shell.")
+            peers = S.peer_ips_for_pid(pid)
+            if peers:
+                tag = "reverse-shell"
+                ip = peers[0]
+                reason = (f"{name} (pid {pid}, user {user}) has a TCP socket "
+                          f"on its stdio (peer {ip}) - classic reverse shell.")
         # --- #2 service/app user or service parent spawned a shell ---
-        elif is_shell and not is_allowed(pid) and (
+        if not reason and is_shell and not is_allowed(pid) and (
                 user in APP_USERS or parent in SERVICE_PARENTS):
             tag = "service-shell"
             why = (f"user '{user}'" if user in APP_USERS
@@ -172,10 +179,7 @@ def scan_once() -> None:
 
         if reason:
             _seen.add(key)
-            peers = S.peer_ips_for_pid(pid)
-            ip = peers[0] if peers else None
-            S.respond(tag, reason + (f"\nPeer: {ip}" if ip else ""),
-                      pid=pid, user=user, ip=ip,
+            S.respond(tag, reason, pid=pid, user=user, ip=ip,
                       extra=f"cmdline={cmdline(pid)} parent={parent}")
 
     # Bound memory: forget PIDs that no longer exist.

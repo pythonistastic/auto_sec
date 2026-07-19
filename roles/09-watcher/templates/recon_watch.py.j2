@@ -2,30 +2,28 @@
 """
 Recon-burst detector - "someone is looking around."
 
-This is the vector-independent detector. It does not care how the
-intruder got in (stolen SSH key, reverse shell, exec channel, an
-insider). It watches what auditd records everyone actually DOING, and
-fires when a single session runs a burst of enumeration commands in a
-short window - the universal first move after any breach: figure out
-who am I, what is this box, where is the data, how do I persist.
+The vector-independent detector. It does not care how the intruder got
+in (stolen SSH key, reverse shell, exec channel, an insider). It watches
+what auditd records everyone actually DOING and fires when a single
+session runs a burst of enumeration commands in a short window - the
+universal first move after any breach: who am I, what is this box, where
+is the data, how do I persist.
 
-A legitimate operator occasionally runs one of these. An attorney
-mapping a freshly compromised box runs many, fast. We alert on the
-BURST (N distinct recon indicators within a window from one session),
-which is what separates the two.
+Implementation: streams /var/log/audit/audit.log directly via `tail -F`
+and correlates each execve's audit session id (ses) with its command.
+We deliberately do NOT shell out to `ausearch` - it has been observed to
+hang on some hosts, which would silently starve this detector.
 
-Source: auditd exec_log (already enabled by role 08 for every execve).
-Grouping: by audit session id (ses=), so concurrent sessions do not
-pool into a false burst.
-
-Tuning lives in config: recon_threshold, recon_window_seconds, and the
-recon_patterns list. Start in alert mode; whitelist your own admin IPs
-via the shared whitelist. Because audit records don't carry the source
-IP, this detector alerts (and in active mode terminates the offending
-login session) but does not IP-block on its own.
+Grouping is by audit session id, so concurrent sessions do not pool into
+a false burst. Tuning lives in config: recon_threshold,
+recon_window_seconds, recon_patterns. Start in alert mode; whitelist
+your own admin IPs via the shared whitelist. Audit records don't carry a
+source IP, so this detector alerts (and in active mode terminates the
+offending login session) but does not IP-block on its own.
 """
 
 import re
+import subprocess
 import sys
 import time
 
@@ -33,7 +31,6 @@ sys.path.insert(0, "/opt/watcher")
 import sentinel_lib as S  # noqa: E402
 
 ENABLED = S.getbool("recon", "enabled", True)
-POLL = S.getint("recon", "poll_interval", 10)
 WINDOW = S.getint("recon", "window_seconds", 45)
 THRESHOLD = S.getint("recon", "threshold", 4)
 
@@ -50,77 +47,54 @@ DEFAULT_PATTERNS = ",".join([
 PATTERNS = [re.compile(p) for p in
             S.getlist("recon", "recon_patterns", DEFAULT_PATTERNS)]
 
-# session id -> {"hits": [(epoch, pattern_str)], "alerted": epoch}
+# session id -> {"hits": [(epoch, pattern)], "alerted": epoch, "user": str}
 _sessions: dict[str, dict] = {}
-_last_scan = time.time() - WINDOW
 
 
-def parse_events(text: str) -> list[tuple[str, str, str]]:
-    """Return (session_id, auid_user, command_text) from ausearch output."""
-    events = []
-    ses = auid = cmd = ""
-    for block in text.split("----"):
-        ses = auid = cmd = ""
-        for line in block.splitlines():
-            m = re.search(r"\bses=(\S+)", line)
-            if m:
-                ses = m.group(1)
-            m = re.search(r"\bAUID=\"?(\w+)\"?", line) or \
-                re.search(r"\bauid=(\S+)", line)
-            if m:
-                auid = m.group(1)
-            if "proctitle=" in line:
-                raw = line.split("proctitle=", 1)[1].strip().strip('"')
-                if re.fullmatch(r"[0-9A-Fa-f]+", raw):
-                    try:
-                        raw = bytes.fromhex(raw).replace(
-                            b"\x00", b" ").decode(errors="replace")
-                    except ValueError:
-                        pass
-                cmd = raw.strip()
-        if ses and ses not in ("unset", "4294967295") and cmd:
-            events.append((ses, auid, cmd))
-    return events
-
-
-def scan() -> None:
-    global _last_scan
-    since = time.strftime("%m/%d/%Y %H:%M:%S", time.localtime(_last_scan))
-    _last_scan = time.time()
-    out = S.run(["ausearch", "-k", "exec_log", "-ts", *since.split()])
+def handle(ses: str, auid: str | None, cmd: str) -> None:
+    matched = next((p.pattern for p in PATTERNS if p.search(cmd)), None)
+    if not matched:
+        return
     now = time.time()
+    state = _sessions.setdefault(
+        ses, {"hits": [], "alerted": 0.0, "user": auid or "unknown"})
+    # distinct indicators only, so `id; id; id` is not a burst
+    if matched not in [p for (_, p) in state["hits"]]:
+        state["hits"].append((now, matched))
+    # prune to the sliding window
+    state["hits"] = [(t, p) for (t, p) in state["hits"] if now - t <= WINDOW]
 
-    for ses, user, cmd in parse_events(out):
-        matched = next((p.pattern for p in PATTERNS if p.search(cmd)), None)
-        if not matched:
-            continue
-        state = _sessions.setdefault(ses, {"hits": [], "alerted": 0})
-        # distinct patterns only, so `id; id; id` is not a burst
-        if matched not in [h[1] for h in state["hits"]]:
-            state["hits"].append((now, matched))
+    if len(state["hits"]) >= THRESHOLD and now - state["alerted"] > WINDOW:
+        state["alerted"] = now
+        indicators = ", ".join(p for (_, p) in state["hits"])
+        S.respond(
+            "recon-burst",
+            f"Session {ses} (auid {state['user']}) ran {len(state['hits'])} "
+            f"distinct enumeration commands in <{WINDOW}s.\n"
+            f"Indicators: {indicators}",
+            user=(state["user"] if state["user"] != "unknown" else None),
+            session_id=ses,
+            extra=f"audit_session={ses}",
+        )
 
-    for ses, state in list(_sessions.items()):
-        state["hits"] = [(t, p) for (t, p) in state["hits"]
-                         if now - t <= WINDOW]
-        if not state["hits"]:
-            _sessions.pop(ses, None)
-            continue
-        if len(state["hits"]) >= THRESHOLD and now - state["alerted"] > WINDOW:
-            state["alerted"] = now
-            indicators = ", ".join(p for (_, p) in state["hits"])
-            # Recover the auid user for this session for the alert/evidence.
-            who = S.run(["ausearch", "-k", "exec_log", "--session", ses,
-                         "-ts", "recent"])
-            um = re.search(r"\bAUID=\"?(\w+)\"?", who)
-            user = um.group(1) if um else "unknown"
-            S.respond(
-                "recon-burst",
-                f"Session {ses} (user {user}) ran {len(state['hits'])} "
-                f"enumeration commands in <{WINDOW}s.\nIndicators: {indicators}",
-                user=user if user != "unknown" else None,
-                session_id=ses,
-                extra=f"audit_session={ses}",
-            )
+    # bound memory: drop sessions with no recent hits
+    if len(_sessions) > 4096:
+        for sid in [k for k, v in _sessions.items() if not v["hits"]]:
+            _sessions.pop(sid, None)
+
+
+def follow_audit_log() -> None:
+    proc = subprocess.Popen(
+        ["tail", "-Fn0", S.AUDIT_LOG],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout is not None
+    for ses, auid, cmd in S.iter_audit_execve(proc.stdout):
+        try:
+            handle(ses, auid, cmd)
+        except Exception:
+            pass  # a bad event must never kill the stream
 
 
 if __name__ == "__main__":
@@ -130,7 +104,6 @@ if __name__ == "__main__":
              f"(threshold {THRESHOLD}/{WINDOW}s, mode {S.MODE}).")
     while True:
         try:
-            scan()
+            follow_audit_log()
         except Exception:
-            pass
-        time.sleep(POLL)
+            time.sleep(2)  # tail died; restart the stream
