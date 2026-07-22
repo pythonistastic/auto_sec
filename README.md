@@ -352,6 +352,10 @@ security and cannot make any server "unhackable."
 - You are responsible for how you deploy and operate this on your own
   systems.
 
+For a candid account of what doesn't work, what's unsolved, and what's
+shipped-but-unproven, read the
+[development retrospective](docs/RETROSPECTIVE.md).
+
 Found a weakness in the playbook itself? Please open a private security
 advisory (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
