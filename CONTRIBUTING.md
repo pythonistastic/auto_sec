@@ -48,6 +48,28 @@ To validate a detector end-to-end on real hardware, run
 `sudo tests/redteam.sh` on a throwaway server the playbook has hardened.
 If you add a detector, add a matching trigger + assertion there.
 
+## Cutting a release
+
+Add your user-facing changes under `## [Unreleased]` in
+[CHANGELOG.md](CHANGELOG.md) as you go (Added / Changed / Fixed). When
+it's time to release, run one command from a clean tree:
+
+```bash
+./scripts/release.sh patch     # 0.1.0 -> 0.1.1 (or: minor | major | X.Y.Z)
+```
+
+It bumps `VERSION`, rolls `[Unreleased]` into a new dated version section,
+updates the README badge and changelog links, commits, and creates an
+annotated `vX.Y.Z` tag. It does **not** push — review, then:
+
+```bash
+git push origin main --tags
+```
+
+Finally, draft a GitHub Release from the new tag and paste that version's
+changelog section. Versioning is SemVer; while pre-1.0, minor versions
+may include breaking changes.
+
 ## Security disclosure
 
 Found a vulnerability in the playbook itself (something that would
