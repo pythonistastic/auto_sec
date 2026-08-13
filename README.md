@@ -113,6 +113,55 @@ assumed.
 
 **Supported targets:** Ubuntu 22.04/24.04, Debian 12.
 
+## Declarative / CI use (without the wizard)
+
+You can skip the wizard and drive auto_sec from committed config — write
+`host_vars/<server>.yml` and `inventory/<server>.yml` yourself, then run
+`ansible-playbook`. This suits CI, fleets, and GitOps.
+
+The playbook **fails fast**: a `pre_tasks` assert validates every
+required variable *before* any change, so an incomplete config aborts the
+run instead of leaving a half-hardened box. That assert block (top of
+[site.yml](site.yml)) is the **source of truth** for what's required.
+
+Minimal `host_vars` by scope (only what each needs):
+
+```yaml
+# Core hardening + detection only (no app/DB/backups):
+deploy_ssh_public_key: "ssh-ed25519 AAAA... you@host"   # required
+
+# Add an app + TLS (enables role 05):
+app_type: "node"                 # or docker
+client_domain: "app.example.com" # required with app_type
+letsencrypt_email: "ops@example.com"   # required with app_type (real address)
+
+# Add a database (enables role 06):
+db_engine: "postgres"            # or mysql
+db_name: "appdb"
+db_user: "appuser"
+db_password: "..."               # use ansible-vault
+
+# Add backups (enables role 07):
+b2_bucket: "my-backups"
+b2_key_id: "..."
+b2_app_key: "..."                # use ansible-vault
+age_public_key: "age1..."
+
+# Enable the experimental login watcher:
+ssh_pattern_watcher_enabled: true
+watcher_pattern: "cd /opt/app"   # required only when the watcher is on
+
+# Alerts (strongly recommended):
+telegram_bot_token: "..."
+telegram_chat_id: "..."
+```
+
+Optional roles (04 fwknop, 05 app, 06 database, 07 backups) are loaded
+**only when their trigger var is set** (`paranoia_level: high`,
+`app_type`, `db_engine`, `b2_bucket`). Everything else defaults sanely in
+[group_vars/all.yml](group_vars/all.yml), so a keys-only-hardening run
+needs just `deploy_ssh_public_key`.
+
 ## Connecting to the server after hardening
 
 Role 02 disables password authentication **and** root login, and

@@ -9,6 +9,38 @@ Last updated: 2026-07 (after the first real-hardware test on Ubuntu 22.04).
 
 ---
 
+## Update: second real-world run (Ubuntu 24.04)
+
+A user hardened a fresh **Ubuntu 24.04** box driving the playbook
+**non-interactively** (hand-written host_vars, no wizard). It exposed a
+batch of portability and fail-safe bugs — the most important class,
+because the playbook could abort *mid-hardening* and leave a half-locked
+box. All were fixed:
+
+- **A `community.mysql` → `ansible.mysql` change (made earlier in this
+  project to silence a deprecation warning) did not exist on the
+  ansible-core people actually run**, and because `site.yml` statically
+  imported every role, it broke *all* invocations — even `--syntax-check`
+  and unrelated `--tags` runs. Reverted, and our CI now runs a
+  distro-representative job (apt ansible-core 2.16) that would have
+  caught it. **Lesson: validate on the ansible-core the target distro
+  ships, not just the newest.**
+- **Galaxy pulled collections newer than the distro core supports.**
+  Fixed by pinning compatible ranges in `requirements.yml`.
+- **A missing `watcher_pattern` failed late, after SSH was already
+  locked down.** Fixed with defaults + a `pre_tasks` assert that
+  validates all required vars *before* any change (fail-fast).
+- **One broken optional role broke everything** (static import). Optional
+  roles now load via dynamic `include_role`.
+
+These fixes are validated on isolated ansible-core 2.16.3 (syntax-check,
+pinned-collection resolution, lint, and the fail-fast assert behaviour).
+**Still pending:** a full role-by-role hardening run on 24.04 to confirm
+runtime behaviour end-to-end — syntax passing is necessary, not
+sufficient.
+
+---
+
 ## 1. The headline failure: the SSH login-pattern watcher
 
 This was the **original core idea** — "watch what a user does right after they

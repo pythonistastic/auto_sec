@@ -200,26 +200,56 @@ fi
 
 # ------------------------------------------------------------------ alerts
 say "Telegram alerts (breach alerts, backup status, watcher)"
-note "Create a bot with @BotFather, then message it once and get your"
-note "chat id from https://api.telegram.org/bot<TOKEN>/getUpdates"
+note "1) In Telegram, open @BotFather and run /newbot to get a bot TOKEN."
+note "2) Open your new bot and press START / send it any message"
+note "   (Telegram won't let a bot message you until you do)."
 ask "Telegram bot token (empty to skip alerts for now)" ""
 TG_TOKEN="$REPLY"
 TG_CHAT=""
+
+# Ask Telegram for the chat id from the message the user just sent the bot.
+detect_chat_id() {
+  curl -s --max-time 10 "https://api.telegram.org/bot${TG_TOKEN}/getUpdates" \
+    | grep -oE '"chat":\{"id":-?[0-9]+' | grep -oE '\-?[0-9]+$' | tail -1
+}
+
 if [ -n "$TG_TOKEN" ]; then
-  ask_required "Telegram chat id"
-  TG_CHAT="$REPLY"
-  if confirm "Send a test message now?"; then
-    if curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-        -d chat_id="${TG_CHAT}" -d text="secure-deploy wizard: test OK for ${SERVER}" \
-        | grep -q '"ok":true'; then
-      say "Test message delivered."
+  note "Looking up your chat id from the message you sent the bot..."
+  TG_CHAT="$(detect_chat_id || true)"
+  if [ -z "$TG_CHAT" ]; then
+    warn "No message found yet. Open your bot in Telegram and press START,"
+    warn "then press Enter here to retry."
+    read -r _
+    TG_CHAT="$(detect_chat_id || true)"
+  fi
+
+  if [ -n "$TG_CHAT" ]; then
+    say "Detected chat id: ${TG_CHAT}"
+  else
+    warn "Still couldn't auto-detect it. You can enter it manually"
+    warn "(from https://api.telegram.org/bot<TOKEN>/getUpdates) or leave blank."
+    ask "Telegram chat id" ""
+    TG_CHAT="$REPLY"
+  fi
+
+  if [ -n "$TG_CHAT" ]; then
+    RESP="$(curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+      -d chat_id="${TG_CHAT}" -d text="auto_sec wizard: test OK for ${SERVER}")"
+    if echo "$RESP" | grep -q '"ok":true'; then
+      say "Test message delivered — check your Telegram."
+    elif echo "$RESP" | grep -q 'chat not found'; then
+      warn "Telegram says 'chat not found' — open the bot and press START,"
+      warn "then re-run the wizard or edit $HOSTVARS. Continuing for now."
     else
-      warn "Telegram test failed. Check token/chat id (you can edit $HOSTVARS later)."
+      warn "Telegram test failed: $(echo "$RESP" | head -c 160)"
     fi
   fi
-else
-  warn "Alerts disabled. The detection layers lose most of their value without them."
-  TG_TOKEN="CHANGE_ME"; TG_CHAT="CHANGE_ME"
+fi
+
+if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
+  [ -n "$TG_TOKEN" ] && warn "Alerts left unconfigured; you can edit $HOSTVARS later."
+  [ -z "$TG_TOKEN" ] && warn "Alerts disabled. The detectors still write incident files to /var/log/sentinel, but nobody gets pinged."
+  TG_TOKEN="${TG_TOKEN:-CHANGE_ME}"; TG_CHAT="${TG_CHAT:-CHANGE_ME}"
 fi
 
 # ----------------------------------------------------------------- backups
