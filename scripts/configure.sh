@@ -32,7 +32,10 @@ banner() {
 ██║  ██║╚██████╔╝   ██║   ╚██████╔╝███████╗███████║███████╗╚██████╗
 ╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝ ╚══════╝╚══════╝╚══════╝ ╚═════╝
 ART
-  printf '\033[0m\033[2m   one-command server hardening + breach detection\033[0m\n'
+  local ver
+  ver="$(cat "${REPO_DIR}/VERSION" 2>/dev/null || echo '?')"
+  printf '\033[0m\033[2m   one-command server hardening + breach detection  \033[0m'
+  printf '\033[2mv%s\033[0m\n' "$ver"
 }
 
 ask() { # ask "Prompt" "default" -> REPLY

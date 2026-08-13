@@ -10,9 +10,15 @@
 
 # auto_sec
 
+![version](https://img.shields.io/badge/version-0.1.0-blue)
+![status](https://img.shields.io/badge/status-early--stage-orange)
+![license](https://img.shields.io/badge/license-MIT-green)
+
 One-command hardening for a Linux VPS: preventive lockdown, behavioral
 breach detection, and ransomware-proof encrypted backups — as an
 idempotent Ansible playbook you configure once and re-run forever.
+
+**Version 0.1.0** · what's new and what's fixed: [CHANGELOG.md](CHANGELOG.md).
 
 Takes a fresh Ubuntu/Debian server from zero to:
 
