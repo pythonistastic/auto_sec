@@ -3,9 +3,9 @@
 
 # [watcher] holds values shared by ALL detectors plus the SSH pattern.
 [watcher]
-pattern = {{ watcher_pattern }}
-window_seconds = {{ watcher_window_seconds }}
-mode = {{ watcher_mode }}
+pattern = {{ watcher_pattern | default('cd /opt/app') }}
+window_seconds = {{ watcher_window_seconds | default(60) }}
+mode = {{ watcher_mode | default('alert') }}
 telegram_bot_token = {{ telegram_bot_token }}
 telegram_chat_id = {{ telegram_chat_id }}
 host_label = {{ inventory_hostname }}

@@ -26,9 +26,19 @@ backup_retention_monthly: 6
 telegram_bot_token: "CHANGE_ME"
 telegram_chat_id: "CHANGE_ME"
 
+# Application directory the detectors watch (ransomware canary etc.).
+# Safe default so core hardening + detection work without an app deployed.
+app_dir: "/opt/app"
+
 # Watcher
 watcher_mode: "alert"        # alert | active
 watcher_window_seconds: 60
+# Secret command a valid interactive login must run within the window
+# (only used when ssh_pattern_watcher_enabled is true). Defaulted here so
+# a minimal/declarative host_vars never fails late, after SSH is already
+# locked down. Override per host and keep it secret if you enable the
+# login watcher.
+watcher_pattern: "cd /opt/app"
 # Extra trusted source IPs/CIDRs that never trigger the watcher
 # (office_static_ip is always included automatically).
 watcher_whitelist_ips: []

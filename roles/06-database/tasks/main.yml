@@ -62,12 +62,12 @@
       notify: restart mysql
 
     - name: Create app database
-      ansible.mysql.mysql_db:
+      community.mysql.mysql_db:
         name: "{{ db_name }}"
         login_unix_socket: /var/run/mysqld/mysqld.sock
 
     - name: Create least-privilege app user (localhost only, own schema only)
-      ansible.mysql.mysql_user:
+      community.mysql.mysql_user:
         name: "{{ db_user }}"
         password: "{{ db_password }}"
         host: localhost

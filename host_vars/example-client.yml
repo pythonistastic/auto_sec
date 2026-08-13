@@ -3,6 +3,9 @@
 
 client_name: "Example Client LLC"
 client_domain: "app.example.com"
+# Required when app_type is set (certbot uses it). Preflight refuses to
+# run if this is left as the CHANGE_ME default.
+letsencrypt_email: "ops@example.com"
 
 paranoia_level: "high"        # standard | high
 

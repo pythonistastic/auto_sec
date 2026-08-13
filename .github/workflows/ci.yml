@@ -5,6 +5,7 @@ on:
   pull_request:
 
 jobs:
+  # Lint + syntax on a modern ansible-core (needed by ansible-lint).
   ansible:
     runs-on: ubuntu-latest
     steps:
@@ -24,6 +25,29 @@ jobs:
           -e client=example-client --syntax-check
       - name: Lint
         run: ansible-lint
+
+  # Representative of a real server: distro-packaged Ansible (Ubuntu
+  # 24.04 -> ansible-core 2.16) with the PINNED collections. This is the
+  # environment that catches "module/collection does not exist on the
+  # version people actually have installed" bugs, which a latest-only CI
+  # silently passes.
+  distro-compat:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install distro Ansible
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ansible
+          ansible --version
+      - name: Install pinned Galaxy collections
+        run: ansible-galaxy collection install -r requirements.yml
+      - name: Syntax check with distro ansible-core
+        run: ansible-playbook site.yml -i inventory/hosts.yml --syntax-check
+      - name: Syntax check restore-test playbook
+        run: >
+          ansible-playbook restore-test/monthly-restore.yml
+          -e client=example-client --syntax-check
 
   python:
     runs-on: ubuntu-latest

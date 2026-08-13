@@ -1,18 +1,109 @@
 ---
 # Master playbook. Runs all layers in order.
 # Usage: ansible-playbook -i inventory/hosts.yml site.yml -l <client>
+#
+# Core hardening (01-03) always runs. Optional layers are loaded
+# dynamically and only when their feature is configured, so a missing
+# optional collection or a misconfigured optional role can never break
+# core hardening or the detectors.
 
 - name: Secure deployment pipeline
   hosts: all
   become: true
+
+  # --- Preflight: fail BEFORE any change if required vars are missing, so
+  #     the server is never left half-hardened (SSH locked, run aborted).
+  #     This block is also the single source of truth for "required vars".
+  pre_tasks:
+    - name: "Preflight: an SSH public key for the deploy user is required"
+      tags: [always]
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - >-
+            (deploy_ssh_public_key is defined and deploy_ssh_public_key | length > 0)
+            or (ssh_public_key_file is defined)
+        fail_msg: >-
+          Set deploy_ssh_public_key (the public key string) OR
+          ssh_public_key_file (a path to a .pub file) in host_vars, so the
+          deploy user can log in. Aborting BEFORE any change so the server
+          is never left half-hardened.
+
+    - name: "Preflight: variables required by the features you enabled"
+      tags: [always]
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (not (ssh_pattern_watcher_enabled | default(false))) or (watcher_pattern is defined)
+          - >-
+            (app_type is not defined)
+            or (client_domain is defined and letsencrypt_email is defined
+                and letsencrypt_email != 'CHANGE_ME@example.com')
+          - >-
+            (db_engine is not defined)
+            or (db_name is defined and db_user is defined and db_password is defined)
+          - >-
+            (b2_bucket is not defined)
+            or (b2_key_id is defined and b2_app_key is defined and age_public_key is defined)
+          - >-
+            (paranoia_level | default('standard') != 'high')
+            or (fwknop_key is defined and fwknop_hmac_key is defined)
+        fail_msg: >-
+          A feature you enabled is missing a required variable (see the
+          failed assertion above). Fix host_vars and re-run - nothing has
+          been changed on the server yet.
+
+  # --- Core hardening: always applied.
   roles:
     - { role: 01-base, tags: ["base"] }
     - { role: 02-ssh-hardening, tags: ["ssh"] }
     - { role: 03-firewall, tags: ["firewall"] }
-    - { role: 04-fwknop, tags: ["fwknop"], when: paranoia_level == "high" }
-    - { role: 05-app-runtime, tags: ["app"] }
-    - { role: 06-database, tags: ["database"], when: db_engine is defined }
-    - { role: 07-backups, tags: ["backups"], when: b2_bucket is defined }
-    - { role: 08-detection, tags: ["detection"] }
-    - { role: 09-watcher, tags: ["watcher"] }
-    - { role: 10-report, tags: ["report"] }
+
+  # --- Optional + detection layers: loaded dynamically so parse-time
+  #     module resolution in an optional role can't break the core run.
+  tasks:
+    - name: "Layer 04: Single Packet Authorization (invisible SSH)"
+      ansible.builtin.include_role:
+        name: 04-fwknop
+        apply: { tags: ["fwknop"] }
+      tags: ["fwknop"]
+      when: paranoia_level | default('standard') == "high"
+
+    - name: "Layer 05: app runtime (Node/Docker + Nginx + TLS)"
+      ansible.builtin.include_role:
+        name: 05-app-runtime
+        apply: { tags: ["app"] }
+      tags: ["app"]
+      when: app_type is defined
+
+    - name: "Layer 06: database (localhost-only, least privilege)"
+      ansible.builtin.include_role:
+        name: 06-database
+        apply: { tags: ["database"] }
+      tags: ["database"]
+      when: db_engine is defined
+
+    - name: "Layer 07: encrypted off-site backups"
+      ansible.builtin.include_role:
+        name: 07-backups
+        apply: { tags: ["backups"] }
+      tags: ["backups"]
+      when: b2_bucket is defined
+
+    - name: "Layer 08: detection (auditd tripwires, ransomware canary)"
+      ansible.builtin.include_role:
+        name: 08-detection
+        apply: { tags: ["detection"] }
+      tags: ["detection"]
+
+    - name: "Layer 09: breach detection suite"
+      ansible.builtin.include_role:
+        name: 09-watcher
+        apply: { tags: ["watcher"] }
+      tags: ["watcher"]
+
+    - name: "Layer 10: client security report"
+      ansible.builtin.include_role:
+        name: 10-report
+        apply: { tags: ["report"] }
+      tags: ["report"]
