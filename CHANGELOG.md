@@ -10,6 +10,10 @@ changes. Treat it as early-stage — see the
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.2.0] - 2026-08-15
+
 ### Added
 
 - **CVE watch (role 11)** — a daily scan that answers "is anything I run
@@ -96,5 +100,6 @@ Backups/restore, fwknop, app/DB/TLS roles, Telegram delivery, `active`
 mode, and non-Ubuntu-22.04 targets are shipped but **not yet validated
 end-to-end**. See [docs/RETROSPECTIVE.md](docs/RETROSPECTIVE.md).
 
-[Unreleased]: https://github.com/pythonistastic/auto_sec/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/pythonistastic/auto_sec/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.2.0
 [0.1.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.1.0
