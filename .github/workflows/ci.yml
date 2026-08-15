@@ -71,10 +71,13 @@ jobs:
       - name: CVE scanner smoke test (lockfile parsing, offline)
         run: |
           mkdir -p /tmp/cvefix
+          # Two runtime deps (one scoped) plus one dev-only dep, which
+          # must be excluded -> the parser should report exactly 2.
           cat > /tmp/cvefix/package-lock.json <<'EOF'
           {"lockfileVersion":3,"packages":{
             "":{"name":"x","version":"1.0.0"},
             "node_modules/lodash":{"version":"4.17.15"},
+            "node_modules/@babel/traverse":{"version":"7.22.5"},
             "node_modules/mocha":{"version":"9.0.0","dev":true}}}
           EOF
           # Network may be unavailable; we only assert it parses and
@@ -84,9 +87,10 @@ jobs:
           python - <<'PY'
           import json
           d = json.load(open("/tmp/out.json"))
-          assert any("package-lock.json" in s for s in d["scanned"]), d
-          assert "2 packages" in d["scanned"][0], d["scanned"]  # dev dep excluded
-          print("scanner smoke test OK:", d["scanned"])
+          scanned = d["scanned"]
+          assert any("package-lock.json" in s for s in scanned), scanned
+          assert "(2 packages)" in scanned[0], scanned   # dev dep excluded
+          print("scanner smoke test OK:", scanned)
           PY
 
   shell:
