@@ -168,6 +168,8 @@ Confidence should read as "works on the box we tried," not "works everywhere."
 | Reverse-shell detector | Validated (fires, captures evidence) |
 | Recon-burst detector | Validated (fires, captures evidence) |
 | Wizard / onboarding, CI, docs | Working |
+| CVE scanner logic (role 11) | Validated locally: lockfile parsing, live OSV queries, dedupe, Tier-2 PR flow on a real repo |
+| CVE role *deployment* (systemd timer, `ProtectSystem=strict` sandbox) | **Units validated statically only — never installed on a real server** |
 | Backups + restore-test | **Shipped, never run for real** |
 | fwknop (SPA) | **Shipped, never tested** |
 | App/DB/TLS roles (05/06) | **Shipped, never tested** |
@@ -180,6 +182,13 @@ Confidence should read as "works on the box we tried," not "works everywhere."
 
 ## 7. Open problems (good "help wanted" issues)
 
+0. **Run role 11 (CVE watch) on a real server.** Its scanner is well
+   tested, but the systemd deployment — particularly the
+   `ProtectSystem=strict` sandbox combined with the simulated
+   `apt-get -s upgrade` used to count pending OS security updates — has
+   only been checked statically. If the sandbox blocks apt, that count
+   degrades to "unavailable" rather than failing, but it should be
+   confirmed on real hardware.
 1. Reliable interactive-vs-automation **session attribution** for SSH logins
    (the unsolved watcher problem).
 2. End-to-end **backup + restore** validation, ideally in CI with a mock or real

@@ -56,6 +56,14 @@ ssh_pattern_watcher_enabled: false
 # If your Node app legitimately shells out via a known wrapper, exempt it:
 # revshell_allowed_parent_cmdlines: "/opt/app/bin/deploy-hook"
 
+# CVE watch: daily dependency + OS vulnerability scan (role 11).
+# Detection only - it never upgrades anything by itself. Use
+# scripts/cve-pr.sh to turn findings into a PR against your repo.
+cve_watch_enabled: true
+cve_watch_min_severity: "high"   # low | moderate | high | critical
+# cve_watch_include_dev: false   # dev-only deps are not shipped
+# cve_watch_hour: 6              # daily scan hour (local time)
+
 # Egress lockdown: default-deny outbound. Off unless you know the app's
 # outbound needs. Add non-standard ports here when you enable it.
 egress_lockdown: false

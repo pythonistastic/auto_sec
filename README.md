@@ -35,6 +35,8 @@ Takes a fresh Ubuntu/Debian server from zero to:
   plus a ransomware early-warning canary (mass file-change detection)
 - Nightly client-side-encrypted backups (age) to a Backblaze B2 bucket
   whose key **cannot delete** — malware on the box can't destroy history
+- A daily **CVE watch** that tells you when your dependencies or OS
+  packages pick up a known vulnerability, with the exact upgrade to run
 - Telegram alerts for everything, and a generated security report
 
 > ⚠️ **Early-stage project — no guarantees.** auto_sec raises the bar; it
@@ -239,6 +241,7 @@ testing showed it false-positives on automation; see below.)
 | 08 | detection | Detective | auditd tripwires, ransomware canary, Telegram alerts |
 | 09 | watcher | Detective/Reactive | Breach detection suite: reverse-shell scanner + recon-burst detector (+ experimental login tripwire) |
 | 10 | report | Deliverable | Generated security report |
+| 11 | cve-watch | Preventive/Detective | Daily dependency + OS CVE scan against OSV.dev, alerts with the exact fix |
 
 Partial runs with tags:
 
@@ -321,6 +324,77 @@ your Telegram lit up. Run it in `alert` mode (it refuses `active` mode
 unless you set `REDTEAM_FORCE=1`, since active mode would kill the test
 processes). This is also the fastest way to confirm a new detector works
 before sending a PR.
+
+## CVE watch — know when your stack becomes vulnerable
+
+The detectors above assume someone got in. This layer works on the other
+side: it tells you when the software you're running picks up a **known
+vulnerability**, before anyone exploits it.
+
+Every day, role 11 reads your app's dependency lockfiles, asks
+[OSV.dev](https://osv.dev) whether those exact versions have advisories,
+and alerts with the **minimal safe upgrade** and a copy-pasteable fix:
+
+```
+CVE WATCH [prod-1]
+2 new vulnerable dependencies (1 critical, 1 high).
+Also 5 pending OS security updates.
+
+[CRITICAL] next 13.4.0 - CVE-2025-29927
+  Authorization bypass in Next.js middleware
+  fix: npm install next@13.5.9
+```
+
+It adds **no third-party binary** to the server — the scanner is stdlib
+Python, like the detectors, so a machine whose job is to be hard to
+compromise doesn't grow new supply-chain surface. The only outbound calls
+are HTTPS to `api.osv.dev` (already allowed under `egress_lockdown`).
+
+Supported lockfiles: `package-lock.json` (npm), `requirements.txt`
+(PyPI), `composer.lock` (Packagist), `go.mod` (Go). Anything present but
+unsupported (`yarn.lock`, `poetry.lock`, `Cargo.lock`, …) is **listed in
+the report as unscanned**, so coverage is never silently partial.
+
+```yaml
+cve_watch_enabled: true
+cve_watch_min_severity: "high"   # low | moderate | high | critical
+cve_watch_hour: 6                # daily, +random <1h
+```
+
+`min_severity` starts at **high** on purpose: a first scan of a real app
+can surface dozens of findings, and an alert channel nobody reads is
+worse than no alerts. Lower it once you've triaged the backlog. The full
+list — every severity — is always written to
+`/var/log/sentinel/cve-report-*.txt`. Findings are alerted once, so a
+daily timer doesn't re-nag you about the same CVE.
+
+### Turning findings into a pull request (Tier 2)
+
+Patching a dependency **on the server is temporary** — your next deploy
+overwrites it. The fix belongs in your repo, so `scripts/cve-pr.sh`
+scans a checkout, bumps each vulnerable package to the lowest version
+that fixes every advisory against it, and opens a PR:
+
+```bash
+./scripts/cve-pr.sh --repo ~/code/my-app --min-severity critical --dry-run
+```
+
+Run it on your workstation or in CI — **not on the production server**.
+Opening a PR needs a token with write access, and a token on an
+internet-facing box is exactly what an intruder harvests first (see the
+July 2026 Hugging Face breach). The on-server scanner stays read-only
+and credential-free by design. Copy
+[examples/cve-pr-workflow.yml](examples/cve-pr-workflow.yml) into your
+app repo to run it weekly in GitHub Actions.
+
+**What this does not do.** It won't auto-patch your app. A version bump
+can break a build at 3am with nobody watching, and without your tests
+there's no way to know it didn't. OS security packages *are* patched
+automatically (role 01, via `unattended-upgrades`) precisely because
+distros backport fixes without changing APIs — app dependencies don't
+get that guarantee. Findings are also matched by **version, not
+reachability**: a CVE in a package you never call still gets reported, so
+expect some triage.
 
 ### Egress lockdown
 

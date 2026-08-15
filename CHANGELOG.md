@@ -10,7 +10,35 @@ changes. Treat it as early-stage — see the
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **CVE watch (role 11)** — a daily scan that answers "is anything I run
+  now known-vulnerable?". Reads the app's dependency lockfiles, queries
+  [OSV.dev](https://osv.dev), and alerts with the **minimal safe upgrade**
+  and a copy-pasteable fix command; also counts unapplied OS security
+  updates. Supports npm, PyPI, Packagist and Go lockfiles, and *reports*
+  unsupported lockfiles rather than silently skipping them. Findings are
+  alerted once (state-deduplicated) and the full list is always written to
+  `/var/log/sentinel/cve-report-*.txt`.
+  - Adds **no third-party binary** to the server: the scanner is stdlib
+    Python, so hardened hosts gain no new supply-chain surface. Outbound
+    calls are HTTPS to `api.osv.dev` only, already allowed by
+    `egress_lockdown`.
+  - Runs under a hardened systemd timer (`ProtectSystem=strict`,
+    `NoNewPrivileges`), daily with a randomized delay.
+  - Defaults to `min_severity: high` to avoid first-run alert fatigue.
+- **`scripts/cve-pr.sh` (Tier 2)** — turns findings into a pull request
+  against your repository, which is where a dependency fix actually
+  persists (patching the server is undone by the next deploy). Collapses
+  multiple advisories per package into one upgrade, supports `--dry-run`,
+  `--package`, and `--min-severity`, and opens the PR via `gh` or the
+  GitHub API. Deliberately intended for a workstation or CI, **not** the
+  production server, so no write-scoped token has to live on an
+  internet-facing box.
+- **`examples/cve-pr-workflow.yml`** — drop-in GitHub Actions workflow to
+  run Tier 2 weekly in CI.
+- CI now compile-checks the CVE scanner and smoke-tests its lockfile
+  parsing (including dev-dependency exclusion).
 
 ## [0.1.0] - 2026-07-26
 

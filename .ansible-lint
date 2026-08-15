@@ -18,3 +18,6 @@ exclude_paths:
   - secrets/
   - reports/
   - .github/
+  # GitHub Actions workflows, not Ansible: their `on:` key is valid YAML
+  # truthy and ansible-lint has no business judging them.
+  - examples/

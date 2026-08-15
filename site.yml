@@ -107,3 +107,10 @@
         name: 10-report
         apply: { tags: ["report"] }
       tags: ["report"]
+
+    - name: "Layer 11: CVE watch (dependency + OS vulnerability scan)"
+      ansible.builtin.include_role:
+        name: 11-cve-watch
+        apply: { tags: ["cve"] }
+      tags: ["cve"]
+      when: cve_watch_enabled | default(true)

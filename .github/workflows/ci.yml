@@ -65,6 +65,30 @@ jobs:
           done
           python -m py_compile /tmp/pyc/*.py
 
+      - name: Compile-check the CVE scanner
+        run: python -m py_compile roles/11-cve-watch/files/cve_watch.py
+
+      - name: CVE scanner smoke test (lockfile parsing, offline)
+        run: |
+          mkdir -p /tmp/cvefix
+          cat > /tmp/cvefix/package-lock.json <<'EOF'
+          {"lockfileVersion":3,"packages":{
+            "":{"name":"x","version":"1.0.0"},
+            "node_modules/lodash":{"version":"4.17.15"},
+            "node_modules/mocha":{"version":"9.0.0","dev":true}}}
+          EOF
+          # Network may be unavailable; we only assert it parses and
+          # reports the lockfile without crashing.
+          python roles/11-cve-watch/files/cve_watch.py \
+            --scan-dir /tmp/cvefix --json > /tmp/out.json || true
+          python - <<'PY'
+          import json
+          d = json.load(open("/tmp/out.json"))
+          assert any("package-lock.json" in s for s in d["scanned"]), d
+          assert "2 packages" in d["scanned"][0], d["scanned"]  # dev dep excluded
+          print("scanner smoke test OK:", d["scanned"])
+          PY
+
   shell:
     runs-on: ubuntu-latest
     steps:
