@@ -10,7 +10,15 @@ changes. Treat it as early-stage — see the
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- CI: the CVE scanner smoke test asserted the wrong package count. Its
+  fixture contained one runtime dependency plus a dev-only one — which the
+  scanner correctly excludes — so it reported 1 where the test demanded 2,
+  turning the v0.2.0 build red. The scanner itself was never affected. The
+  fixture now holds two runtime dependencies (one scoped, exercising
+  `@scope/name` parsing) plus a dev-only one, so the assertion proves both
+  inclusion and dev-exclusion.
 
 ## [0.2.0] - 2026-08-15
 
