@@ -60,6 +60,13 @@ SCAN=$(conf_get revshell scan_interval); SCAN=${SCAN:-5}
 POLL=$(conf_get recon poll_interval);   POLL=${POLL:-10}
 RWIN=$(conf_get recon window_seconds);  RWIN=${RWIN:-45}
 
+# These values reach $(( )) below. Bash arithmetic evaluates array
+# subscripts, so a value like  a[$(cmd)]  would execute cmd as root. Accept
+# plain integers only.
+for v in SCAN POLL RWIN; do
+  [[ "${!v}" =~ ^[0-9]{1,5}$ ]] || die "$v in $CONF is not an integer: '${!v}'"
+done
+
 if [ "$MODE" = "active" ] && [ "${REDTEAM_FORCE:-0}" != "1" ]; then
   die "watcher_mode is 'active'. Test in alert mode, or set REDTEAM_FORCE=1 if you accept that test sessions may be killed and loopback may be blocked."
 fi

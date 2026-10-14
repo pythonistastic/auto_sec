@@ -13,3 +13,8 @@ reports/
 # Ansible noise
 *.retry
 __pycache__/
+
+# Editor/backup files - never commit (a stray .bak once held a vulnerable script)
+*.bak
+*.orig
+*~

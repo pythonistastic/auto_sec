@@ -53,6 +53,30 @@
           failed assertion above). Fix host_vars and re-run - nothing has
           been changed on the server yet.
 
+    # Runs BEFORE the shape checks so an unfilled template gets a clear
+    # "still a placeholder" message rather than a misleading "unsafe shape".
+    # Only credentials an ENABLED feature actually needs are checked:
+    # telegram_bot_token: CHANGE_ME is a legitimate "alerts off" setting.
+    - name: "Preflight: required credentials are not template placeholders"
+      tags: [always]
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - >-
+            (b2_bucket is not defined)
+            or ('CHANGE' not in (b2_key_id | string)
+                and 'CHANGE' not in (b2_app_key | string)
+                and 'CHANGE' not in (age_public_key | string | upper))
+          - (db_engine is not defined) or ('CHANGE_ME' not in (db_password | string))
+          - >-
+            (paranoia_level | default('standard') != 'high')
+            or ('CHANGE' not in (fwknop_key | string) and 'CHANGE' not in (fwknop_hmac_key | string))
+        fail_msg: >-
+          host_vars still contains a CHANGE_ME placeholder for a feature you
+          enabled (see the failed assertion). Fill in the real value, or
+          remove the feature's trigger variable (b2_bucket / db_engine /
+          paranoia_level) to turn that feature off. Nothing has been changed.
+
     # --- Value validation --------------------------------------------------
     # Required vars are not enough: their VALUES reach shell commands, file
     # paths and newline-delimited config files. A value is only safe if its
@@ -68,6 +92,10 @@
       ansible.builtin.assert:
         quiet: true
         that:
+          # Used as a path component (report file, backup prefix) and inside
+          # the hostname module, so it must be a plain hostname-like label.
+          - inventory_hostname is match('^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$')
+          - inventory_hostname is not search('\.\.')
           # Reaches sshd_config, audit rules and /home/<user> paths.
           - deploy_user is match('^[a-z_][a-z0-9_-]{0,31}$')
           # Reaches sshd_config, ufw and fwknop access.conf.
@@ -105,6 +133,10 @@
           - (letsencrypt_email is not defined) or (letsencrypt_email is match('^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$'))
           # Node major version only: reaches a shell pipeline.
           - (node_version is not defined) or (node_version | string is match('^[0-9]{1,2}$'))
+          # Rendered into nginx's proxy_pass line.
+          - (app_port is not defined) or (app_port | string is match('^[0-9]{1,5}$') and (app_port | int) > 0 and (app_port | int) < 65536)
+          # A path component under /etc/postgresql/<version>/main.
+          - (pg_version is not defined) or (pg_version | string is match('^[0-9]{1,3}$'))
           - (app_type is not defined) or (app_type in ['node', 'docker'])
           # SQL identifiers: reach pg_dump/mysqldump and a mysql priv DSL.
           - (db_engine is not defined) or (db_engine in ['postgres', 'mysql'])
@@ -113,8 +145,12 @@
           - (db_password is not defined) or (db_password is not search('[\r\n]'))
           # Reach the backup script and rclone remote.
           - (b2_bucket is not defined) or (b2_bucket is match('^[A-Za-z0-9][A-Za-z0-9-]{1,49}$'))
-          - (b2_key_id is not defined) or (b2_key_id is match('^[A-Za-z0-9]{1,64}$'))
-          - (b2_app_key is not defined) or (b2_app_key is match('^[A-Za-z0-9]{1,128}$'))
+          # Deliberately permissive: Backblaze does not publish the key
+          # charset, and rejecting a real key is a bug of its own. These land
+          # in rclone.conf (an INI file), so only whitespace, newlines and
+          # shell/quoting characters are excluded.
+          - (b2_key_id is not defined) or (b2_key_id is match('^[A-Za-z0-9+/=_.-]{1,128}$'))
+          - (b2_app_key is not defined) or (b2_app_key is match('^[A-Za-z0-9+/=_.-]{1,256}$'))
           # The recipient of every backup. A second recipient here reads
           # every future backup, so the charset must be exact.
           - (age_public_key is not defined) or (age_public_key is match('^age1[02-9ac-hj-np-z]{10,100}$'))
@@ -146,6 +182,11 @@
           - (revshell_allowed_parent_cmdlines is not defined) or (revshell_allowed_parent_cmdlines is not search('[\r\n,]'))
           - (recon_patterns is not defined) or (recon_patterns is not search('[\r\n]'))
           - (report_prepared_by is not defined) or (report_prepared_by is not search('[\r\n]'))
+          # Rendered into the client-facing report: a newline would let a
+          # value inject whole sections into a document a client relies on.
+          - (client_name is not defined) or (client_name is not search('[\r\n]') and client_name | length <= 200)
+          # Rendered into cve-watch.conf (an INI file read by the scanner).
+          - (cve_watch_min_severity is not defined) or (cve_watch_min_severity | lower in ['low', 'moderate', 'medium', 'high', 'critical'])
         fail_msg: >-
           An alerting or detector value has an unsafe shape (see the failed
           assertion). Nothing has been changed on the server.

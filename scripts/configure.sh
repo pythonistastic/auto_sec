@@ -22,6 +22,22 @@ note() { printf '    %s\n' "$*"; }
 warn() { printf '\033[1;33mWARNING:\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Emit a value as a single-quoted YAML scalar for host_vars.
+#
+# Values used to be written as  echo "key: \"${VAR}\""  - so a typed " or \
+# broke out of the string and could inject arbitrary extra keys into
+# host_vars, including keys the playbook preflight never checks. Inside
+# single quotes YAML interprets nothing except '' (an escaped quote), so ",
+# \, $, # and : are all literal. Newlines are refused: `read -r` cannot
+# produce one, so a value carrying one came from a file or a network
+# response, and would otherwise be folded silently.
+yaml_str() {
+  case "$1" in
+    *$'\n'*|*$'\r'*) die "refusing a value containing a newline: $(printf '%q' "$1")" ;;
+  esac
+  printf "'%s'" "${1//\'/\'\'}"
+}
+
 banner() {
   printf '\033[1;32m'
   cat <<'ART'
@@ -92,6 +108,9 @@ SSH_KEY_FILE=""
 if [ "$MODE" = "remote" ]; then
   ask_required "Server public IP address"
   SERVER_IP="$REPLY"
+  # Becomes ansible_host. An IP or a plain hostname, nothing else.
+  [[ "$SERVER_IP" =~ ^[A-Za-z0-9][A-Za-z0-9.:-]{0,252}$ ]] \
+    || die "Not a valid IP address or hostname: $SERVER_IP"
 fi
 
 # ------------------------------------------------------------- identity
@@ -183,6 +202,9 @@ APP_TYPE="$REPLY"
 [ "$APP_TYPE" = "node" ] || [ "$APP_TYPE" = "docker" ] || die "Must be node or docker."
 ask "App listen port (Nginx proxies to it)" "3000"
 APP_PORT="$REPLY"
+# Rendered into the nginx vhost's proxy_pass line.
+[[ "$APP_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$APP_PORT" -ge 1 ] && [ "$APP_PORT" -le 65535 ] \
+  || die "Port must be a number between 1 and 65535."
 NODE_VERSION="20"
 [ "$APP_TYPE" = "node" ] && { ask "Node.js major version" "20"; NODE_VERSION="$REPLY"; }
 
@@ -209,10 +231,22 @@ note "   (Telegram won't let a bot message you until you do)."
 ask "Telegram bot token (empty to skip alerts for now)" ""
 TG_TOKEN="$REPLY"
 TG_CHAT=""
+[ -z "$TG_TOKEN" ] || [[ "$TG_TOKEN" =~ ^[0-9]{5,}:[A-Za-z0-9_-]{20,}$ ]] \
+  || die "That doesn't look like a bot token (expected 123456789:AAH...)."
+
+# Call the Telegram API without putting the token on a command line. The
+# token lives in the URL path, and a process's argv is readable by every
+# local user via `ps` - which matters because in local mode this wizard runs
+# on the server itself. curl -K - takes its config (here, the URL) on stdin.
+tg_api() {  # tg_api <method> [extra curl args...]
+  local method="$1"; shift
+  printf 'url = "https://api.telegram.org/bot%s/%s"\n' "$TG_TOKEN" "$method" \
+    | curl -s --max-time 10 -K - "$@"
+}
 
 # Ask Telegram for the chat id from the message the user just sent the bot.
 detect_chat_id() {
-  curl -s --max-time 10 "https://api.telegram.org/bot${TG_TOKEN}/getUpdates" \
+  tg_api getUpdates \
     | grep -oE '"chat":\{"id":-?[0-9]+' | grep -oE '\-?[0-9]+$' | tail -1
 }
 
@@ -233,11 +267,13 @@ if [ -n "$TG_TOKEN" ]; then
     warn "(from https://api.telegram.org/bot<TOKEN>/getUpdates) or leave blank."
     ask "Telegram chat id" ""
     TG_CHAT="$REPLY"
+    [ -z "$TG_CHAT" ] || [[ "$TG_CHAT" =~ ^-?[0-9]{1,32}$ ]] \
+      || die "A chat id is a number (groups are negative)."
   fi
 
   if [ -n "$TG_CHAT" ]; then
-    RESP="$(curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-      -d chat_id="${TG_CHAT}" -d text="auto_sec wizard: test OK for ${SERVER}")"
+    RESP="$(tg_api sendMessage -X POST \
+      -d chat_id="${TG_CHAT}" --data-urlencode "text=auto_sec wizard: test OK for ${SERVER}")"
     if echo "$RESP" | grep -q '"ok":true'; then
       say "Test message delivered — check your Telegram."
     elif echo "$RESP" | grep -q 'chat not found'; then
@@ -304,8 +340,13 @@ fi
 OFFICE_IP=""
 if confirm "Keep a break-glass IP allowed on the SSH port (recommended)?"; then
   DETECTED_IP="$(curl -s --max-time 5 https://api.ipify.org || true)"
+  # A network response is not trusted input: only offer it as the default if
+  # it actually looks like an IP address.
+  [[ "$DETECTED_IP" =~ ^[0-9a-fA-F:.]{2,45}$ ]] || DETECTED_IP=""
   ask "Break-glass IP (your office/home static IP)" "${DETECTED_IP}"
   OFFICE_IP="$REPLY"
+  [ -z "$OFFICE_IP" ] || [[ "$OFFICE_IP" =~ ^[0-9a-fA-F:.]{2,45}(/[0-9]{1,3})?$ ]] \
+    || die "Not a valid IP address or CIDR: $OFFICE_IP"
 fi
 
 # ------------------------------------------------------------ egress lockdown
@@ -351,52 +392,66 @@ if [ "$WATCHER_MODE" = "active" ]; then
 fi
 
 # ------------------------------------------------------------------- write
+# yaml_str refuses newlines, but it runs inside $(...), where `die` only ends
+# the subshell - the wizard would carry on and write an empty value. So check
+# every value here, in the main shell, before anything is written. The usual
+# source of a newline is a .pub file holding more than one key.
+for v in AGE_PUBLIC APP_PORT APP_TYPE B2_APP_KEY B2_BUCKET B2_KEY_ID \
+         CLIENT_NAME DB_ENGINE DB_NAME DB_PASSWORD DB_USER DEPLOY_PUBKEY \
+         DOMAIN FWKNOP_HMAC FWKNOP_KEY LE_EMAIL NODE_VERSION OFFICE_IP \
+         PARANOIA SERVER_IP SSH_KEY_FILE TG_CHAT TG_TOKEN WATCHER_MODE \
+         WATCHER_PATTERN; do
+  case "${!v-}" in
+    *$'\n'*|*$'\r'*) die "$v contains a newline; refusing to write $HOSTVARS. (A .pub file with several keys? Pick one.)" ;;
+  esac
+done
+
 say "Writing ${HOSTVARS}"
 {
   echo "---"
   echo "# Generated by scripts/configure.sh on $(date -u +%F)"
   echo "# This file contains secrets. It is gitignored - keep it that way."
   echo
-  echo "client_name: \"${CLIENT_NAME}\""
-  echo "client_domain: \"${DOMAIN}\""
-  echo "letsencrypt_email: \"${LE_EMAIL}\""
+  echo "client_name: $(yaml_str "${CLIENT_NAME}")"
+  echo "client_domain: $(yaml_str "${DOMAIN}")"
+  echo "letsencrypt_email: $(yaml_str "${LE_EMAIL}")"
   echo
-  echo "paranoia_level: \"${PARANOIA}\""
-  echo "office_static_ip: \"${OFFICE_IP}\""
+  echo "paranoia_level: $(yaml_str "${PARANOIA}")"
+  echo "office_static_ip: $(yaml_str "${OFFICE_IP}")"
   echo "egress_lockdown: ${EGRESS}"
   echo
-  echo "deploy_ssh_public_key: \"${DEPLOY_PUBKEY}\""
+  echo "deploy_ssh_public_key: $(yaml_str "${DEPLOY_PUBKEY}")"
   echo
-  echo "app_type: \"${APP_TYPE}\""
+  echo "app_type: $(yaml_str "${APP_TYPE}")"
   echo "app_dir: \"/opt/app\""
-  echo "app_port: ${APP_PORT}"
-  echo "node_version: \"${NODE_VERSION}\""
+  echo "app_port: $(yaml_str "${APP_PORT}")"
+  echo "node_version: $(yaml_str "${NODE_VERSION}")"
   if [ "$DB_ENGINE" != "none" ]; then
     echo
-    echo "db_engine: \"${DB_ENGINE}\""
-    echo "db_name: \"${DB_NAME}\""
-    echo "db_user: \"${DB_USER}\""
-    echo "db_password: \"${DB_PASSWORD}\""
+    echo "db_engine: $(yaml_str "${DB_ENGINE}")"
+    echo "db_name: $(yaml_str "${DB_NAME}")"
+    echo "db_user: $(yaml_str "${DB_USER}")"
+    echo "db_password: $(yaml_str "${DB_PASSWORD}")"
   fi
   echo
-  echo "telegram_bot_token: \"${TG_TOKEN}\""
-  echo "telegram_chat_id: \"${TG_CHAT}\""
+  echo "telegram_bot_token: $(yaml_str "${TG_TOKEN}")"
+  echo "telegram_chat_id: $(yaml_str "${TG_CHAT}")"
   if [ "$BACKUPS" = "1" ]; then
     echo
-    echo "b2_bucket: \"${B2_BUCKET}\""
-    echo "b2_key_id: \"${B2_KEY_ID}\""
-    echo "b2_app_key: \"${B2_APP_KEY}\""
-    echo "age_public_key: \"${AGE_PUBLIC}\""
+    echo "b2_bucket: $(yaml_str "${B2_BUCKET}")"
+    echo "b2_key_id: $(yaml_str "${B2_KEY_ID}")"
+    echo "b2_app_key: $(yaml_str "${B2_APP_KEY}")"
+    echo "age_public_key: $(yaml_str "${AGE_PUBLIC}")"
   fi
   if [ "$PARANOIA" = "high" ]; then
     echo
-    echo "fwknop_key: \"${FWKNOP_KEY}\""
-    echo "fwknop_hmac_key: \"${FWKNOP_HMAC}\""
+    echo "fwknop_key: $(yaml_str "${FWKNOP_KEY}")"
+    echo "fwknop_hmac_key: $(yaml_str "${FWKNOP_HMAC}")"
     echo "fwknop_open_seconds: 30"
   fi
   echo
-  echo "watcher_pattern: \"${WATCHER_PATTERN}\""
-  echo "watcher_mode: \"${WATCHER_MODE}\""
+  echo "watcher_pattern: $(yaml_str "${WATCHER_PATTERN}")"
+  echo "watcher_mode: $(yaml_str "${WATCHER_MODE}")"
   echo "watcher_whitelist_ips: []"
   echo "ssh_pattern_watcher_enabled: ${SSH_WATCHER}"
 } > "$HOSTVARS"
@@ -414,9 +469,9 @@ say "Writing inventory/${SERVER}.yml"
     echo "          ansible_host: 127.0.0.1"
     echo "          ansible_connection: local"
   else
-    echo "          ansible_host: ${SERVER_IP}"
+    echo "          ansible_host: $(yaml_str "${SERVER_IP}")"
     echo "          ansible_user: deploy"
-    echo "          ansible_ssh_private_key_file: ${SSH_KEY_FILE}"
+    echo "          ansible_ssh_private_key_file: $(yaml_str "${SSH_KEY_FILE}")"
   fi
 } > "inventory/${SERVER}.yml"
 

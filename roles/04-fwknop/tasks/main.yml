@@ -30,7 +30,7 @@
 - name: Remove open SSH rule from UFW (fwknop takes over)
   community.general.ufw:
     rule: limit
-    port: "{{ ssh_port }}"
+    port: "{{ ssh_port | int }}"
     proto: tcp
     delete: true
   failed_when: false
