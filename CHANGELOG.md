@@ -10,6 +10,10 @@ changes. Treat it as early-stage — see the
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.3.2] - 2026-10-14
+
 ### Fixed
 
 - **CI was red on the v0.3.1 tag.** The new port check in
@@ -321,7 +325,8 @@ Backups/restore, fwknop, app/DB/TLS roles, Telegram delivery, `active`
 mode, and non-Ubuntu-22.04 targets are shipped but **not yet validated
 end-to-end**. See [docs/RETROSPECTIVE.md](docs/RETROSPECTIVE.md).
 
-[Unreleased]: https://github.com/pythonistastic/auto_sec/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/pythonistastic/auto_sec/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.3.2
 [0.3.1]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.3.1
 [0.3.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.3.0
 [0.2.1]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.2.1
