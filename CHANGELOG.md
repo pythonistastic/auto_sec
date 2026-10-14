@@ -10,6 +10,10 @@ changes. Treat it as early-stage — see the
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.3.0] - 2026-10-14
+
 **Security release — upgrade promptly.** A codebase-wide audit found a class of injection bugs
 where a variable's *value* could stop being data and become part of a command,
 a file path, or a config directive. 59 issues were found and fixed.
@@ -211,7 +215,8 @@ Backups/restore, fwknop, app/DB/TLS roles, Telegram delivery, `active`
 mode, and non-Ubuntu-22.04 targets are shipped but **not yet validated
 end-to-end**. See [docs/RETROSPECTIVE.md](docs/RETROSPECTIVE.md).
 
-[Unreleased]: https://github.com/pythonistastic/auto_sec/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/pythonistastic/auto_sec/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.3.0
 [0.2.1]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.2.1
 [0.2.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.2.0
 [0.1.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.1.0
