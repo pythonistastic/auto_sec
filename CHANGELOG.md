@@ -10,7 +10,15 @@ changes. Treat it as early-stage — see the
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **CI was red on the v0.3.1 tag.** The new port check in
+  `scripts/configure.sh` used `A && B || C`, which ShellCheck reports
+  (SC2015) at its default severity. The check itself was correct; it is
+  now a plain `if`. No runtime behaviour changed. The 0.3.1 checks were
+  run locally at `-S warning`, which hides that class of note.
+- `CONTRIBUTING.md` now lists the same ShellCheck command CI runs
+  (`scripts/` and `tests/`, default severity).
 
 ## [0.3.1] - 2026-10-14
 

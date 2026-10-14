@@ -38,7 +38,7 @@ gaps, or broaden OS support are very welcome.
 ansible-galaxy collection install -r requirements.yml
 ansible-playbook site.yml -i inventory/hosts.yml --syntax-check
 ansible-lint
-shellcheck scripts/*.sh
+shellcheck scripts/*.sh tests/*.sh   # default severity, same as CI
 python3 -m py_compile roles/09-watcher/templates/*.py.j2   # after stripping {{ }}
 ```
 

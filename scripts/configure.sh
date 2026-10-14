@@ -203,8 +203,9 @@ APP_TYPE="$REPLY"
 ask "App listen port (Nginx proxies to it)" "3000"
 APP_PORT="$REPLY"
 # Rendered into the nginx vhost's proxy_pass line.
-[[ "$APP_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$APP_PORT" -ge 1 ] && [ "$APP_PORT" -le 65535 ] \
-  || die "Port must be a number between 1 and 65535."
+if ! [[ "$APP_PORT" =~ ^[0-9]{1,5}$ ]] || [ "$APP_PORT" -lt 1 ] || [ "$APP_PORT" -gt 65535 ]; then
+  die "Port must be a number between 1 and 65535."
+fi
 NODE_VERSION="20"
 [ "$APP_TYPE" = "node" ] && { ask "Node.js major version" "20"; NODE_VERSION="$REPLY"; }
 
