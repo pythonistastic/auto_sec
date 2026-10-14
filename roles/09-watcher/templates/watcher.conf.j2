@@ -4,7 +4,7 @@
 # [watcher] holds values shared by ALL detectors plus the SSH pattern.
 [watcher]
 pattern = {{ watcher_pattern | default('cd /opt/app') }}
-window_seconds = {{ watcher_window_seconds | default(60) }}
+window_seconds = {{ watcher_window_seconds | default(60) | int }}
 mode = {{ watcher_mode | default('alert') }}
 telegram_bot_token = {{ telegram_bot_token }}
 telegram_chat_id = {{ telegram_chat_id }}
@@ -19,7 +19,7 @@ skip_non_interactive = {{ watcher_skip_non_interactive | default(true) | lower }
 # Reverse-shell / unexpected-shell scanner (watches the process table).
 [revshell]
 enabled = {{ revshell_enabled | default(true) | lower }}
-scan_interval = {{ revshell_scan_interval | default(5) }}
+scan_interval = {{ revshell_scan_interval | default(5) | int }}
 shell_names = {{ revshell_shell_names | default('bash,sh,dash,zsh,ksh,ash,busybox') }}
 netcat_names = {{ revshell_netcat_names | default('nc,ncat,netcat,socat') }}
 app_users = {{ revshell_app_users | default('app,www-data') }}
@@ -30,9 +30,9 @@ allowed_parent_cmdlines = {{ revshell_allowed_parent_cmdlines | default('') }}
 # Recon-burst detector (watches auditd exec_log for enumeration bursts).
 [recon]
 enabled = {{ recon_enabled | default(true) | lower }}
-poll_interval = {{ recon_poll_interval | default(10) }}
-window_seconds = {{ recon_window_seconds | default(45) }}
-threshold = {{ recon_threshold | default(4) }}
+poll_interval = {{ recon_poll_interval | default(10) | int }}
+window_seconds = {{ recon_window_seconds | default(45) | int }}
+threshold = {{ recon_threshold | default(4) | int }}
 # Leave recon_patterns unset to use the built-in list. To override,
 # set recon_patterns in host_vars as a comma-separated list of regexes.
 {% if recon_patterns is defined %}

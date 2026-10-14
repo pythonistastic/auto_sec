@@ -10,7 +10,106 @@ changes. Treat it as early-stage — see the
 
 ## [Unreleased]
 
-_Nothing yet._
+**Security release — upgrade promptly.** A codebase-wide audit found a class of injection bugs
+where a variable's *value* could stop being data and become part of a command,
+a file path, or a config directive. 59 issues were found and fixed.
+
+**Realistic impact today:** most of these variables are typed by the operator,
+so exploiting them meant attacking your own infrastructure. The reason they are
+being treated as security bugs is the boundary: the moment any value is derived
+from a managed host — a hostname read from a vhost, a package name, a domain —
+an attacker with limited access to that host could reach a root command. One
+issue (the detector one, below) was reachable **without any operator mistake**.
+
+### Fixed — code execution
+
+- `node_version` was interpolated into `curl … | bash` as root. Replaced with a
+  fetch-then-run via `get_url` + `command`, so no shell is involved.
+- `db_name`, `app_dir`, `b2_bucket` and `age_public_key` were interpolated into
+  `backup.sh`, which runs **as root from cron every night**. All values now go
+  through `| quote` (a single-quoted shell literal). Double quotes are *not*
+  sufficient — bash expands `$(…)` and backticks inside them.
+- `telegram_bot_token` / `telegram_chat_id` were rendered into two root-run
+  shell scripts (the 5-minute audit cron and the `Restart=always` canary unit).
+  Credentials are now written to root-only files and read at runtime, so they
+  never appear in shell source, in `ps`, or in a `--diff`.
+- `restore-test/monthly-restore.yml` had unquoted values in shell tasks and runs
+  on the **ops machine that holds every client's age private key**. Rewritten to
+  use `command: argv:` throughout, with `| quote` where a shell is genuinely
+  required.
+
+### Fixed — backup integrity
+
+- **`age -r "{{ age_public_key }}"` could be given a second recipient.** A
+  crafted value rendered as two `-r` flags, so every backup would also be
+  readable by an attacker — and a restore test would still pass, because the
+  legitimate recipient was still present. The recipient is now written to a
+  root-only file and consumed with `age -R`, which cannot be extended through a
+  command line.
+- The monthly restore test now **counts the recipient stanzas in the age header
+  and fails if there is more than one**, which detects exactly the attack a
+  successful decrypt cannot see.
+
+### Fixed — privilege escalation and file writes
+
+- `client_domain` reached `certbot` through `command:`, where argv splitting let
+  a value inject `--deploy-hook` — persisted by certbot into the renewal config
+  as root execution on every future renewal. Now passed via `argv:`.
+- `client_domain` was used as a path component under `/etc/nginx/sites-*`,
+  allowing traversal to arbitrary root-owned files. Now validated as a hostname.
+- `app_dir` reached `pm2 startup --hp` through argv splitting, which could append
+  a second `--user` and make the application's process manager run **as root**.
+  Now passed via `argv:`.
+- `db_name` was interpolated into MySQL's `priv` string DSL, where `/` and `:`
+  could append grants (e.g. `*.*:ALL`). Now passed as a dict key.
+
+### Fixed — config injection
+
+A newline in a value could append directives to files that are newline-
+delimited. Affected `sshd_config` (`ssh_port`, `ssh_max_auth_tries`,
+`deploy_user` — where an injected `Match` block overrides hardening regardless
+of order, and `sshd -t` still passes because the result is valid syntax), the
+fail2ban jail, fwknop `access.conf`, the audit rules, and `watcher.conf`.
+Numerics are now coerced with `| int` in the templates themselves, so a
+tag-scoped run that skips the preflight is still safe.
+
+### Fixed — detector hardening
+
+- **`block_ip()` accepted an unvalidated address parsed from `auth.log`.** Log
+  lines contain attacker-influencable text, so a crafted entry could make the
+  detector ban an arbitrary address — including the operator's. The value must
+  now parse as a routable IP; loopback, private, link-local and reserved
+  addresses are refused.
+- The ransomware canary had **no `sleep`** in its loop. With a missing or wrong
+  `app_dir`, `inotifywait` exits instantly and the unit spins a full CPU core
+  forever. It now backs off, excludes `node_modules`/`.next`, and tolerates a
+  missing directory.
+
+### Added
+
+- **Preflight value validation** in `site.yml` — charset, range and CR/LF checks
+  for every operator-supplied variable, enforced before any change. This is the
+  single enforcement point; roles may assume a validated value and must still
+  quote it.
+- `no_log: true` on every task that handles a token, key or password. Previously
+  **no task in the repo had it**, so `-vvv` or `--diff` printed secrets.
+- `SECURITY.md` — disclosure process, and the trust boundary written down:
+  *facts collected from a managed host must never be promoted into variables
+  automatically.*
+- CI now lints the **rendered** `.sh.j2` templates and fails the build if any
+  interpolation in a shell template skips `| quote` or `| int`.
+- Role 08 refuses to run if auditd is in immutable mode, and only watches the
+  deploy user's `authorized_keys` if the path exists (previously a tag-scoped
+  run could fail the whole ruleset load).
+
+### Changed
+
+- The audit rules file is now `90-autosec.rules` (was `hardening.rules`) so a
+  site-local `99-*.rules` can still apply `-e 2` last. The old file is removed
+  on upgrade to avoid a duplicate ruleset.
+- Preflight validation **may reject configurations that previously ran** — this
+  is why the minor version is bumped. If a run now fails preflight, the value it
+  names was reaching a shell or a config file unescaped.
 
 ## [0.2.1] - 2026-08-15
 

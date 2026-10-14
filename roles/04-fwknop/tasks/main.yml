@@ -9,12 +9,16 @@
     name: fwknop-server
     state: present
 
+# no_log: this renders both SPA keys. Without it, `--diff` (or `--check
+# --diff`) prints the full rendered access.conf, including KEY_BASE64 and
+# HMAC_KEY_BASE64, to the terminal and to any CI log.
 - name: Configure fwknopd access
   ansible.builtin.template:
     src: access.conf.j2
     dest: /etc/fwknop/access.conf
     mode: "0600"
   notify: restart fwknopd
+  no_log: true
 
 - name: Configure fwknopd main config
   ansible.builtin.template:

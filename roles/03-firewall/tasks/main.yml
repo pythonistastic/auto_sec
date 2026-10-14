@@ -62,14 +62,14 @@
 - name: Allow SSH with rate limiting (standard mode, fwknop gates it in high mode)
   community.general.ufw:
     rule: limit
-    port: "{{ ssh_port }}"
+    port: "{{ ssh_port | int }}"
     proto: tcp
   when: paranoia_level == "standard"
 
 - name: Break-glass, allow SSH from office static IP directly
   community.general.ufw:
     rule: allow
-    port: "{{ ssh_port }}"
+    port: "{{ ssh_port | int }}"
     proto: tcp
     src: "{{ office_static_ip }}"
   when: office_static_ip | length > 0
@@ -93,7 +93,7 @@
 
       [sshd]
       enabled = true
-      port = {{ ssh_port }}
+      port = {{ ssh_port | int }}
 
       [nginx-http-auth]
       enabled = true

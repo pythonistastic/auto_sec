@@ -1,23 +1,30 @@
 #!/usr/bin/env bash
 # Scans recent audit events for high-severity keys and alerts Telegram.
+#
+# SECURITY: credentials are read at runtime from root-only files. They are
+# NOT interpolated into this script, because bash expands $(...) and `...`
+# inside double quotes too - a crafted token would execute as root on the
+# next cron tick.
 set -uo pipefail
 
-TG_TOKEN="{{ telegram_bot_token }}"
-TG_CHAT="{{ telegram_chat_id }}"
+HOST_ID={{ inventory_hostname | quote }}
 STATE=/opt/detect/.last_check
+TG_TOKEN="$(cat /opt/detect/.tg_token 2>/dev/null || true)"
+TG_CHAT="$(cat /opt/detect/.tg_chat 2>/dev/null || true)"
 
 notify() {
+  [ -n "$TG_TOKEN" ] && [ "$TG_TOKEN" != "CHANGE_ME" ] || return 0
   curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-    -d chat_id="${TG_CHAT}" -d text="$1" > /dev/null || true
+    -d chat_id="${TG_CHAT}" --data-urlencode "text=$1" > /dev/null || true
 }
 
 SINCE="recent"
-[ -f "$STATE" ] && SINCE=$(cat "$STATE")
+[ -f "$STATE" ] && SINCE="$(cat "$STATE")"
 date "+%m/%d/%Y %H:%M:%S" > "$STATE"
 
-for KEY in identity privilege ssh_trust cron bin_tamper; do
-  HITS=$(ausearch -k "$KEY" -ts ${SINCE} 2>/dev/null | grep -c "^type=SYSCALL" || true)
+for KEY in identity privilege ssh_trust cron bin_tamper shell_exec; do
+  HITS=$(ausearch -k "$KEY" -ts "$SINCE" 2>/dev/null | grep -c "^type=SYSCALL" || true)
   if [ "${HITS:-0}" -gt 0 ]; then
-    notify "SECURITY ALERT [{{ inventory_hostname }}] ${HITS} event(s) matching '${KEY}' since last scan. Investigate: ausearch -k ${KEY}"
+    notify "SECURITY ALERT [${HOST_ID}] ${HITS} event(s) matching '${KEY}' since last scan. Investigate: ausearch -k ${KEY}"
   fi
 done

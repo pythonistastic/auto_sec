@@ -27,6 +27,7 @@
         password: "{{ db_password }}"
       become: true
       become_user: postgres
+      no_log: true
 
     - name: Grant only what the app needs (no superuser, no createdb)
       community.postgresql.postgresql_privs:
@@ -66,13 +67,19 @@
         name: "{{ db_name }}"
         login_unix_socket: /var/run/mysqld/mysqld.sock
 
+    # priv is given as a DICT, not the "db.table:PRIVS/db2.table:PRIVS" string
+    # DSL. In the string form db_name can contain '/' and ':' and so append
+    # extra grants - e.g. "*.*:ALL,GRANT OPTION/appdb" would grant the app
+    # user full server rights. As a dict key it can only ever be a database.
     - name: Create least-privilege app user (localhost only, own schema only)
       community.mysql.mysql_user:
         name: "{{ db_user }}"
         password: "{{ db_password }}"
         host: localhost
-        priv: "{{ db_name }}.*:SELECT,INSERT,UPDATE,DELETE,CREATE,INDEX,ALTER,REFERENCES"
+        priv:
+          "{{ db_name }}.*": "SELECT,INSERT,UPDATE,DELETE,CREATE,INDEX,ALTER,REFERENCES"
         login_unix_socket: /var/run/mysqld/mysqld.sock
+      no_log: true
 
 # Verification, applies to both
 - name: Verify DB is NOT reachable externally

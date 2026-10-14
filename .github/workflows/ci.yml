@@ -101,3 +101,29 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
           shellcheck scripts/*.sh tests/*.sh
+
+      # The .sh.j2 templates become root-run scripts (cron, systemd). They
+      # were never linted before, which is how unquoted interpolation reached
+      # production. Render them with placeholder values and lint the result.
+      - name: ShellCheck the rendered shell templates
+        run: |
+          mkdir -p /tmp/sh
+          for f in roles/*/templates/*.sh.j2; do
+            sed -e '/{%/d' -e "s/{{[^}]*}}/'PLACEHOLDER'/g" "$f" \
+              > "/tmp/sh/$(basename "$f" .j2)"
+          done
+          shellcheck -S warning /tmp/sh/*.sh
+
+      # Fail if a variable reaches a templated shell script without going
+      # through `| quote` or `| int`. Bash expands $(...) and backticks even
+      # inside double quotes, so quoting in the template is not optional.
+      - name: Reject unquoted interpolation in shell templates
+        run: |
+          bad=0
+          for f in roles/*/templates/*.sh.j2; do
+            if grep -nE '\{\{' "$f" | grep -vE '\|\s*(quote|int)\s*\}\}'; then
+              echo "::error file=$f::interpolation must use | quote or | int"
+              bad=1
+            fi
+          done
+          exit "$bad"

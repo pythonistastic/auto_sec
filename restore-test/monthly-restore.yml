@@ -9,17 +9,37 @@
 #
 # Requires locally: rclone (configured with a READ key), age private
 # key in your vault path, docker.
+#
+# SECURITY: this playbook runs on the machine that holds every client's age
+# private key, so a tainted variable here is worse than one on a server.
+# `client` arrives via -e and host_vars is read from disk, so both are
+# validated below and every interpolation is either an argv element or passed
+# through `| quote`.
 
 - name: Monthly restore verification
   hosts: localhost
+  connection: local
   gather_facts: true
   vars_files:
     - "../host_vars/{{ client }}.yml"
   vars:
-    age_private_key_file: "~/.vault/age-keys/{{ client }}.key"
+    age_private_key_file: "{{ lookup('env', 'HOME') }}/.vault/age-keys/{{ client }}.key"
     work: "/tmp/restore-test-{{ client }}"
+    expected_recipients: 1
 
   tasks:
+    - name: "Preflight: the client name and backup settings must be safe"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - client is defined
+          - client is match('^[a-z0-9][a-z0-9-]{0,62}$')
+          - b2_bucket is match('^[A-Za-z0-9][A-Za-z0-9-]{1,49}$')
+          - db_name is match('^[A-Za-z0-9_]{1,63}$')
+        fail_msg: >-
+          client/b2_bucket/db_name must be simple identifiers. They are used
+          in container names, paths and database commands on THIS machine.
+
     - name: Restore, verify, report
       block:
         - name: Clean workspace
@@ -28,50 +48,129 @@
             state: "{{ item }}"
           loop: [absent, directory]
 
-        - name: Find latest daily backup in B2
-          ansible.builtin.shell: >
-            rclone lsf b2:{{ b2_bucket }}/{{ client }}/daily/
-            --files-only | sort | tail -1
-          register: latest
+        - name: List daily backups in B2
+          ansible.builtin.command:
+            argv: [rclone, lsf, "b2:{{ b2_bucket }}/{{ client }}/daily/", --files-only]
+          register: b2_listing
           changed_when: false
 
         - name: Fail if no backup found
           ansible.builtin.fail:
             msg: "No backups found in bucket, investigate immediately"
-          when: latest.stdout | length == 0
+          when: (b2_listing.stdout_lines | select | list | length) == 0
+
+        - name: Pick the newest backup
+          ansible.builtin.set_fact:
+            latest_backup: "{{ b2_listing.stdout_lines | select | list | sort | last }}"
 
         - name: Download latest backup
-          ansible.builtin.command: >
-            rclone copyto
-            b2:{{ b2_bucket }}/{{ client }}/daily/{{ latest.stdout }}
-            {{ work }}/bundle.tar.gz.age
+          ansible.builtin.command:
+            argv:
+              - rclone
+              - copyto
+              - "b2:{{ b2_bucket }}/{{ client }}/daily/{{ latest_backup }}"
+              - "{{ work }}/bundle.tar.gz.age"
+          changed_when: true
 
-        - name: Decrypt with offline age key
-          ansible.builtin.shell: >
-            age -d -i {{ age_private_key_file }}
-            -o {{ work }}/bundle.tar.gz {{ work }}/bundle.tar.gz.age
+        # An age file header carries one stanza per recipient, in cleartext,
+        # before any ciphertext. Counting them detects the attack that a
+        # successful decrypt CANNOT see: an extra `-r` recipient silently
+        # added to the backup job, making every bundle readable by someone
+        # else. Decrypting with our own key still succeeds in that case.
+        - name: Count encryption recipients in the archive header
+          ansible.builtin.shell:
+            cmd: "head -c 8192 {{ (work ~ '/bundle.tar.gz.age') | quote }} | grep -c '^-> ' || true"
+          register: recipient_count
+          changed_when: false
+
+        - name: Fail if the backup was encrypted to anyone else
+          ansible.builtin.assert:
+            quiet: true
+            that:
+              - (recipient_count.stdout | trim | int) == (expected_recipients | int)
+            fail_msg: >-
+              SECURITY: this backup is encrypted to
+              {{ recipient_count.stdout | trim }} recipients, expected
+              {{ expected_recipients }}. An extra recipient means someone else
+              can decrypt every backup. Investigate the age recipient
+              configuration on the server before trusting any restore.
+
+        - name: Decrypt with the offline age key
+          ansible.builtin.command:
+            argv:
+              - age
+              - -d
+              - -i
+              - "{{ age_private_key_file }}"
+              - -o
+              - "{{ work }}/bundle.tar.gz"
+              - "{{ work }}/bundle.tar.gz.age"
+          changed_when: true
 
         - name: Extract
           ansible.builtin.unarchive:
             src: "{{ work }}/bundle.tar.gz"
             dest: "{{ work }}"
 
+        - name: Locate the database dump
+          ansible.builtin.find:
+            paths: "{{ work }}"
+            patterns: "db_*.sql"
+          register: dump_files
+
+        - name: Require exactly one dump
+          ansible.builtin.assert:
+            quiet: true
+            that: [(dump_files.files | length) == 1]
+            fail_msg: "Expected exactly one db_*.sql in the bundle, found {{ dump_files.files | length }}."
+
         - name: Start scratch Postgres container
-          ansible.builtin.shell: >
-            docker run -d --name restore-test-{{ client }}
-            -e POSTGRES_PASSWORD=scratch -e POSTGRES_DB={{ db_name }}
-            postgres:16 && sleep 10
+          ansible.builtin.command:
+            argv:
+              - docker
+              - run
+              - -d
+              - --name
+              - "restore-test-{{ client }}"
+              - -e
+              - POSTGRES_PASSWORD=scratch
+              - -e
+              - "POSTGRES_DB={{ db_name }}"
+              - postgres:16
+          changed_when: true
+
+        - name: Wait for Postgres to accept connections
+          ansible.builtin.command:
+            argv: [docker, exec, "restore-test-{{ client }}", pg_isready, -U, postgres]
+          register: pg_ready
+          until: pg_ready.rc == 0
+          retries: 30
+          delay: 2
+          changed_when: false
 
         - name: Restore dump into scratch container
-          ansible.builtin.shell: >
-            docker exec -i restore-test-{{ client }}
-            psql -U postgres {{ db_name }} < {{ work }}/db_*.sql
+          ansible.builtin.shell:
+            cmd: >-
+              docker exec -i {{ ('restore-test-' ~ client) | quote }}
+              psql -U postgres {{ db_name | quote }}
+              < {{ (dump_files.files[0].path) | quote }}
+          changed_when: true
 
-        - name: Sanity check, count tables and total rows
-          ansible.builtin.shell: |
-            docker exec restore-test-{{ client }} psql -U postgres -t {{ db_name }} -c \
-            "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';"
+        - name: Sanity check, count tables
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "restore-test-{{ client }}"
+              - psql
+              - -U
+              - postgres
+              - -t
+              - "{{ db_name }}"
+              - -c
+              - "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';"
           register: sanity
+          changed_when: false
 
         - name: Report result to Telegram
           ansible.builtin.uri:
@@ -82,8 +181,10 @@
               chat_id: "{{ telegram_chat_id }}"
               text: >-
                 RESTORE TEST {{ 'PASSED' if (sanity.stdout | trim | int) > 0 else 'FAILED' }}
-                for {{ client }}. Backup: {{ latest.stdout }}.
+                for {{ client }}. Backup: {{ latest_backup }}.
                 Tables restored: {{ sanity.stdout | trim }}.
+                Recipients: {{ recipient_count.stdout | trim }}.
+          no_log: true
 
         - name: Fail the play if sanity check failed (so cron surfaces it)
           ansible.builtin.fail:
@@ -102,14 +203,20 @@
                 RESTORE TEST FAILED for {{ client }}:
                 {{ ansible_failed_result.msg | default('see ansible output') }}
           failed_when: false
+          no_log: true
 
         - name: Surface the failure to cron
           ansible.builtin.fail:
             msg: "Restore verification FAILED for {{ client }}"
 
       always:
-        - name: Destroy scratch container and workspace
-          ansible.builtin.shell: |
-            docker rm -f restore-test-{{ client }} || true
-            rm -rf {{ work }}
+        - name: Destroy scratch container
+          ansible.builtin.command:
+            argv: [docker, rm, -f, "restore-test-{{ client }}"]
           failed_when: false
+          changed_when: true
+
+        - name: Destroy workspace
+          ansible.builtin.file:
+            path: "{{ work }}"
+            state: absent

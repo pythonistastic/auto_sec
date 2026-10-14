@@ -23,21 +23,49 @@
 - name: Node runtime block
   when: app_type == "node"
   block:
-    - name: Install Node.js via NodeSource
-      ansible.builtin.shell: |
-        curl -fsSL https://deb.nodesource.com/setup_{{ node_version }}.x | bash -
-        apt-get install -y nodejs
-      args:
-        creates: /usr/bin/node
+    # Leave an existing Node.js alone, whatever installed it (same behaviour
+    # as the previous `creates: /usr/bin/node`).
+    - name: Check for an existing Node.js
+      ansible.builtin.stat:
+        path: /usr/bin/node
+      register: node_bin
+
+    # Fetch then run, instead of `curl | bash`: the script is a file we can
+    # inspect, and node_version (validated as digits in site.yml preflight)
+    # never reaches a shell.
+    - name: Install Node.js from NodeSource
+      when: not node_bin.stat.exists
+      block:
+        - name: Fetch the NodeSource setup script
+          ansible.builtin.get_url:
+            url: "https://deb.nodesource.com/setup_{{ node_version | int }}.x"
+            dest: /opt/nodesource_setup.sh
+            mode: "0700"
+            owner: root
+            group: root
+
+        - name: Run the NodeSource setup script
+          ansible.builtin.command:
+            argv: [/bin/bash, /opt/nodesource_setup.sh]
+            creates: /etc/apt/sources.list.d/nodesource.list
+
+        - name: Install Node.js
+          ansible.builtin.apt:
+            name: nodejs
+            state: present
+            update_cache: true
 
     - name: Install PM2 globally
       community.general.npm:
         name: pm2
         global: true
 
+    # argv form: app_dir can never be split into an extra flag. Without it,
+    # app_dir "/opt/app -u root" appends a second --user and pm2 generates a
+    # unit that runs the application as root.
     - name: PM2 startup on boot as app user
-      ansible.builtin.command: pm2 startup systemd -u app --hp {{ app_dir }}
-      args:
+      ansible.builtin.command:
+        argv: [pm2, startup, systemd, -u, app, --hp, "{{ app_dir }}"]
         creates: /etc/systemd/system/pm2-app.service
 
 # --- Docker branch ---
@@ -83,9 +111,19 @@
     insertafter: "http {"
   notify: reload nginx
 
+# argv form: a value like "site.com --deploy-hook /tmp/x.sh" cannot become
+# extra flags. certbot persists --deploy-hook into the renewal config, which
+# would give an attacker root execution on every future renewal.
 - name: Obtain TLS certificate
-  ansible.builtin.command: >
-    certbot --nginx -d {{ client_domain }}
-    --non-interactive --agree-tos -m {{ letsencrypt_email }} --redirect
-  args:
+  ansible.builtin.command:
+    argv:
+      - certbot
+      - --nginx
+      - -d
+      - "{{ client_domain }}"
+      - --non-interactive
+      - --agree-tos
+      - -m
+      - "{{ letsencrypt_email }}"
+      - --redirect
     creates: "/etc/letsencrypt/live/{{ client_domain }}/fullchain.pem"

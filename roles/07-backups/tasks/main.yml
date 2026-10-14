@@ -12,6 +12,16 @@
     group: root
     mode: "0700"
 
+# The rclone config lives under /root/.config, which does not exist on a
+# minimal image until something creates it.
+- name: Ensure rclone config directory exists
+  ansible.builtin.file:
+    path: /root/.config/rclone
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
 - name: Configure rclone remote for B2 (scoped key, read+write, NO delete)
   ansible.builtin.copy:
     dest: /root/.config/rclone/rclone.conf
@@ -21,6 +31,36 @@
       type = b2
       account = {{ b2_key_id }}
       key = {{ b2_app_key }}
+  no_log: true
+
+# The age recipient is written to a file and consumed with `age -R`, so it
+# can never be appended to as an extra `-r` argument on a command line.
+# One recipient per line; a newline in the value would add a recipient, which
+# is why site.yml validates the charset before we get here.
+- name: Install the backup encryption recipient
+  ansible.builtin.copy:
+    dest: /opt/backup/recipients.txt
+    mode: "0600"
+    owner: root
+    group: root
+    content: "{{ age_public_key }}\n"
+  no_log: true
+
+# Alert credentials are read at runtime by the script, never rendered into
+# its source (where $(...) inside double quotes would execute as root).
+- name: Install alert credentials for the backup script
+  ansible.builtin.copy:
+    dest: "/opt/backup/{{ item.name }}"
+    mode: "0600"
+    owner: root
+    group: root
+    content: "{{ item.value }}"
+  loop:
+    - { name: ".tg_token", value: "{{ telegram_bot_token | default('CHANGE_ME') }}" }
+    - { name: ".tg_chat", value: "{{ telegram_chat_id | default('') }}" }
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true
 
 - name: Install backup script
   ansible.builtin.template:
@@ -28,11 +68,14 @@
     dest: /opt/backup/backup.sh
     mode: "0700"
 
+# hour/minute are forced through `| int`: the cron module joins the five time
+# fields with single spaces, so whitespace in a time field shifts the command
+# column and injects a job.
 - name: Nightly backup cron
   ansible.builtin.cron:
     name: "nightly encrypted backup to B2"
-    hour: "{{ backup_hour }}"
-    minute: "{{ backup_minute }}"
+    hour: "{{ backup_hour | int }}"
+    minute: "{{ backup_minute | int }}"
     job: "/opt/backup/backup.sh >> /var/log/backup.log 2>&1"
 
 - name: Logrotate for backup log

@@ -1,5 +1,5 @@
 # Managed by Ansible. Manual edits will be overwritten.
-Port {{ ssh_port }}
+Port {{ ssh_port | int }}
 Protocol 2
 
 PermitRootLogin no
@@ -10,7 +10,7 @@ KbdInteractiveAuthentication no
 UsePAM yes
 
 AllowUsers {{ deploy_user }}
-MaxAuthTries {{ ssh_max_auth_tries }}
+MaxAuthTries {{ ssh_max_auth_tries | int }}
 LoginGraceTime 20
 MaxSessions 5
 

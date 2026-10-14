@@ -2,54 +2,81 @@
 # Nightly backup: dump DB + app uploads, encrypt client-side with age,
 # push to B2. The B2 key CANNOT delete, bucket versioning is on, so
 # ransomware on this box cannot destroy backup history.
+#
+# SECURITY NOTES (do not undo these):
+#  * Every Ansible value below is rendered through `| quote`, which emits a
+#    single-quoted shell literal. Double quotes are NOT safe here: bash still
+#    expands $(...), `...` and ${...} inside them.
+#  * Secrets are NOT rendered into this file. They are read at runtime from
+#    root-only files, so they never appear in shell source, in `ps`, or in a
+#    --diff of this template.
+#  * The age recipient is read from a file with -R, never passed with -r on a
+#    command line, so a crafted value cannot append a second recipient and
+#    silently make every backup readable by someone else.
 set -euo pipefail
 
 STAMP=$(date +%F_%H%M)
 WORK=/opt/backup/tmp
-DEST="b2:{{ b2_bucket }}/{{ inventory_hostname }}"
-TG_TOKEN="{{ telegram_bot_token }}"
-TG_CHAT="{{ telegram_chat_id }}"
+B2_BUCKET={{ b2_bucket | quote }}
+HOST_ID={{ inventory_hostname | quote }}
+DEST="b2:${B2_BUCKET}/${HOST_ID}"
+RECIPIENTS=/opt/backup/recipients.txt
+APP_DIR={{ app_dir | quote }}
+{% if db_engine is defined %}
+DB_NAME={{ db_name | quote }}
+{% endif %}
+
+# Read alert credentials from root-only files (0600), never from argv.
+TG_TOKEN="$(cat /opt/backup/.tg_token 2>/dev/null || true)"
+TG_CHAT="$(cat /opt/backup/.tg_chat 2>/dev/null || true)"
 
 notify() {
+  [ -n "$TG_TOKEN" ] && [ "$TG_TOKEN" != "CHANGE_ME" ] || return 0
   curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-    -d chat_id="${TG_CHAT}" -d text="$1" > /dev/null || true
+    -d chat_id="${TG_CHAT}" --data-urlencode "text=$1" > /dev/null || true
 }
 
-trap 'notify "BACKUP FAILED on {{ inventory_hostname }} at ${STAMP}"' ERR
+trap 'notify "BACKUP FAILED on ${HOST_ID} at ${STAMP}"' ERR
 
 mkdir -p "$WORK"
 cd "$WORK"
 
 # 1. Database dump
+# SC2024 (sudo does not affect redirects) is not a problem here: this script
+# runs as root from cron, so the redirect is performed by root into $WORK.
+# sudo is only used to drop to the postgres role for the dump itself.
 {% if db_engine is defined and db_engine == "postgres" %}
-sudo -u postgres pg_dump {{ db_name }} > db_${STAMP}.sql
+# shellcheck disable=SC2024
+sudo -u postgres pg_dump -- "$DB_NAME" > "db_${STAMP}.sql"
 {% elif db_engine is defined and db_engine == "mysql" %}
-mysqldump --single-transaction {{ db_name }} > db_${STAMP}.sql
+mysqldump --single-transaction -- "$DB_NAME" > "db_${STAMP}.sql"
 {% else %}
-echo "no database configured" > db_${STAMP}.sql
+echo "no database configured" > "db_${STAMP}.sql"
 {% endif %}
 
 # 2. App files (uploads and env)
-tar czf files_${STAMP}.tar.gz -C {{ app_dir }} . 2>/dev/null || true
+tar czf "files_${STAMP}.tar.gz" -C "$APP_DIR" . 2>/dev/null || true
 
 # 3. Bundle and encrypt client-side. Private key NEVER on this server.
-tar czf bundle_${STAMP}.tar.gz db_${STAMP}.sql files_${STAMP}.tar.gz
-age -r "{{ age_public_key }}" -o bundle_${STAMP}.tar.gz.age bundle_${STAMP}.tar.gz
+#    -R reads recipients from a file: one per line, no argv parsing, so no
+#    extra recipient can be injected through a variable.
+tar czf "bundle_${STAMP}.tar.gz" "db_${STAMP}.sql" "files_${STAMP}.tar.gz"
+age -R "$RECIPIENTS" -o "bundle_${STAMP}.tar.gz.age" "bundle_${STAMP}.tar.gz"
 
 # 4. Upload with checksum verification
-rclone copyto bundle_${STAMP}.tar.gz.age "${DEST}/daily/bundle_${STAMP}.tar.gz.age" --b2-upload-cutoff 100M
-rclone check bundle_${STAMP}.tar.gz.age "${DEST}/daily/" --one-way --include "bundle_${STAMP}.tar.gz.age"
+rclone copyto "bundle_${STAMP}.tar.gz.age" "${DEST}/daily/bundle_${STAMP}.tar.gz.age" --b2-upload-cutoff 100M
+rclone check "bundle_${STAMP}.tar.gz.age" "${DEST}/daily/" --one-way --include "bundle_${STAMP}.tar.gz.age"
 
 # 5. Weekly and monthly copies (retention pruning happens at B2
 #    lifecycle level in the account console, NOT from this server,
 #    because this key cannot delete)
 if [ "$(date +%u)" = "7" ]; then
-  rclone copyto bundle_${STAMP}.tar.gz.age "${DEST}/weekly/bundle_${STAMP}.tar.gz.age"
+  rclone copyto "bundle_${STAMP}.tar.gz.age" "${DEST}/weekly/bundle_${STAMP}.tar.gz.age"
 fi
 if [ "$(date +%d)" = "01" ]; then
-  rclone copyto bundle_${STAMP}.tar.gz.age "${DEST}/monthly/bundle_${STAMP}.tar.gz.age"
+  rclone copyto "bundle_${STAMP}.tar.gz.age" "${DEST}/monthly/bundle_${STAMP}.tar.gz.age"
 fi
 
 # 6. Cleanup local, ping heartbeat
 rm -rf "$WORK"
-notify "Backup OK: {{ inventory_hostname }} ${STAMP} ($(du -h /opt/backup 2>/dev/null | tail -1 | cut -f1 || echo done))"
+notify "Backup OK: ${HOST_ID} ${STAMP}"

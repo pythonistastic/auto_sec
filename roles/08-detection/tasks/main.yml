@@ -10,9 +10,45 @@
     state: started
     enabled: true
 
+# Refuse to touch the ruleset if auditd is in immutable mode (-e 2): the
+# load would fail and the resulting ruleset would depend on reboot order.
+- name: Check whether the audit configuration is locked
+  ansible.builtin.command: auditctl -s
+  register: auditctl_status
+  changed_when: false
+  failed_when: false
+
+- name: Refuse to modify an immutable audit configuration
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - "'enabled 2' not in (auditctl_status.stdout | default(''))"
+    fail_msg: >-
+      auditd is in immutable mode (enabled 2). Loading rules would fail and
+      leave an unpredictable ruleset. Reboot first, or remove the `-e 2` rule,
+      then re-run.
+
+# Only watch the deploy user's authorized_keys if the path exists: auditctl
+# rejects a watch on a missing path and fails the whole `augenrules --load`.
+- name: Check for the deploy user's authorized_keys
+  ansible.builtin.stat:
+    path: "/home/{{ deploy_user }}/.ssh/authorized_keys"
+  register: deploy_authkeys
+
+# Upgrade path: versions <= 0.2.1 wrote hardening.rules. augenrules
+# concatenates every file in rules.d, so leaving it behind would load a
+# stale duplicate ruleset alongside the new one.
+- name: Remove the pre-0.3.0 audit rules file
+  ansible.builtin.file:
+    path: /etc/audit/rules.d/hardening.rules
+    state: absent
+  notify: restart auditd
+
+# Named 90- so that a site-local 99-*.rules containing `-e 2` still sorts
+# last, which is what augenrules requires for immutability to work.
 - name: Audit rules for intrusion indicators
   ansible.builtin.copy:
-    dest: /etc/audit/rules.d/hardening.rules
+    dest: /etc/audit/rules.d/90-autosec.rules
     mode: "0640"
     content: |
       ## Managed by Ansible
@@ -24,7 +60,9 @@
       -w /etc/sudoers.d/ -p wa -k privilege
 
       ## SSH trust changes (attacker persistence)
+      {% if deploy_authkeys.stat.exists %}
       -w /home/{{ deploy_user }}/.ssh/authorized_keys -p wa -k ssh_trust
+      {% endif %}
       -w /root/.ssh/ -p wa -k ssh_trust
 
       ## Scheduled task persistence
@@ -51,6 +89,32 @@
     path: /opt/detect
     state: directory
     mode: "0700"
+
+# Credentials and the watched path are consumed at RUNTIME from root-only
+# files. They are never rendered into shell source: bash expands $(...) and
+# backticks inside double quotes, so a crafted value would execute as root
+# under cron and under a Restart=always systemd unit.
+- name: Install detection runtime secrets
+  ansible.builtin.copy:
+    dest: "/opt/detect/{{ item.name }}"
+    mode: "0600"
+    owner: root
+    group: root
+    content: "{{ item.value }}"
+  loop:
+    - { name: ".tg_token", value: "{{ telegram_bot_token | default('CHANGE_ME') }}" }
+    - { name: ".tg_chat", value: "{{ telegram_chat_id | default('') }}" }
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true
+
+- name: Install the canary watch directory
+  ansible.builtin.copy:
+    dest: /opt/detect/.canary_dir
+    mode: "0600"
+    owner: root
+    group: root
+    content: "{{ app_dir }}\n"
 
 - name: Install detection alert script
   ansible.builtin.template:
