@@ -1,0 +1,4 @@
+Origin: Debian
+Label: Debian-Security
+Suite: stable-security
+Codename: trixie-security

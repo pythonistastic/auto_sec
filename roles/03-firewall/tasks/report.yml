@@ -1,0 +1,31 @@
+---
+# roles/03-firewall/tasks/report.yml - F12: _f2b_report, one line for role 10.
+# Included by fail2ban.yml after the change. Uses _f2b_trial (the effective
+# sshd jail values and the files they come from) and the service state.
+
+- name: "fail2ban F12: is fail2ban running now?"
+  ansible.builtin.command:
+    argv: [systemctl, is-active, fail2ban.service]
+  register: _f2b_active_now
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "fail2ban F12: one line for the report"
+  ansible.builtin.set_fact:
+    _f2b_report: >-
+      {% if (_f2b_active_now.stdout | default('') | trim) != 'active' %}fail2ban is NOT running{% if ansible_check_mode %} (check mode){% endif %}
+      {%- elif not (_f2b_trial.sshd.enabled | default(false)) %}fail2ban is running; its sshd jail is OFF
+      {%- else %}sshd jail: maxretry {{ _f2b_s.maxretry | default('?') }}, findtime {{ _f2b_s.findtime | default('?') }},
+      bantime {{ _f2b_s.bantime | default('?') }}{{ ', escalating' if (_f2b_s['bantime.increment'] | default('') | string | lower) == 'true' else '' }}
+      (values from {{ _f2b_from | join(', ') if (_f2b_from | length > 0) else 'jail.conf' }}){% endif %}
+  vars:
+    _f2b_s: "{{ _f2b_trial.sshd.effective | default({}) }}"
+    _f2b_from: >-
+      {{ _f2b_trial.sshd.set_in | default({}) | dict2items
+         | selectattr('key', 'in', ['maxretry', 'findtime', 'bantime', 'bantime.increment'])
+         | map(attribute='value') | map('regex_replace', ' \[.*$', '') | unique | list }}
+
+- name: "fail2ban F12: result"
+  ansible.builtin.debug:
+    msg: "{{ _f2b_report }}"

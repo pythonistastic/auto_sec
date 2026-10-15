@@ -1,0 +1,4 @@
+Origin: Ubuntu
+Label: Ubuntu
+Suite: noble-updates
+Codename: noble

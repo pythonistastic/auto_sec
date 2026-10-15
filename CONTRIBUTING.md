@@ -37,6 +37,24 @@ gaps, or broaden OS support are very welcome.
   and then tests a fresh login. Never add a `restart sshd` handler, never
   write `Port` or `ListenAddress`, never touch `ssh.socket`. CI checks
   the first rule.
+- **fail2ban changes go to auto_sec's own file.** Role 03 writes only
+  `/etc/fail2ban/jail.d/00-autosec.conf` (and role 05 only
+  `00-autosec-nginx.conf`). Never write `jail.local`, never add a
+  `restart fail2ban` handler: fail2ban is reloaded only when the trial
+  run shows an effective change. CI checks both.
+- **Update settings go to auto_sec's own file.** Role 01 writes only
+  `/etc/apt/apt.conf.d/51autosec-unattended-upgrades`, and only when an
+  operator setting asks for something (with the defaults it writes
+  none). Never write `20auto-upgrades` or `50unattended-upgrades` (the
+  one-time 0.1–0.4 restore, behind `-e apt_migrate_unattended_upgrades=true`,
+  is the only exception). The hostname and timezone change only when
+  the operator set `server_hostname` or `timezone`. Role 01 installs
+  missing packages only, without recommendations, and never one whose
+  install upgrades or removes another. The base-semantics tests check
+  all of this.
+- **Public variables live in `group_vars/all.yml`.** Roles 01 and 03
+  keep the same values in their `defaults/main.yml`, so their tests run
+  without group_vars. CI fails when the two differ.
 - **Host data is not input.** Values read from a managed host may be
   compared, shown, or used to refuse a run. They never become variables,
   file content or command arguments without a written exception in
@@ -51,14 +69,18 @@ ansible-lint
 # default severity, same files as CI (bash, for **):
 shopt -s globstar
 shellcheck scripts/*.sh tests/**/*.sh tests/guard/stubs/* \
-  roles/02-ssh-hardening/files/auto-sec-ssh-guard
+  roles/02-ssh-hardening/files/auto-sec-ssh-guard \
+  roles/01-base/files/autosec-apt-sim
 python3 -m py_compile roles/09-watcher/templates/*.py.j2   # after stripping {{ }}
 ```
 
 CI runs all of these on every push and pull request.
 
 If you touch SSH (role 02, the guard script, roles 03 or 04, or the
-preflight in `site.yml`), also run the two SSH test suites below.
+preflight in `site.yml`), also run the two SSH test suites below. If you
+touch fail2ban (role 03) or the update, hostname and timezone settings
+(role 01), run their lab tests (see
+[The fail2ban and update tests](#the-fail2ban-and-update-tests)).
 
 ### The SSH tests in CI
 
@@ -113,6 +135,41 @@ installed. It needs `dpkg-deb`, `curl`, `ssh-keygen`, `ansible-playbook`
 **Live role tests:** GitHub runners only. They use `sudo` and change
 the runner's sshd, ufw and fail2ban. Do not run them on your own
 machine or on a server you care about.
+
+### The fail2ban and update tests
+
+- **fail2ban semantics** (`tests/fail2ban/semantics/`). Real fail2ban
+  builds from Ubuntu 22.04, 24.04 and 26.04 and Debian 12 and 13 read
+  `/etc/fail2ban` layouts next to role 03's file: the read order, the
+  canary-like layout that must not change at all, migration of an
+  auto_sec 0.1–0.4 `jail.local`, the refusals and warnings. With a
+  Python that can import `asyncore` (`pip install pyasyncore` on Python
+  3.12+), a real fail2ban 1.0.2 server also runs as your user: reload
+  and restart semantics, and role 03's own task files against it.
+- **Update semantics** (`tests/base/semantics/`). Real
+  unattended-upgrades builds from the same five releases: role 01's own
+  task files run against lab apt configurations, and each release's
+  unattended-upgrades code reports what it would install from and
+  whether it would reboot, before and after. Role 01's package step
+  runs against real `apt-get -s` output (fake `dpkg-query` and `apt-get`
+  in `PATH`).
+- **Live tests** (`tests/fail2ban/live/`, `tests/base/live/`). The real
+  roles against GitHub's Ubuntu 22.04 and 24.04 VMs. GitHub runners
+  only: they reconfigure fail2ban, apt, the hostname and the timezone of
+  the machine they run on.
+
+Both lab suites run **without root**, download pinned packages
+(SHA256-checked) and unpack them with `dpkg-deb -x`. WSL (Ubuntu) works:
+
+```bash
+bash tests/fail2ban/semantics/run.sh --ansible "$(command -v ansible-playbook)"
+bash tests/base/semantics/run.sh
+```
+
+The update suite also needs `python3-apt`, `python3-distro-info` and
+`lsb_release` for the system's `/usr/bin/python3`; without them its
+unattended-upgrades checks print SKIP. `--cache DIR` reuses downloaded
+packages.
 
 To validate a detector end-to-end on real hardware, run
 `sudo tests/redteam.sh` on a throwaway server the playbook has hardened.

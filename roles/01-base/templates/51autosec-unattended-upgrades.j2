@@ -1,0 +1,35 @@
+{{ _base_uu_header }} from your unattended_* settings. The next
+// run writes it again, so do not edit it. Your own settings belong in a
+// file that sorts after this one, for example 52unattended-upgrades-local:
+// that file wins, and auto_sec's preflight stops a run whose settings it
+// would cancel.
+{% if _base_uu_write_periodic | bool %}
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+{% endif %}
+{% if _base_uu_reboot == 'on' %}
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "{{ _base_uu_reboot_time }}";
+{% elif _base_uu_reboot == 'off' %}
+Unattended-Upgrade::Automatic-Reboot "false";
+{% endif %}
+{% if _base_uu_blacklist_re | length > 0 %}
+// Added to the blacklist of the other files; nothing is removed from it.
+Unattended-Upgrade::Package-Blacklist {
+{% for p in _base_uu_blacklist_re %}
+    "{{ p }}";
+{% endfor %}
+};
+{% endif %}
+{% if _base_uu_origins == 'security' %}
+// unattended_origins: security. Replaces the origin lists of the files
+// before this one: Ubuntu release pocket (new dependencies of security
+// fixes), security and ESM pockets; Debian security archive only.
+#clear Unattended-Upgrade::Allowed-Origins;
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern {
+{% for p in _base_uu_security_patterns %}
+    "{{ p }}";
+{% endfor %}
+};
+{% endif %}

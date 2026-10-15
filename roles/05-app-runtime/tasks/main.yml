@@ -127,3 +127,45 @@
       - "{{ letsencrypt_email }}"
       - --redirect
     creates: "/etc/letsencrypt/live/{{ client_domain }}/fullchain.pem"
+
+# --- fail2ban jails for nginx (issue #2) ---
+# Role 03 never writes nginx jails. They are added here, once nginx runs:
+# the flush applies the nginx changes above (nginx is running and its log
+# files exist), then role 03's own tasks run the same read-only trial,
+# checks and reload-only-on-change as for 00-autosec.conf, and write only
+# /etc/fail2ban/jail.d/00-autosec-nginx.conf (backend = auto). That file
+# skips itself when fail2ban_hardening_enabled or fail2ban_nginx_jails is
+# false, and stops the run when role 03's preflight has not run.
+- name: Apply the nginx changes before the nginx jails read its logs
+  ansible.builtin.meta: flush_handlers
+
+# In --check nginx is not really installed, and fail2ban's config test
+# would fail on the missing nginx logs: skip the jails there.
+- name: Is nginx installed? (the nginx jails read its log files)
+  ansible.builtin.command:
+    argv: [dpkg-query, -W, "-f=${db:Status-Abbrev}", nginx]
+  register: _app_nginx_pkg
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: fail2ban jails for nginx, skipped while nginx is not installed
+  when: (_app_nginx_pkg.stdout | default('')) is not match('^.i')
+  ansible.builtin.debug:
+    msg: >-
+      nginx is not installed on {{ inventory_hostname }}{{ ' yet (check mode: the real run
+      installs it first)' if ansible_check_mode else '' }}, so the fail2ban nginx jails are
+      not added in this run.
+
+# Tagged fail2ban as well (it keeps "app" from site.yml), so that
+# --skip-tags fail2ban leaves fail2ban alone here too. --tags fail2ban does
+# not reach this role: the nginx jails are updated by runs that include
+# "app".
+- name: fail2ban jails for nginx (jail.d/00-autosec-nginx.conf)
+  when: (_app_nginx_pkg.stdout | default('')) is match('^.i')
+  ansible.builtin.include_role:
+    name: 03-firewall
+    tasks_from: fail2ban-nginx
+    apply:
+      tags: [fail2ban]
+  tags: [fail2ban]

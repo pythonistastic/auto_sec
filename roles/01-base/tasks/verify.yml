@@ -1,0 +1,76 @@
+---
+# roles/01-base/tasks/verify.yml - check that what you chose takes effect.
+#
+# Imported twice:
+#   trial (preflight B6): on the trial run's result, before any change.
+#     A failure refuses the run.
+#   prove (main, step 4): on the real configuration after the write. A
+#     failure means the real result differs from the trial run.
+# Inputs (import vars):
+#   _base_chk      {key: [values]} as parsed by _base_kv
+#   _base_chk_s    "<file> <line>:<text>" lines that set a managed key, in
+#                  the order apt reads them (from files/autosec-apt-sim)
+#   _base_chk_ctx  trial | prove
+#
+# apt reads /etc/apt/apt.conf.d in byte order of the file names: a scalar
+# set again later wins, a list adds up, and `#clear` empties a list. So the
+# only file that can cancel auto_sec's settings is one read after it (or
+# the main /etc/apt/apt.conf). auto_sec never edits that file: it stops and
+# shows you the lines.
+
+- name: "Base B6 / 4: auto_sec's apt settings take effect ({{ _base_chk_ctx }})"
+  ansible.builtin.assert:
+    quiet: true
+    that: _base_chk_problems | length == 0
+    fail_msg: >-
+      {% if _base_chk_ctx == 'trial' %}After the trial run, apt on {{ inventory_hostname }}
+      would NOT use what you chose: {{ _base_chk_problems | join('; ') }}.
+      {% if _base_chk_later | length > 0 %}Lines read after auto_sec's {{ _base_uu_file | basename }}
+      (the last value wins; #clear empties a list): {{ _base_chk_later }}.
+      {% endif %}Your file is read after auto_sec's file, so it wins. Change that file,
+      or set the auto_sec variable to match it. Nothing has been changed.
+      {% else %}auto_sec wrote {{ _base_uu_file }} on {{ inventory_hostname }}, but apt now
+      uses: {{ _base_chk_problems | join('; ') }}. The trial run said otherwise, so
+      something changed apt's configuration during this run. Lines read after
+      auto_sec's file: {{ _base_chk_later }}. Check `apt-config dump | grep -i
+      unattended`; to undo auto_sec's file, delete {{ _base_uu_file }}.
+      {% endif %}
+  vars:
+    _base_chk_uu: "{{ _base_chk['APT::Periodic::Unattended-Upgrade'] | default(['']) | last }}"
+    _base_chk_upl: "{{ _base_chk['APT::Periodic::Update-Package-Lists'] | default(['']) | last }}"
+    _base_chk_ena: "{{ _base_chk['APT::Periodic::Enable'] | default(['1']) | last }}"
+    _base_chk_rb: "{{ _base_chk['Unattended-Upgrade::Automatic-Reboot'] | default(['']) | last }}"
+    _base_chk_rb_on: "{{ (_base_chk_rb | lower) in _base_true_words }}"
+    _base_chk_rt: "{{ _base_chk['Unattended-Upgrade::Automatic-Reboot-Time'] | default(['now']) | last }}"
+    _base_chk_bl: "{{ _base_chk['Unattended-Upgrade::Package-Blacklist::'] | default([]) }}"
+    _base_chk_ao: "{{ _base_chk['Unattended-Upgrade::Allowed-Origins::'] | default([]) }}"
+    _base_chk_op: "{{ _base_chk['Unattended-Upgrade::Origins-Pattern::'] | default([]) }}"
+    _base_chk_sec: >-
+      {{ _base_uu_security_patterns | map('regex_replace', '\$\{([a-z_]+)\}', '<\1>') | list }}
+    # A file read after auto_sec's may still add these: they name the same
+    # archives as auto_sec's patterns (e.g. Ubuntu Pro's ESM origins).
+    _base_chk_sec_legacy: >-
+      {{ _base_uu_security_legacy_origins | map('regex_replace', '\$\{([a-z_]+)\}', '<\1>') | list }}
+    _base_chk_problems: >-
+      {{ (['automatic updates would be off (APT::Periodic::Unattended-Upgrade "' ~ _base_chk_uu
+            ~ '", Update-Package-Lists "' ~ _base_chk_upl ~ '", Enable "' ~ _base_chk_ena ~ '")']
+          if ((_base_uu_write_periodic | bool) and (_base_chk_uu in ['0', ''] or _base_chk_upl in ['0', ''] or _base_chk_ena == '0'))
+          else [])
+         + (['Automatic-Reboot "' ~ _base_chk_rb ~ '" at "' ~ _base_chk_rt ~ '" (you chose true at "'
+             ~ _base_uu_reboot_time ~ '")']
+            if (_base_uu_reboot == 'on' and not ((_base_chk_rb_on | bool) and _base_chk_rt == _base_uu_reboot_time))
+            else [])
+         + (['Automatic-Reboot "' ~ _base_chk_rb ~ '" (you chose false)']
+            if (_base_uu_reboot == 'off' and (_base_chk_rb_on | bool)) else [])
+         + (['Package-Blacklist lacks ' ~ (_base_uu_blacklist_re | reject('in', _base_chk_bl) | list | to_json)]
+            if (_base_uu_blacklist_re | reject('in', _base_chk_bl) | list | length > 0) else [])
+         + (['origins are not security only (Allowed-Origins ' ~ (_base_chk_ao | to_json)
+             ~ ', Origins-Pattern ' ~ (_base_chk_op | to_json) ~ ')']
+            if (_base_uu_origins == 'security'
+                and (_base_chk_ao | reject('in', _base_chk_sec_legacy) | list | length > 0
+                     or (_base_chk_op | unique | sort) != (_base_chk_sec | sort)))
+            else []) }}
+    _base_chk_later: >-
+      {{ _base_chk_s | zip(_base_chk_s | map('regex_replace', '^(\S+) .*$', '\1'))
+         | selectattr(1, 'gt', _base_uu_file | basename) | map('first') | list
+         + (_base_chk_s | select('match', '^/') | list) }}

@@ -1,0 +1,26 @@
+{# roles/03-firewall/templates/00-autosec.conf.j2
+   Inputs, all checked by preflight P1: _f2b_defaults (mapping, allowlisted
+   keys, strict values), _f2b_ignore (list of IP addresses or networks),
+   ssh_port (integer). No value can contain "%", a newline or a section. #}
+{{ _f2b_marker }}
+# Change the auto_sec variables instead (fail2ban_defaults, office_static_ip,
+# fail2ban_ignore_ips, ssh_port).
+#
+# fail2ban reads this file right after jail.conf, before every other file in
+# jail.d and before jail.local. A value that one of YOUR files sets in the
+# same section always wins. [DEFAULT] values apply to every jail that sets
+# none of its own.
+{% if (_f2b_defaults | length > 0) or (_f2b_ignore | length > 0) %}
+
+[DEFAULT]
+{% for k, v in _f2b_defaults | dictsort %}
+{{ k }} = {{ (v | string | lower) if (v is boolean) else v }}
+{% endfor %}
+{% if _f2b_ignore | length > 0 %}
+ignoreip = {{ (['127.0.0.1/8', '::1'] + _f2b_ignore) | join(' ') }}
+{% endif %}
+{% endif %}
+
+[sshd]
+enabled = true
+port = {{ ssh_port | int }}

@@ -1,0 +1,25 @@
+# Pinned unattended-upgrades packages for tests/base/semantics/run.sh.
+#
+# Format (whitespace separated, one file per line):
+#   <set> <pool file name> <sha256> <url> [<fallback url>...]
+# <set> is a distro codename. run.sh looks for the file in its --cache
+# directories first, then tries the URLs in order, and uses a file only if
+# its SHA256 matches.
+#
+# The SHA256 values are those of the copies used to build role 01 0.5.
+# The noble file was also checked against dpkg's md5sums of an installed
+# unattended-upgrades 2.9.1+nmu4ubuntu1. UNVERIFIED: the other four have
+# not yet been checked against the signed archive index (InRelease ->
+# Packages.xz), and the URLs have not been re-checked; check both before
+# relying on a fresh download.
+
+# Ubuntu 22.04 jammy
+jammy unattended-upgrades_2.8ubuntu1_all.deb fb0154c0573903a0b23c100aa34ca000b7008206d764b36f4fe44f6ef2368c68 https://archive.ubuntu.com/ubuntu/pool/main/u/unattended-upgrades/unattended-upgrades_2.8ubuntu1_all.deb
+# Debian 12 bookworm
+bookworm unattended-upgrades_2.9.1+nmu3_all.deb 33c06547ae713f46d5a02b9ca05c75a2807809941cd5beff9e31f71eb4385cd1 https://deb.debian.org/debian/pool/main/u/unattended-upgrades/unattended-upgrades_2.9.1+nmu3_all.deb
+# Ubuntu 24.04 noble (the canary's version)
+noble unattended-upgrades_2.9.1+nmu4ubuntu1_all.deb 13c576c7d8184f509d5ddc4d75bec6e62ef3f745319cce60f8131f401091113b https://archive.ubuntu.com/ubuntu/pool/main/u/unattended-upgrades/unattended-upgrades_2.9.1+nmu4ubuntu1_all.deb
+# Debian 13 trixie
+trixie unattended-upgrades_2.12_all.deb a5e37d196598d2f2a7cb8c3ded760b77283d0ecf110d2f90d77d4821e3512eb6 https://deb.debian.org/debian/pool/main/u/unattended-upgrades/unattended-upgrades_2.12_all.deb
+# Ubuntu 26.04 resolute
+resolute unattended-upgrades_2.12ubuntu9_all.deb 129682f0176cbeabba735f550cb64bdfbcd9c99f4d2377c247f8235ccfe0b4af https://archive.ubuntu.com/ubuntu/pool/main/u/unattended-upgrades/unattended-upgrades_2.12ubuntu9_all.deb

@@ -1,0 +1,5 @@
+---
+# Addresses auto_sec puts in ignoreip.
+ssh_port: 22
+office_static_ip: "203.0.113.7"
+fail2ban_ignore_ips: ["198.51.100.9", "2001:db8::/32"]

@@ -279,13 +279,14 @@ setup() {
 case_i() {
   local rc tags found
   # --tags ssh is the canary's first command; ssh,firewall adds role 03 on a
-  # host where ufw is off. Role 03 in --check needs ufw and fail2ban already
-  # installed (its jail.local task fails in check mode without
-  # /etc/fail2ban, a limitation older than 0.4.0), so that variant only runs
-  # when both are present.
+  # host where ufw is off. Role 03 in --check needs ufw already installed
+  # (community.general.ufw needs the ufw binary, also in --check; a
+  # limitation older than 0.4.0), so that variant only runs when ufw is
+  # present. fail2ban is not needed: in --check without fail2ban, role 03
+  # only says that the real run installs it.
   for tags in ssh ssh,firewall; do
-    if [ "$tags" = ssh,firewall ] && ! { [ -x /usr/sbin/ufw ] && [ -d /etc/fail2ban ]; }; then
-      info i "--check --tags $tags skipped: ufw or fail2ban is not installed on this runner"
+    if [ "$tags" = ssh,firewall ] && ! [ -x /usr/sbin/ufw ]; then
+      info i "--check --tags $tags skipped: ufw is not installed on this runner"
       continue
     fi
     rc=0

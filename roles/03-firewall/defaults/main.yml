@@ -1,0 +1,108 @@
+---
+# Role 03 (firewall and fail2ban) defaults.
+
+# --- fail2ban: public settings --------------------------------------------
+# Documented in group_vars/all.yml, which site.yml reads and which beats
+# these defaults. The same values stay here so that the role behaves the
+# same in a playbook without group_vars (the tests in tests/fail2ban). CI
+# checks that both files hold the same values.
+#
+# auto_sec writes only /etc/fail2ban/jail.d/00-autosec.conf, never
+# jail.local. fail2ban reads it first, so any value YOUR files set wins.
+# false: role 03 does not install or configure fail2ban (ufw still runs).
+fail2ban_hardening_enabled: true
+
+# fail2ban [DEFAULT] values. They apply to every jail that sets none of its
+# own; if one would change a jail of yours, the run stops and names it.
+# Setting this replaces the whole mapping. {} = auto_sec sets none.
+# Allowed keys: bantime findtime maxretry bantime.increment bantime.factor
+# bantime.maxtime bantime.rndtime backend
+fail2ban_defaults:
+  bantime: "1h"
+  bantime.increment: true
+  bantime.factor: 2
+  findtime: "10m"
+  maxretry: 4
+
+# One-off switch: pass with -e on one run, never in host_vars. Moves a
+# jail.local written by auto_sec 0.1-0.4 to /var/lib/auto-sec/fail2ban/.
+fail2ban_migrate_jail_local: false
+
+# Role 05 only (used when app_type is set): adds the nginx-http-auth and
+# nginx-botsearch jails in jail.d/00-autosec-nginx.conf after nginx is in.
+fail2ban_nginx_jails: true
+
+# --- Role-internal constants. These are not settings: do not override. ---
+
+# The files auto_sec owns. "00-autosec" sorts right after jail.conf and
+# before every other jail.d file and jail.local, so the operator's values
+# win (fail2ban keeps the LAST value it reads; a jail section beats
+# [DEFAULT] whatever the file order). _f2b_conf_dir is /etc/fail2ban.
+_f2b_dropin: "{{ _f2b_conf_dir }}/jail.d/00-autosec.conf"
+_f2b_nginx_dropin: "{{ _f2b_conf_dir }}/jail.d/00-autosec-nginx.conf"
+_f2b_jail_local: "{{ _f2b_conf_dir }}/jail.local"
+_f2b_marker: "# Written by auto_sec (role 03). Do not edit: the next run replaces this file."
+_f2b_nginx_marker: "# Written by auto_sec (role 05). Do not edit: the next run replaces this file."
+
+# Scratch space for the trial run (tmpfs, root only, removed every run).
+_f2b_run_dir: /run/auto-sec
+_f2b_sim_dir: /run/auto-sec/f2b-sim
+# Copy of 00-autosec.conf before this run's write, for the rollback.
+_f2b_prev_dir: /run/auto-sec/f2b-prev
+# Migration backup of an auto_sec 0.1-0.4 jail.local (kept).
+_f2b_backup_dir: /var/lib/auto-sec/fail2ban
+
+# fail2ban_defaults: allowed keys and the whole-value pattern each accepts
+# (anchors are added by preflight P1). bantime.formula (evaluated as code),
+# ignorecommand, action, banaction and ignoreip are not allowed: addresses
+# come only from office_static_ip and fail2ban_ignore_ips. -1 (ban
+# forever) is not accepted. bantime.increment must be a YAML boolean.
+_f2b_time_pat: '[1-9][0-9]{0,5}(s|m|h|d|w|mo|y)?'
+_f2b_key_pat:
+  bantime: "{{ _f2b_time_pat }}"
+  findtime: "{{ _f2b_time_pat }}"
+  bantime.maxtime: "{{ _f2b_time_pat }}"
+  bantime.rndtime: "{{ _f2b_time_pat }}"
+  maxretry: '[1-9][0-9]?'
+  bantime.factor: '[0-9]{1,3}(\.[0-9]{1,3})?'
+  bantime.increment: '(True|False)'
+  backend: '(auto|systemd|polling|pyinotify)'
+
+# IPv4/IPv6 address or network. Same pattern as role 02's preflight and
+# site.yml (fail2ban_ignore_ips); keep them equal.
+_f2b_cidr_re: >-
+  ^(((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(/(3[0-2]|[12]?[0-9]))?|(?=[0-9A-Fa-f:]*:)[0-9A-Fa-f:]{2,39}(/(12[0-8]|1[01][0-9]|[1-9]?[0-9]))?)$
+
+_f2b_bool_words: ["true", "false", "yes", "no", "1", "0", "on", "off"]
+
+# What the template uses (after preflight P1 has checked the inputs).
+_f2b_defaults: "{{ fail2ban_defaults | default({}) }}"
+_f2b_ignore: >-
+  {{ ([office_static_ip | default('')] + (fail2ban_ignore_ips | default([])))
+     | map('string') | map('trim') | select | unique | list }}
+
+# The two files auto_sec may write, and the jails each one is for. A change
+# auto_sec's file makes to any OTHER jail is a "leak" and stops the run.
+_f2b_kinds:
+  main:
+    name: 00-autosec.conf
+    dest: "{{ _f2b_dropin }}"
+    template: 00-autosec.conf.j2
+    marker: "{{ _f2b_marker }}"
+    jails: [sshd]
+  nginx:
+    name: 00-autosec-nginx.conf
+    dest: "{{ _f2b_nginx_dropin }}"
+    template: 00-autosec-nginx.conf.j2
+    marker: "{{ _f2b_nginx_marker }}"
+    jails: [nginx-http-auth, nginx-botsearch]
+
+# How role 03 runs fail2ban's tools and the trial helper (files/). Only the
+# unprivileged lab (tests/fail2ban/semantics) changes these, to point at an
+# unpacked fail2ban build, a lab config tree and a conffile list; never set
+# them for a real host.
+_f2b_conf_dir: /etc/fail2ban
+_f2b_client: fail2ban-client
+_f2b_python: /usr/bin/python3
+_f2b_conffiles_file: ""
+_f2b_file_owner: root

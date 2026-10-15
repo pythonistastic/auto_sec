@@ -1,0 +1,133 @@
+---
+# roles/03-firewall/tasks/trial.yml - the fail2ban trial run (read-only).
+#
+# Included with _f2b_kind (main: 00-autosec.conf, nginx:
+# 00-autosec-nginx.conf) and _f2b_stage (preflight | apply) by preflight.yml
+# (P3), fail2ban.yml (F3) and fail2ban-nginx.yml.
+#
+# Renders the candidate file from your variables into /run/auto-sec/f2b-sim
+# and runs files/auto-sec-f2b-check there. The helper copies /etc/fail2ban
+# three times (as it is now; without auto_sec's file; with the candidate)
+# and asks fail2ban's own config reader (`fail2ban-client -c COPY -d` and
+# `-t`) what each copy means. Nothing under /etc changes, so this also runs
+# in --check. Sets _f2b_trial (the helper's JSON) and _f2b_nginx_ours.
+#
+# R6 is checked here, before the trial: a file auto_sec did not write must
+# never be treated as auto_sec's.
+
+- name: "fail2ban trial: auto_sec's file names and their first lines"
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - |
+        for f in "$@"; do
+          if [ -L "$f" ]; then printf 'link %s\n' "$f"
+          elif [ -f "$f" ]; then printf 'file %s ' "$f"; head -n 1 -- "$f"; echo
+          elif [ -e "$f" ]; then printf 'other %s\n' "$f"
+          fi
+        done
+      - sh
+      - "{{ _f2b_dropin }}"
+      - "{{ _f2b_nginx_dropin }}"
+  register: _f2b_own_files
+  changed_when: false
+  check_mode: false
+
+- name: "fail2ban trial R6: a file with auto_sec's name must be auto_sec's own"
+  ansible.builtin.assert:
+    quiet: true
+    that: _f2b_foreign | length == 0
+    fail_msg: >-
+      {{ _f2b_foreign | join(', ') }} on {{ inventory_hostname }}: a file auto_sec did not write
+      has the name auto_sec uses (its first line is not auto_sec's marker, or it is not a
+      plain file). auto_sec never replaces a file it did not write. Rename it (keep the
+      .conf or .local ending so fail2ban still reads it) and run again.
+      {{ 'Nothing has been changed.' if _f2b_stage == 'preflight' else 'fail2ban has not been changed.' }}
+  vars:
+    _f2b_lines: "{{ _f2b_own_files.stdout_lines | default([]) | select | list }}"
+    _f2b_foreign: >-
+      {{ _f2b_lines | reject('equalto', 'file ' ~ _f2b_dropin ~ ' ' ~ _f2b_marker)
+         | reject('equalto', 'file ' ~ _f2b_nginx_dropin ~ ' ' ~ _f2b_nginx_marker)
+         | map('regex_replace', '^(file|link|other) (\S+).*$', '\2') | map('regex_replace', '[{}]', '?') | list }}
+
+- name: "fail2ban trial: which jails are auto_sec's own"
+  ansible.builtin.set_fact:
+    _f2b_nginx_ours: "{{ ('file ' ~ _f2b_nginx_dropin ~ ' ' ~ _f2b_nginx_marker) in (_f2b_own_files.stdout_lines | default([])) }}"
+    _f2b_trial: {}
+
+- name: "fail2ban trial: remove an old scratch copy"
+  ansible.builtin.file:
+    path: "{{ _f2b_sim_dir }}"
+    state: absent
+  changed_when: false
+  check_mode: false
+  diff: false
+
+- name: "fail2ban trial: scratch folders, root only"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ _f2b_file_owner }}"
+    mode: "0700"
+  loop:
+    - "{{ _f2b_run_dir }}"
+    - "{{ _f2b_sim_dir }}"
+  changed_when: false
+  check_mode: false
+  diff: false
+
+# The copies are only read here. `always` removes them, also when the
+# helper fails.
+- name: "fail2ban trial: render, compare, clean up"
+  block:
+    - name: "fail2ban trial: render from your variables the candidate {{ _f2b_kinds[_f2b_kind].name }}"
+      ansible.builtin.template:
+        src: "{{ _f2b_kinds[_f2b_kind].template }}"
+        dest: "{{ _f2b_sim_dir }}/candidate"
+        owner: "{{ _f2b_file_owner }}"
+        mode: "0600"
+      changed_when: false
+      check_mode: false
+      diff: false
+
+    # One argv list, no shell: python3 -I -c <helper> <options>. Every
+    # option value is a constant or a value preflight P1 has checked.
+    - name: "fail2ban trial: ask fail2ban's own config reader (read-only)"
+      ansible.builtin.command:
+        argv: "{{ _f2b_argv }}"
+      register: _f2b_trial_raw
+      changed_when: false
+      failed_when: _f2b_trial_raw.rc != 0 or not (_f2b_trial_raw.stdout | default('') is match('^\{'))
+      check_mode: false
+      vars:
+        _f2b_jails: >-
+          {{ _f2b_kinds[_f2b_kind].jails
+             + (_f2b_kinds['nginx'].jails if (_f2b_kind == 'main' and (_f2b_nginx_ours | bool)) else []) }}
+        _f2b_argv: >-
+          {{ [_f2b_python, '-I', '-c', lookup('ansible.builtin.file', 'auto-sec-f2b-check'),
+              '--conf', _f2b_conf_dir,
+              '--work', _f2b_sim_dir ~ '/trees',
+              '--candidate', _f2b_sim_dir ~ '/candidate',
+              '--candidate-name', _f2b_kinds[_f2b_kind].name,
+              '--ssh-port', ssh_port | int | string,
+              '--client', _f2b_client,
+              '--running']
+             + (['--conffiles', _f2b_conffiles_file] if (_f2b_conffiles_file | length > 0) else [])
+             + (_f2b_jails | map('regex_replace', '^', '--allowed-jail=') | list)
+             + ((_f2b_ignore | map('regex_replace', '^', '--autosec-ip=') | list) if _f2b_kind == 'main' else [])
+             + ((_f2b_defaults | dict2items | map(attribute='key') | map('regex_replace', '^', '--autosec-key=') | list)
+                if _f2b_kind == 'main' else []) }}
+
+    - name: "fail2ban trial: read the result"
+      ansible.builtin.set_fact:
+        _f2b_trial: "{{ _f2b_trial_raw.stdout | from_json }}"
+
+  always:
+    - name: "fail2ban trial: remove the scratch copy"
+      ansible.builtin.file:
+        path: "{{ _f2b_sim_dir }}"
+        state: absent
+      changed_when: false
+      check_mode: false
+      diff: false

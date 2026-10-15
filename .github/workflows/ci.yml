@@ -28,6 +28,14 @@ jobs:
           -e client=example-client --syntax-check
       - name: Syntax check the sshd-semantics render playbook
         run: ansible-playbook tests/sshd-semantics/render.yml --syntax-check
+      - name: Syntax check the role 01 and role 03 test playbooks
+        env:
+          ANSIBLE_ROLES_PATH: ${{ github.workspace }}/roles
+        run: |
+          for p in tests/base/semantics/lab.yml tests/base/semantics/pkg.yml tests/base/live/play.yml \
+                   tests/fail2ban/semantics/ansible-lab.yml tests/fail2ban/semantics/render.yml; do
+            ansible-playbook -i localhost, "$p" --syntax-check
+          done
       - name: Lint
         run: ansible-lint
 
@@ -51,6 +59,59 @@ jobs:
             fi
           done
           exit "$bad"
+
+      # 0.5.0 invariants (#2). Role 03 writes only jail.d/00-autosec.conf,
+      # never jail.local, and reloads fail2ban itself, only when the trial
+      # run shows an effective change. A handler restarted it on every
+      # change (and enabled a fail2ban the operator had disabled). The
+      # migration rollback writes jail.local through a variable
+      # (_f2b_jail_local), never by name. Role 01's apt-file invariants
+      # run inside tests/base/semantics (job base-semantics).
+      - name: "Role 03: no jail.local write by name, no 'restart fail2ban' handler"
+        run: |
+          bad=0
+          if grep -rnE --include='*.yml' --include='*.yaml' --include='*.j2' \
+               '^[^#]*restart fail2ban' roles site.yml restore-test; then
+            echo "::error::nothing may notify or define 'restart fail2ban' (role 03 reloads fail2ban only on an effective change)"
+            bad=1
+          fi
+          if grep -rnE --include='*.yml' --include='*.yaml' \
+               '^[^#]*dest:[^#]*jail\.local' roles site.yml restore-test; then
+            echo "::error::no task may write jail.local (role 03 writes jail.d/00-autosec.conf only)"
+            bad=1
+          fi
+          if [ -e roles/03-firewall/handlers/main.yml ]; then
+            echo "::error file=roles/03-firewall/handlers/main.yml::removed in 0.5.0, must not come back"
+            bad=1
+          fi
+          exit "$bad"
+
+      # The public role 01 and role 03 variables are documented in
+      # group_vars/all.yml, which site.yml reads and which wins. The role
+      # defaults keep the same values for the tests that run the roles
+      # without group_vars. They must never drift apart (0.4's
+      # `timezone: "UTC"` in group_vars silently beat the role's keep).
+      - name: "group_vars/all.yml and the role 01/03 defaults hold the same values"
+        shell: python
+        run: |
+          import sys
+          import yaml
+          g = yaml.safe_load(open("group_vars/all.yml"))
+          bad = 0
+          for role in ("01-base", "03-firewall"):
+              path = "roles/%s/defaults/main.yml" % role
+              d = yaml.safe_load(open(path))
+              for k, v in d.items():
+                  if k.startswith("_"):
+                      continue
+                  if k not in g:
+                      print("::error file=group_vars/all.yml::%s (from %s) is missing" % (k, path))
+                      bad = 1
+                  elif g[k] != v:
+                      print("::error file=group_vars/all.yml::%s is %r here but %r in %s" % (k, g[k], v, path))
+                      bad = 1
+          print("checked: same values" if not bad else "values differ")
+          sys.exit(bad)
 
   # Representative of a real server: distro-packaged Ansible (Ubuntu
   # 24.04 -> ansible-core 2.16) with the PINNED collections. This is the
@@ -76,6 +137,14 @@ jobs:
           -e client=example-client --syntax-check
       - name: Syntax check the sshd-semantics render playbook
         run: ansible-playbook tests/sshd-semantics/render.yml --syntax-check
+      - name: Syntax check the role 01 and role 03 test playbooks
+        env:
+          ANSIBLE_ROLES_PATH: ${{ github.workspace }}/roles
+        run: |
+          for p in tests/base/semantics/lab.yml tests/base/semantics/pkg.yml tests/base/live/play.yml \
+                   tests/fail2ban/semantics/ansible-lab.yml tests/fail2ban/semantics/render.yml; do
+            ansible-playbook -i localhost, "$p" --syntax-check
+          done
 
   python:
     runs-on: ubuntu-latest
@@ -95,6 +164,19 @@ jobs:
 
       - name: Compile-check the CVE scanner
         run: python -m py_compile roles/11-cve-watch/files/cve_watch.py
+
+      # Role 03 runs this helper on the managed host with its python3:
+      # Ubuntu 22.04 has Python 3.10, so newer syntax must not creep in.
+      - name: Compile-check the fail2ban trial helper (Python 3.10 syntax)
+        run: |
+          python - roles/03-firewall/files/auto-sec-f2b-check <<'PY'
+          import ast
+          import sys
+          src = open(sys.argv[1]).read()
+          ast.parse(src, filename=sys.argv[1], feature_version=(3, 10))
+          compile(src, sys.argv[1], "exec")
+          print("ok:", sys.argv[1])
+          PY
 
       - name: CVE scanner smoke test (lockfile parsing, offline)
         run: |
@@ -126,15 +208,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # Default severity, every shell file: scripts, all test suites (and the
-      # guard tests' stub commands) and the SSH undo guard, which is
-      # installed as a root-run script.
-      - name: ShellCheck scripts, tests and the SSH guard
+      # guard tests' stub commands), the SSH undo guard, which is installed
+      # as a root-run script, and role 01's apt trial-run script, which
+      # runs as root on the managed host (sh -c).
+      - name: ShellCheck scripts, tests, the SSH guard and the apt trial run
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
           shopt -s globstar nullglob
           shellcheck scripts/*.sh tests/**/*.sh tests/guard/stubs/* \
-            roles/02-ssh-hardening/files/auto-sec-ssh-guard
+            roles/02-ssh-hardening/files/auto-sec-ssh-guard \
+            roles/01-base/files/autosec-apt-sim
           bash -n roles/02-ssh-hardening/files/auto-sec-ssh-guard
+          sh -n roles/01-base/files/autosec-apt-sim
 
       # The .sh.j2 templates become root-run scripts (cron, systemd). They
       # were never linted before, which is how unquoted interpolation reached
@@ -244,4 +329,160 @@ jobs:
         with:
           name: role02-live-${{ matrix.os }}-${{ matrix.ssh_mode }}-${{ strategy.job-index }}
           path: ${{ runner.temp }}/role02-live/logs
+          if-no-files-found: ignore
+
+  # How real fail2ban builds read role 03's drop-in next to an operator's
+  # own files: jammy, bookworm, noble, trixie and resolute fail2ban from
+  # SHA256-pinned .debs, unpacked with dpkg-deb -x and run unprivileged
+  # (fail2ban-client -d/-t/-vvv on config copies). A real fail2ban 1.0.2
+  # server (noble build, pyasyncore) also runs as the runner user: reload
+  # and restart semantics, and role 03's own task files against it, on the
+  # current ansible-core and on 2.16.
+  fail2ban-semantics:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core (current and 2.16) and pyasyncore
+        run: |
+          pip install ansible-core pyasyncore
+          python -m venv "$RUNNER_TEMP/ac216"
+          "$RUNNER_TEMP/ac216/bin/pip" install -q "ansible-core>=2.16,<2.17"
+          ansible-playbook --version | head -1
+          "$RUNNER_TEMP/ac216/bin/ansible-playbook" --version | head -1
+      - name: Cache the pinned fail2ban packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/auto-sec-fail2ban-semantics
+          key: fail2ban-debs-${{ hashFiles('tests/fail2ban/semantics/debs.txt') }}
+      - name: fail2ban golden tests, server semantics, role 03 against a lab server
+        run: >
+          bash tests/fail2ban/semantics/run.sh
+          --cache ~/.cache/auto-sec-fail2ban-semantics
+          --require-server
+          --ansible "$(command -v ansible-playbook)"
+          --ansible "$RUNNER_TEMP/ac216/bin/ansible-playbook"
+
+  # Role 01's apt handling (#3) without root: the pinned unattended-upgrades
+  # .debs of Ubuntu 22.04, 24.04 and 26.04 and Debian 12 and 13, role 01's
+  # own task files against lab apt configurations, and each release's own
+  # unattended-upgrades code on the result. A SKIP line (a missing tool on
+  # the runner) fails the job, so a check can never pass by not running.
+  base-semantics:
+    name: base-semantics (${{ matrix.ansible_core }})
+    strategy:
+      fail-fast: false
+      matrix:
+        ansible_core: ["ansible-core", "ansible-core>=2.16,<2.17"]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core, and python3-apt for the system Python
+        env:
+          ANSIBLE_CORE_SPEC: ${{ matrix.ansible_core }}
+        run: |
+          pip install "$ANSIBLE_CORE_SPEC"
+          ansible-playbook --version | head -1
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-apt python3-distro-info lsb-release shellcheck
+      - name: Cache the pinned unattended-upgrades packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/auto-sec-base-semantics
+          key: base-debs-${{ hashFiles('tests/base/semantics/debs.txt') }}
+      - name: Role 01 lab tests
+        shell: bash
+        run: |
+          bash tests/base/semantics/run.sh --cache ~/.cache/auto-sec-base-semantics \
+            | tee "$RUNNER_TEMP/base-semantics.log"
+          if grep -q '^SKIP' "$RUNNER_TEMP/base-semantics.log"; then
+            echo "::error::a check was skipped (a tool is missing on the runner)"
+            exit 1
+          fi
+
+  # Live role 03 fail2ban runs against the runner itself (site.yml --tags
+  # fail2ban, local connection): the canary's layout with live bans must
+  # come through unchanged (same dump, PID, bans, firewall set; no reload),
+  # refusals, and the migration of a 0.3 jail.local. 22.04 has fail2ban
+  # 0.11.2 with iptables, 24.04 fail2ban 1.0.2 with nftables.
+  # UNVERIFIED until it has run green on GitHub: written and linted
+  # locally, never executed (it needs root on a throwaway VM).
+  fail2ban-live:
+    name: fail2ban-live (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core and the pinned collections
+        run: |
+          pip install ansible-core
+          ansible --version
+          ansible-galaxy collection install -r requirements.yml
+      - name: Live fail2ban tests against this runner
+        run: bash tests/fail2ban/live/run.sh
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fail2ban-live-${{ matrix.os }}
+          path: ${{ runner.temp }}/fail2ban-live/logs
+          if-no-files-found: ignore
+
+  # Live role 01 runs against the runner itself (tests/base/live/play.yml:
+  # the preflight and the role, as site.yml runs them): defaults write no
+  # apt file and change no effective update setting, hostname or timezone;
+  # the distro's off switch still works after a run; a chosen reboot time
+  # is what unattended-upgrade really schedules; Docker exclusion; the
+  # 0.1-0.4 restore (only with its -e switch); a package install never
+  # upgrades an installed package; refusals. Once more on ansible-core 2.16.
+  # UNVERIFIED until it has run green on GitHub: written and linted
+  # locally, never executed (it needs root on a throwaway VM).
+  base-live:
+    name: base-live (${{ matrix.os }}, ${{ matrix.ansible_core }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            ansible_core: ansible-core
+          - os: ubuntu-24.04
+            ansible_core: ansible-core
+          - os: ubuntu-24.04
+            ansible_core: ansible-core>=2.16,<2.17
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core and the pinned collections
+        env:
+          ANSIBLE_CORE_SPEC: ${{ matrix.ansible_core }}
+        run: |
+          pip install "$ANSIBLE_CORE_SPEC"
+          ansible --version
+          ansible-galaxy collection install -r requirements.yml
+      - name: Live role 01 tests against this runner
+        run: bash tests/base/live/run.sh
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-live-${{ matrix.os }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/base-live/logs
           if-no-files-found: ignore

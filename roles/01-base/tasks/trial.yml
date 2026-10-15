@@ -1,0 +1,174 @@
+---
+# roles/01-base/tasks/trial.yml - preflight B5 and B6, the trial run.
+#
+# Renders the candidate 51autosec-unattended-upgrades into /run/auto-sec
+# (tmpfs, root only), copies /etc/apt/apt.conf.d into /run/auto-sec/apt-sim,
+# puts the candidate (and, for a 0.1-0.4 host, the distro's
+# 50unattended-upgrades) into the copy and lets apt itself read it
+# (files/autosec-apt-sim). Nothing under /etc changes, so this runs in
+# --check too. Imported by preflight.yml.
+#
+# Sets _base_uu_sim_after (effective managed keys after the change),
+# _base_uu_sim_s (lines that set them, in read order), _base_uu_diff and
+# _base_uu_diff_lines, and finishes _base_uu_off_on_purpose. Refuses when
+# auto_sec's file would break apt (exit 92), when 50unattended-upgrades is
+# auto_sec 0.1-0.4's file and -e apt_migrate_unattended_upgrades=true was
+# not given (or was given with nothing to migrate), or when a file read
+# after auto_sec's would cancel what you chose (verify.yml).
+
+# The play runs as root (become) and only root can create anything in
+# /run, so the folder and the candidate are root-owned anyway. They set no
+# owner, so that the unprivileged tests (tests/base/semantics) can run
+# this file too.
+- name: "Base B5: scratch folder, root only"
+  ansible.builtin.file:
+    path: "{{ _base_run_dir }}"
+    state: directory
+    mode: "0700"
+  changed_when: false
+  check_mode: false
+  diff: false
+
+- name: "Base B5: trial run on a copy of the apt configuration"
+  block:
+    - name: "Base B5: render the candidate file"
+      when: not (_base_uu_plan_empty | bool)
+      ansible.builtin.template:
+        src: 51autosec-unattended-upgrades.j2
+        dest: "{{ _base_candidate }}"
+        mode: "0600"
+      changed_when: false
+      check_mode: false
+      diff: false
+
+    - name: "Base B5: let apt read the copy with auto_sec's change"
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - "{{ lookup('ansible.builtin.file', 'autosec-apt-sim') }}"
+          - sh
+          - "{{ _base_apt_parts }}"
+          - "{{ _base_sim_dir }}"
+          - "{{ '-' if (_base_uu_plan_empty | bool) else _base_candidate }}"
+          - "{{ _base_uu_file | basename }}"
+          - "{{ _base_uu_pristine if (_base_uu_trial_pristine | bool) else '-' }}"
+      environment:
+        LC_ALL: C
+      register: _base_sim
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Base B5: auto_sec's file must not break apt"
+      ansible.builtin.assert:
+        quiet: true
+        that: _base_sim.rc == 0
+        fail_msg: >-
+          {% if _base_sim.rc == 92 %}auto_sec's new {{ _base_uu_file | basename }}{{ ' (with the
+          distro 50unattended-upgrades put back)' if (_base_uu_trial_pristine | bool) else '' }} would
+          break apt on {{ inventory_hostname }}: {{ _base_sim_err }}. This is an auto_sec bug;
+          please report it.
+          {% elif _base_sim.rc == 91 %}apt cannot read its configuration on
+          {{ inventory_hostname }} now: {{ _base_sim_err }}. Fix that first.
+          {% else %}The trial run of the apt configuration failed (exit {{ _base_sim.rc }}):
+          {{ _base_sim_err }} {{ _base_sim.stderr | default('') | regex_replace('[{}]', '?') | truncate(300) }}.
+          {% endif %}Nothing has been changed.
+      vars:
+        _base_sim_err: >-
+          {{ _base_sim.stdout_lines | default([]) | select('match', '^E ') | map('regex_replace', '^E ', '')
+             | map('regex_replace', '[{}]', '?') | list | join(' ') | truncate(600) }}
+
+    - name: "Base B6: remember the result of the trial run"
+      ansible.builtin.set_fact:
+        _base_uu_sim_after: "{{ _base_kv }}"
+        _base_uu_sim_s: >-
+          {{ _base_sim.stdout_lines | select('match', '^S ') | map('regex_replace', '^S ', '')
+             | map('regex_replace', '\$\{([a-z_]+)\}', '<\1>') | map('regex_replace', '[{}]', '?') | list }}
+      vars:
+        _base_kv_lines: "{{ _base_sim.stdout_lines | select('match', '^A ') | map('regex_replace', '^A ', '') | list }}"
+
+    - name: "Base B6: which keys would change"
+      ansible.builtin.set_fact:
+        _base_uu_diff: >-
+          {{ ((_base_b | dict2items) | symmetric_difference(_base_a | dict2items))
+             | map(attribute='key') | unique | sort }}
+      vars:
+        _base_b: "{{ dict(_base_uu_before | list | zip(_base_uu_before | dict2items | map(attribute='value') | map('to_json'))) }}"
+        _base_a: "{{ dict(_base_uu_sim_after | list | zip(_base_uu_sim_after | dict2items | map(attribute='value') | map('to_json'))) }}"
+
+    # In auto mode auto_sec writes no update switch, so the result of the
+    # trial run is what the server will use: off there means off on purpose
+    # (20auto-upgrades "0", dpkg-reconfigure, or no file turns them on).
+    - name: "Base B6: what changes, and are the updates left off?"
+      ansible.builtin.set_fact:
+        _base_uu_diff_lines: >-
+          {{ _base_uu_diff | zip(_base_uu_diff | map('extract', _base_uu_before) | map('default', ['(unset)']) | map('join', ', ')
+                                 | zip(_base_uu_diff | map('extract', _base_uu_sim_after) | map('default', ['(unset)']) | map('join', ', '))
+                                 | map('join', ' -> '))
+             | map('join', ': ') | list }}
+        _base_uu_off_on_purpose: >-
+          {{ _base_uu_enabled_mode == 'auto'
+             and ((_base_uu_removed | default(false) | bool)
+                  or ((_base_uu_installed | bool)
+                      and ((_base_uu_sim_after['APT::Periodic::Unattended-Upgrade'] | default(['']) | last) in ['0', '']
+                           or (_base_uu_sim_after['APT::Periodic::Enable'] | default(['1']) | last) == '0'))) }}
+
+    # Like role 03's jail.local migration and role 02's sshd_config one:
+    # auto_sec's own old file is replaced only when you ask for it, once.
+    - name: "Base B6: a 0.1-0.4 50unattended-upgrades is migrated only on request"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (_base_migrate | bool) == (_base_uu_legacy | bool)
+          - not (_base_migrate | bool) or (_base_uu_pristine_ok | bool)
+        fail_msg: >-
+          {% if (_base_uu_legacy | bool) and not (_base_migrate | bool) %}{{ _base_uu_dist_file }} on
+          {{ inventory_hostname }} is the file auto_sec 0.1-0.4 wrote (it matches that file exactly).
+          It turns on automatic reboots at 04:00{{ ', and its origins match no Debian archive, so this
+          server has installed NO automatic updates since auto_sec set it up'
+          if (ansible_facts['distribution'] | default('')) == 'Debian' else '' }}. auto_sec no longer
+          writes this file.
+          {% if _base_uu_pristine_ok | bool %}Putting the distro's file back changes:
+          {{ _base_uu_diff_lines | join('; ') if (_base_uu_diff_lines | length > 0) else 'nothing' }}.
+          {% if (ansible_facts['distribution'] | default('')) == 'Debian' %}The next nightly run may then
+          install {{ (_base_pending_upgrades ~ ' or more') if (_base_pending_upgrades | int) >= 0
+          else 'all' }} waiting updates (point releases too, not only security) and restart services;
+          add unattended_origins: security first to allow security updates only.
+          {% endif %}Run once with -e apt_migrate_unattended_upgrades=true: a copy of the old file is
+          kept in {{ _base_backup_file }}.
+          {% else %}The distro's copy ({{ _base_uu_pristine }}) is missing or does not match dpkg's
+          record, so auto_sec cannot put it back yet: reinstall unattended-upgrades first
+          (apt-get install --reinstall unattended-upgrades), then run once with
+          -e apt_migrate_unattended_upgrades=true.
+          {% endif %}To keep the file as your own instead, edit any line of it (a comment is enough) and
+          run again; its reboots at 04:00 then stay on unless you set
+          unattended_automatic_reboot: false.
+          {% elif not (_base_uu_legacy | bool) %}apt_migrate_unattended_upgrades is set, but
+          {{ _base_uu_dist_file }} on {{ inventory_hostname }} is {{ 'missing' if (_base_uu_dist_sha256 | length == 0)
+          else 'not the file auto_sec 0.1-0.4 wrote (auto_sec never touches it)' }}:
+          there is nothing to migrate. Run again without -e apt_migrate_unattended_upgrades=true.
+          {% else %}apt_migrate_unattended_upgrades is set, but the distro's copy ({{ _base_uu_pristine }}) on
+          {{ inventory_hostname }} is missing or does not match dpkg's record, so auto_sec cannot put it
+          back. Reinstall unattended-upgrades (apt-get install --reinstall unattended-upgrades) and run
+          again.
+          {% endif %}Nothing has been changed.
+
+    - name: "Base B6: what you chose takes effect"
+      ansible.builtin.import_tasks: verify.yml
+      vars:
+        _base_chk: "{{ _base_uu_sim_after }}"
+        _base_chk_s: "{{ _base_uu_sim_s }}"
+        _base_chk_ctx: trial
+
+  always:
+    - name: "Base B5: remove the copy and the candidate"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ _base_sim_dir }}"
+        - "{{ _base_candidate }}"
+      changed_when: false
+      check_mode: false
+      diff: false

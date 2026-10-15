@@ -1,0 +1,4 @@
+Origin: Debian
+Label: Debian
+Suite: stable
+Codename: trixie

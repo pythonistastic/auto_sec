@@ -1,8 +1,86 @@
 ---
 # Global defaults. Override per client in host_vars/<client>.yml
 
-timezone: "UTC"
 deploy_user: "deploy"
+
+# --- Updates, reboots, hostname, timezone (role 01) -----------------------
+# auto_sec writes at most one apt file,
+# /etc/apt/apt.conf.d/51autosec-unattended-upgrades, and only when a
+# setting below asks for something (with the defaults it writes none). It
+# never edits the distro's 20auto-upgrades or 50unattended-upgrades (one
+# exception, only with -e apt_migrate_unattended_upgrades=true: on a host
+# set up by auto_sec 0.1-0.4 it puts the distro's 50unattended-upgrades
+# back once). Your own 52unattended-upgrades-local is read after auto_sec's
+# file and wins; the run stops if it would cancel a choice made here.
+# keep = leave it as the server has it.
+
+# Hostname: keep, or a lowercase hostname/FQDN (at most 64 characters).
+# Nothing in auto_sec needs it: reports, alerts and backups use the
+# inventory name. A mail server announces this name; the run refuses to
+# change it while something listens on port 25, 465 or 587.
+server_hostname: keep
+
+# Timezone: keep, or a name the server knows (timedatectl list-timezones),
+# e.g. "UTC" or "Europe/Berlin". A change moves every cron job and timer
+# that runs at a clock time; the run lists them first. (0.4 set "UTC".)
+timezone: keep
+
+# Automatic security updates (unattended-upgrades):
+#   auto: install unattended-upgrades if it is missing; its own setup turns
+#         the updates on. auto_sec writes no switch of its own, so the
+#         distro's switch keeps working (dpkg-reconfigure
+#         unattended-upgrades, 20auto-upgrades). If the server has them off,
+#         or unattended-upgrades was removed, they stay off and the run
+#         prints a WARNING.
+#   true: turn them on and keep them on (auto_sec's file sets both
+#         switches to "1", daily, whatever 20auto-upgrades says)
+#   keep: leave them as they are (auto_sec does not even install
+#         unattended-upgrades)
+# auto_sec never turns them off ("false" is refused).
+unattended_upgrades_enabled: auto
+
+# Automatic reboot after an update that needs one (a new kernel):
+#   keep:  auto_sec does not touch it (off unless you or the distro turned
+#          it on; the run warns when it is on)
+#   true:  reboot at unattended_reboot_time, in the server's own timezone
+#   false: never reboot automatically
+# Updates run at about 06:00-07:00; a time already past that day means the
+# next day.
+unattended_automatic_reboot: keep
+# Required with true, QUOTED (unquoted, YAML reads 03:30 as a number):
+# unattended_reboot_time: "03:30"
+
+# Which archives the automatic updates install from:
+#   keep:     leave the distro's (or your) origin list alone
+#   security: security archives only (on Ubuntu also the release pocket,
+#             which security fixes need for new dependencies)
+unattended_origins: keep
+
+# true: never update the Docker packages automatically (docker-ce,
+# docker-ce-cli, docker-ce-rootless-extras, docker-buildx-plugin,
+# docker-compose-plugin, containerd.io, docker.io, containerd). A Docker
+# update restarts the Docker service and every container.
+unattended_exclude_docker: false
+
+# More packages the automatic updates must never touch: exact package
+# names, no patterns, e.g. ["nginx", "postgresql-16"]. Added to the list
+# of the other files; nothing is removed from it.
+unattended_upgrade_blacklist: []
+
+# One-off switch: pass with -e on one run, never in host_vars. true runs
+# `apt-get dist-upgrade` (all waiting updates; it can restart services and
+# a new kernel needs a reboot). Without it, role 01 only installs missing
+# packages, without their recommendations, and stops if that would
+# upgrade or remove an installed package; the nightly automatic updates do
+# the rest.
+apt_full_upgrade: false
+
+# One-off switch: pass with -e on one run, never in host_vars. On a server
+# set up by auto_sec 0.1-0.4 (its 50unattended-upgrades is still exactly
+# 0.1-0.4's file, with automatic reboots at 04:00), the run stops and shows
+# what putting the distro's file back changes. true keeps a copy in
+# /var/lib/auto-sec/backup/ and puts the distro's file back.
+apt_migrate_unattended_upgrades: false
 
 # --- SSH (role 02) --------------------------------------------------------
 # auto_sec writes only /etc/ssh/sshd_config.d/00-autosec.conf. It never
@@ -63,9 +141,40 @@ ssh_max_hosts_per_run: 5
 # Set to empty string to disable.
 office_static_ip: ""
 
-# More fixed IPs/CIDRs fail2ban must never ban (jail.local ignoreip,
-# together with office_static_ip), e.g. ["203.0.113.7", "198.51.100.0/24"].
+# More fixed IPs/CIDRs fail2ban must never ban, e.g.
+# ["203.0.113.7", "198.51.100.0/24"]. Together with office_static_ip they
+# go to ignoreip in [DEFAULT] of jail.d/00-autosec.conf. An ignoreip of
+# your own (jail.local) replaces that list; the run warns when one of
+# these addresses is then missing.
 fail2ban_ignore_ips: []
+
+# --- fail2ban (role 03) ---------------------------------------------------
+# auto_sec writes only /etc/fail2ban/jail.d/00-autosec.conf, never
+# jail.local. fail2ban reads it first, so any value YOUR files set wins.
+# fail2ban is reloaded only when its effective config changes.
+# false: role 03 does not install or configure fail2ban (ufw still runs).
+fail2ban_hardening_enabled: true
+
+# fail2ban [DEFAULT] values. They apply to every jail that sets none of its
+# own; if one would change a jail of yours, the run stops and names it.
+# Setting this replaces the whole mapping. {} = auto_sec sets none.
+# Allowed keys: bantime findtime maxretry bantime.increment bantime.factor
+# bantime.maxtime bantime.rndtime backend
+fail2ban_defaults:
+  bantime: "1h"
+  bantime.increment: true
+  bantime.factor: 2
+  findtime: "10m"
+  maxretry: 4
+
+# One-off switch: pass with -e on one run, never in host_vars. Moves a
+# jail.local written by auto_sec 0.1-0.4 to /var/lib/auto-sec/fail2ban/.
+fail2ban_migrate_jail_local: false
+
+# For role 05 only (app_type set): the nginx-http-auth and nginx-botsearch
+# jails, in jail.d/00-autosec-nginx.conf, once nginx is installed. Role 03
+# never adds nginx jails, so a host without nginx gets none.
+fail2ban_nginx_jails: true
 
 # Paranoia: standard | high. high adds fwknop (Single Packet Authorization).
 # In 0.4.0 SSH stays visible (rate-limited) in high mode too; hiding SSH

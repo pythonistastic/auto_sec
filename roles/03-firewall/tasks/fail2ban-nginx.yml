@@ -1,0 +1,67 @@
+---
+# roles/03-firewall/tasks/fail2ban-nginx.yml - auto_sec's nginx jails.
+#
+# Role 05 includes this file AFTER it has installed nginx and flushed its
+# handlers (nginx runs, its log files exist):
+#   - ansible.builtin.include_role:
+#       name: 03-firewall
+#       tasks_from: fail2ban-nginx
+# Role 03 itself never writes nginx jails, so a host where nginx is yours
+# (no app_type) never gets them. Writes only
+# /etc/fail2ban/jail.d/00-autosec-nginx.conf (nginx-http-auth and
+# nginx-botsearch, backend = auto), after the same trial and checks as
+# 00-autosec.conf (R1, R2, R3, R5, R6, R7), and reloads fail2ban only when
+# the effective config changes.
+
+- name: "fail2ban nginx: the fail2ban preflight must have run in this play"
+  ansible.builtin.assert:
+    quiet: true
+    that: _f2b_enabled is defined
+    fail_msg: >-
+      The nginx jails need role 03's preflight (site.yml runs it in pre_tasks:
+      import_role name=03-firewall tasks_from=preflight, tags always).
+
+- name: "fail2ban nginx: is fail2ban installed?"
+  when:
+    - _f2b_enabled | bool
+    - fail2ban_nginx_jails | default(true) | bool
+  ansible.builtin.command:
+    argv: [dpkg-query, -W, "-f=${db:Status-Abbrev}", fail2ban]
+  register: _f2b_ngx_pkg
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "fail2ban nginx: no fail2ban, no nginx jails"
+  when:
+    - _f2b_ngx_pkg is not skipped
+    - (_f2b_ngx_pkg.stdout | default('')) is not match('^.i')
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: fail2ban is not installed on {{ inventory_hostname }}, so the nginx jails
+      were not added. Run role 03 (--tags firewall) first, then this role again.
+
+- name: "fail2ban nginx: trial, write and load 00-autosec-nginx.conf"
+  when:
+    - _f2b_ngx_pkg is not skipped
+    - (_f2b_ngx_pkg.stdout | default('')) is match('^.i')
+  block:
+    - name: "fail2ban nginx: trial run on a copy of /etc/fail2ban"
+      ansible.builtin.include_tasks:
+        file: trial.yml
+      vars:
+        _f2b_kind: nginx
+        _f2b_stage: apply
+
+    - name: "fail2ban nginx: refuse or go on"
+      ansible.builtin.include_tasks:
+        file: decide.yml
+      vars:
+        _f2b_kind: nginx
+        _f2b_stage: apply
+
+    - name: "fail2ban nginx: write, check, load and verify"
+      ansible.builtin.include_tasks:
+        file: apply.yml
+      vars:
+        _f2b_kind: nginx

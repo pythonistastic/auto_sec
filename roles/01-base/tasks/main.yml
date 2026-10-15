@@ -1,54 +1,196 @@
 ---
-- name: Set hostname
-  ansible.builtin.hostname:
-    name: "{{ inventory_hostname }}"
+# roles/01-base/tasks/main.yml - role 01 apply phase (tags: base).
+#
+# Preflight (tasks/preflight.yml, imported by site.yml pre_tasks) already
+# checked everything and set the _base_* facts. This file:
+#   1. installs the missing base packages, without recommendations; it
+#      stops instead if that would upgrade or remove an installed package
+#      (packages.yml), unless apt_full_upgrade is set
+#   2. on a host set up by auto_sec 0.1-0.4 only, and only with
+#      -e apt_migrate_unattended_upgrades=true: keeps a copy of the old
+#      50unattended-upgrades and puts the distro's own file back
+#   3. writes /etc/apt/apt.conf.d/51autosec-unattended-upgrades, or removes
+#      it when there is nothing to write (the default: nothing)
+#   4. proves that apt now reads what the trial run said
+#   5. full upgrade, only with -e apt_full_upgrade=true
+#   6. deploy user, sudoers, sysctl (unchanged in 0.5)
+#   7. hostname, only when server_hostname is set and differs
+#   8. timezone, only when timezone is set and differs
+# auto_sec never writes 20auto-upgrades, never edits 50unattended-upgrades
+# (apart from the one-time restore in 2) and never touches the apt timers.
 
-- name: Set timezone
-  community.general.timezone:
-    name: "{{ timezone }}"
+- name: "Base: the preflight must have run in this play"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _base_uu_plan_empty is defined
+      - _base_uu_sim_after is defined
+      - _base_hostname_change is defined
+      # Preflight skips its role-01-only checks unless the tags select
+      # "base"; role 01 must then not run under some other tag.
+      - _base_role_runs | default(false) | bool
+    fail_msg: >-
+      Role 01 needs its preflight, and the role must be tagged "base". site.yml runs the
+      preflight in pre_tasks (import_role name=01-base tasks_from=preflight, tags always)
+      and tags role 01 "base". Do the same in any other playbook that uses role 01.
+      Nothing has been changed.
 
-- name: Full system upgrade
+# --- 1. Packages ----------------------------------------------------------------
+
+# Only when something is missing (preflight B5b): a host that has every
+# package gets no apt run at all, not even a list refresh.
+- name: "Base 1: refresh the package lists (only if older than an hour)"
+  when: _base_pkgs_missing | length > 0
   ansible.builtin.apt:
     update_cache: true
-    upgrade: dist
     cache_valid_time: 3600
 
-- name: Install essentials
+- name: "Base 1: check again with the fresh lists: install only, upgrade nothing"
+  when: _base_pkgs_missing | length > 0
+  ansible.builtin.import_tasks: packages.yml
+  vars:
+    _base_pkg_ctx: main
+
+# state: present installs only the missing names; the check above made sure
+# that this upgrades and removes nothing (or apt_full_upgrade allows it).
+- name: "Base 1: install the missing base packages"
+  when: _base_pkgs_missing | length > 0
   ansible.builtin.apt:
-    name:
-      - curl
-      - git
-      - htop
-      - ncdu
-      - age
-      - unattended-upgrades
-      - apt-listchanges
-      - python3-pip
-      - jq
+    name: "{{ _base_pkgs_missing }}"
     state: present
+    install_recommends: false
 
-- name: Configure unattended upgrades (security only, 4am reboot window)
-  ansible.builtin.copy:
-    dest: /etc/apt/apt.conf.d/50unattended-upgrades
+# --- 2. Host set up by auto_sec 0.1-0.4 ------------------------------------------
+
+- name: "Base 2: put the distro's 50unattended-upgrades back"
+  when: _base_uu_restore | bool
+  block:
+    - name: "Base 2: 50unattended-upgrades is still the file auto_sec 0.1-0.4 wrote"
+      ansible.builtin.stat:
+        path: "{{ _base_uu_dist_file }}"
+        follow: false
+        checksum_algorithm: sha256
+      register: _base_m_dist
+
+    - name: "Base 2: stop if it changed since the preflight"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _base_m_dist.stat.isreg | default(false)
+          - _base_m_dist.stat.checksum == _base_uu_legacy_sha256
+        fail_msg: >-
+          {{ _base_uu_dist_file }} on {{ inventory_hostname }} changed during this run, so
+          auto_sec leaves it alone. Nothing in apt.conf.d has been changed. Run again.
+
+    - name: "Base 2: backup folder, root only"
+      ansible.builtin.file:
+        path: "{{ _base_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: "Base 2: keep a copy of the old file"
+      ansible.builtin.copy:
+        src: "{{ _base_uu_dist_file }}"
+        dest: "{{ _base_backup_file }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: "Base 2: the copy is complete"
+      when: not ansible_check_mode
+      ansible.builtin.stat:
+        path: "{{ _base_backup_file }}"
+        checksum_algorithm: sha256
+      register: _base_m_backup
+
+    - name: "Base 2: stop unless the copy is complete"
+      when: not ansible_check_mode
+      ansible.builtin.assert:
+        quiet: true
+        that: (_base_m_backup.stat.checksum | default('')) == _base_uu_legacy_sha256
+        fail_msg: >-
+          The copy {{ _base_backup_file }} on {{ inventory_hostname }} does not match the old
+          file, so auto_sec does not replace {{ _base_uu_dist_file }}. Nothing in apt.conf.d
+          has been changed.
+
+    # ucf then sees the file it installed, and later package updates replace
+    # it normally (no "modified configuration file" prompt).
+    - name: "Base 2: put the distro's own file in place"
+      ansible.builtin.copy:
+        src: "{{ _base_uu_pristine }}"
+        dest: "{{ _base_uu_dist_file }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+        validate: apt-config -c %s dump
+
+# --- 3. auto_sec's own apt file ---------------------------------------------------
+
+- name: "Base 3: write 51autosec-unattended-upgrades"
+  when: not (_base_uu_plan_empty | bool)
+  ansible.builtin.template:
+    src: 51autosec-unattended-upgrades.j2
+    dest: "{{ _base_uu_file }}"
+    owner: root
+    group: root
     mode: "0644"
-    content: |
-      Unattended-Upgrade::Allowed-Origins {
-          "${distro_id}:${distro_codename}-security";
-          "${distro_id}ESMApps:${distro_codename}-apps-security";
-      };
-      Unattended-Upgrade::Automatic-Reboot "true";
-      Unattended-Upgrade::Automatic-Reboot-Time "04:00";
-      Unattended-Upgrade::Remove-Unused-Dependencies "true";
+    validate: apt-config -c %s dump
 
-- name: Enable periodic updates
-  ansible.builtin.copy:
-    dest: /etc/apt/apt.conf.d/20auto-upgrades
-    mode: "0644"
-    content: |
-      APT::Periodic::Update-Package-Lists "1";
-      APT::Periodic::Unattended-Upgrade "1";
+# Preflight B3 refused any other file under this name.
+- name: "Base 3: nothing to write: remove auto_sec's own file"
+  when:
+    - _base_uu_plan_empty | bool
+    - _base_uu_file_state == 'ours'
+  ansible.builtin.file:
+    path: "{{ _base_uu_file }}"
+    state: absent
 
-- name: Create deploy user
+# --- 4. Prove -----------------------------------------------------------------------
+
+- name: "Base 4: prove what apt reads now"
+  when: not ansible_check_mode
+  ansible.builtin.import_tasks: prove.yml
+
+# auto mode on a host without unattended-upgrades: the package's own setup
+# decided (debconf, default true). Say what it did.
+- name: "Base 4: automatic updates after this run installed unattended-upgrades"
+  when:
+    - not ansible_check_mode
+    - _base_uu_enabled_mode == 'auto'
+    - _base_uu_install | bool
+    - not (_base_uu_installed | bool)
+  ansible.builtin.debug:
+    msg: >-
+      {% if _base_m_on | bool %}unattended-upgrades was installed on {{ inventory_hostname }} by this run, and
+      its own setup turned automatic updates on.{% else %}WARNING: unattended-upgrades was installed on
+      {{ inventory_hostname }} by this run, but its setup left automatic updates OFF (debconf
+      unattended-upgrades/enable_auto_updates is false, or a file turns them off). auto_sec leaves them
+      off because unattended_upgrades_enabled is auto. Set unattended_upgrades_enabled: true to turn them
+      on.{% endif %}
+  vars:
+    _base_m_on: >-
+      {{ (_base_uu_after['APT::Periodic::Unattended-Upgrade'] | default(['']) | last) not in ['0', '']
+         and (_base_uu_after['APT::Periodic::Update-Package-Lists'] | default(['']) | last) not in ['0', '']
+         and (_base_uu_after['APT::Periodic::Enable'] | default(['1']) | last) != '0' }}
+
+# --- 5. Full upgrade (one-off switch) -----------------------------------------------
+
+# Last of the apt steps, so the package's ucf sees the restored, unmodified
+# 50unattended-upgrades and replaces it normally.
+- name: "Base 5: full upgrade (apt_full_upgrade)"
+  when: _base_full_upgrade | bool
+  ansible.builtin.apt:
+    upgrade: dist
+    update_cache: true
+    cache_valid_time: 3600
+
+# --- 6. Deploy user, sudoers, sysctl (unchanged in 0.5) -----------------------------
+
+- name: "Base 6: create the deploy user"
   ansible.builtin.user:
     name: "{{ deploy_user }}"
     shell: /bin/bash
@@ -56,14 +198,14 @@
     append: true
     create_home: true
 
-- name: Passwordless sudo for deploy user
+- name: "Base 6: passwordless sudo for the deploy user"
   ansible.builtin.copy:
     dest: "/etc/sudoers.d/{{ deploy_user }}"
     mode: "0440"
     validate: "visudo -cf %s"
     content: "{{ deploy_user }} ALL=(ALL) NOPASSWD:ALL\n"
 
-- name: Kernel hardening via sysctl
+- name: "Base 6: kernel hardening via sysctl"
   ansible.posix.sysctl:
     name: "{{ item.key }}"
     value: "{{ item.value }}"
@@ -77,3 +219,34 @@
     - { key: "net.ipv4.conf.all.send_redirects", value: "0" }
     - { key: "net.ipv4.conf.all.accept_source_route", value: "0" }
     - { key: "kernel.dmesg_restrict", value: "1" }
+
+# --- 7, 8. Hostname and timezone (only when you set them) ---------------------------
+
+# server_hostname: keep (the default) never reaches this task. hostnamectl
+# sets the static and transient name; /etc/hosts is not touched.
+- name: "Base 7: hostname"
+  when: _base_hostname_change | bool
+  ansible.builtin.hostname:
+    name: "{{ _base_hostname_want }}"
+
+- name: "Base 8: timezone"
+  when: _base_tz_change | bool
+  community.general.timezone:
+    name: "{{ _base_tz_want }}"
+
+- name: "Base 8: timezone after the change"
+  when:
+    - _base_tz_change | bool
+    - not ansible_check_mode
+  ansible.builtin.command:
+    argv: [timedatectl, show, -p, Timezone, --value]
+  register: _base_m_tz
+  changed_when: false
+  failed_when: false
+
+- name: "Base 8: remember the timezone"
+  when:
+    - _base_tz_change | bool
+    - not ansible_check_mode
+  ansible.builtin.set_fact:
+    _base_tz_after: "{{ _base_m_tz.stdout | default('') | trim if (_base_m_tz.stdout | default('') | trim) is match(_base_tz_re) else '' }}"

@@ -1,0 +1,2 @@
+---
+unattended_upgrade_blacklist: ["docker-ce$"]

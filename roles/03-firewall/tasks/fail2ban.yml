@@ -1,0 +1,92 @@
+---
+# roles/03-firewall/tasks/fail2ban.yml - role 03's fail2ban part (issue #2).
+#
+# Included by main.yml (tags: fail2ban) when fail2ban_hardening_enabled is
+# true. auto_sec writes one file of its own, /etc/fail2ban/jail.d/
+# 00-autosec.conf, and never writes jail.local. fail2ban reads that file
+# right after jail.conf, so every value your own files set wins.
+#
+#   F1  install fail2ban (state present: an installed one is never upgraded)
+#   F2  --check on a host without fail2ban: say so and stop here
+#   F3  trial run and decision again, after roles 01 and 02 (preflight P3
+#       did the same before anything changed)
+#   F4-F10 apply.yml: write, check, reload only on an effective change, verify
+#   F11 start and enable fail2ban only if this run installed it
+#   F12 one line for the report (_f2b_report)
+
+- name: "fail2ban: the preflight must have run in this play"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _f2b_enabled is defined
+      - _f2b_installed_before is defined
+      - _f2b_role_runs | default(false) | bool
+    fail_msg: >-
+      Role 03's fail2ban part needs its preflight, and the role must be tagged
+      "firewall". site.yml runs the preflight in pre_tasks (import_role
+      name=03-firewall tasks_from=preflight, tags always). Do the same in any other
+      playbook that uses role 03. Nothing has been changed in fail2ban.
+
+- name: "fail2ban F1: install fail2ban"
+  ansible.builtin.apt:
+    name: "{{ ['fail2ban'] + (['python3-systemd'] if (_f2b_defaults.backend | default('')) == 'systemd' else []) }}"
+    state: present
+
+- name: "fail2ban F1: is fail2ban installed now?"
+  ansible.builtin.command:
+    argv: [dpkg-query, -W, "-f=${db:Status-Abbrev}", fail2ban]
+  register: _f2b_pkg_now
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "fail2ban F1: fail2ban must be installed now (outside --check)"
+  ansible.builtin.assert:
+    quiet: true
+    that: ansible_check_mode or ((_f2b_pkg_now.stdout | default('')) is match('^.i'))
+    fail_msg: >-
+      apt reported fail2ban as installed, but dpkg says it is not
+      ({{ _f2b_pkg_now.stdout | default('') | regex_replace('[{}]', '?') }}). fail2ban has not been configured.
+
+- name: "fail2ban F2: check mode on a host without fail2ban"
+  when: (_f2b_pkg_now.stdout | default('')) is not match('^.i')
+  ansible.builtin.debug:
+    msg: >-
+      fail2ban is not installed on {{ inventory_hostname }} yet. The real run installs
+      it, runs the same trial on its config, writes {{ _f2b_dropin }} and loads it.
+
+- name: "fail2ban: trial, write and load"
+  when: (_f2b_pkg_now.stdout | default('')) is match('^.i')
+  block:
+    - name: "fail2ban F3: trial run on a copy of /etc/fail2ban (after roles 01 and 02)"
+      ansible.builtin.include_tasks:
+        file: trial.yml
+      vars:
+        _f2b_kind: main
+        _f2b_stage: apply
+
+    - name: "fail2ban F3: refuse or go on"
+      ansible.builtin.include_tasks:
+        file: decide.yml
+      vars:
+        _f2b_kind: main
+        _f2b_stage: apply
+
+    - name: "fail2ban F4-F10: write, check, load and verify"
+      ansible.builtin.include_tasks:
+        file: apply.yml
+      vars:
+        _f2b_kind: main
+
+    # F11. A fail2ban that was installed before this run keeps its state:
+    # auto_sec never starts, stops or enables it (W4 said so).
+    - name: "fail2ban F11: start and enable the fail2ban this run installed"
+      when: not (_f2b_installed_before | bool)
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: started
+        enabled: true
+
+    - name: "fail2ban F12: one line for the report"
+      ansible.builtin.include_tasks:
+        file: report.yml

@@ -1,0 +1,222 @@
+---
+# roles/03-firewall/tasks/preflight.yml
+#
+# Read-only fail2ban checks P1-P4 (issue #2). site.yml imports this file in
+# pre_tasks with tags [always], after the SSH preflight, so a refusal comes
+# BEFORE role 01 changes anything. It also runs in --check. It writes only
+# the trial copy under /run/auto-sec/f2b-sim (tmpfs, root only, removed
+# again at the end of the trial).
+#
+# Trust boundary (SECURITY.md): what is read from the host is shown to you,
+# used to refuse, or used to decide whether role 03 reloads fail2ban,
+# restarts its sshd jail, and (only with -e fail2ban_migrate_jail_local=true)
+# moves a jail.local that auto_sec 0.1-0.4 wrote. It never becomes part of a
+# config file: 00-autosec.conf is rendered from your variables only.
+#
+# Facts set on every host:
+#   _f2b_enabled             bool  fail2ban_hardening_enabled
+#   _f2b_role_runs           bool  the tags select role 03's fail2ban part
+#   _f2b_migrate             bool  fail2ban_migrate_jail_local
+#   _f2b_installed_before    bool  fail2ban was installed when the run started
+#   _f2b_active_before       bool  fail2ban.service was active
+#   _f2b_unit_enabled_before bool  fail2ban.service was enabled
+#   _f2b_trial               dict  output of the last trial (files/auto-sec-f2b-check)
+#   _f2b_plan                str   what role 03 does with fail2ban
+#   _f2b_report              str   one line for the report (role 10)
+#
+# Checks that protect only role 03's own write (P3) run only when the tags
+# select it ("firewall" or "fail2ban"), so that for example --tags backups
+# is not refused because of a fail2ban change that would not happen.
+
+- name: "fail2ban preflight: start every fail2ban fact from a safe value"
+  ansible.builtin.set_fact:
+    _f2b_enabled: "{{ (fail2ban_hardening_enabled | default(true) | string | lower) in ['true', 'yes', '1', 'on'] }}"
+    _f2b_migrate: "{{ (fail2ban_migrate_jail_local | default(false) | string | lower) in ['true', 'yes', '1', 'on'] }}"
+    _f2b_role_runs: >-
+      {{ (('all' in ansible_run_tags) or ('tagged' in ansible_run_tags)
+          or ('firewall' in ansible_run_tags) or ('fail2ban' in ansible_run_tags))
+         and ('firewall' not in ansible_skip_tags) and ('fail2ban' not in ansible_skip_tags)
+         and ('tagged' not in ansible_skip_tags) and ('all' not in ansible_skip_tags) }}
+    _f2b_installed_before: false
+    _f2b_version_before: ""
+    _f2b_active_before: false
+    _f2b_unit_enabled_before: false
+    _f2b_trial: {}
+    _f2b_plan: "not checked"
+    _f2b_report: >-
+      {{ 'fail2ban is not managed by auto_sec (fail2ban_hardening_enabled: false)'
+         if (fail2ban_hardening_enabled | default(true) | string | lower) not in ['true', 'yes', '1', 'on']
+         else 'fail2ban was not checked in this run' }}
+
+# --- P1. Variable checks (no host access) ---------------------------------
+
+- name: "fail2ban preflight P1: on/off switches are true or false"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (fail2ban_hardening_enabled | default(true) | string | lower) in _f2b_bool_words
+      - (fail2ban_migrate_jail_local | default(false) | string | lower) in _f2b_bool_words
+      - (fail2ban_nginx_jails | default(true) | string | lower) in _f2b_bool_words
+    fail_msg: >-
+      fail2ban_hardening_enabled ({{ fail2ban_hardening_enabled | default(true) }}),
+      fail2ban_migrate_jail_local ({{ fail2ban_migrate_jail_local | default(false) }}) and
+      fail2ban_nginx_jails ({{ fail2ban_nginx_jails | default(true) }}) must each be true
+      or false. Nothing has been changed.
+
+- name: "fail2ban preflight P1: fail2ban_defaults uses allowed keys and values"
+  when: _f2b_enabled | bool
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _f2b_d is mapping
+      - _f2b_pairs | reject('match', _f2b_pair_re) | list | length == 0
+      - _f2b_pairs | select('search', '[\r\n]') | list | length == 0
+      - ('bantime.increment' not in _f2b_d) or (_f2b_d['bantime.increment'] is boolean)
+      - ('bantime.factor' not in _f2b_d) or ((_f2b_d['bantime.factor'] | float) > 0)
+    fail_msg: >-
+      {% if _f2b_d is not mapping %}fail2ban_defaults must be a mapping, for example
+      {bantime: "1h", maxretry: 4}, or {} for none. Got: {{ _f2b_d | string | truncate(80) }}.
+      {% else %}fail2ban_defaults has entries auto_sec does not accept:
+      {{ (_f2b_pairs | reject('match', _f2b_pair_re) | list) + (_f2b_pairs | select('search', '[\r\n]') | list) }}.
+      Allowed keys and values: {{ _f2b_key_pat }} (times like 10m, 1h, 4w; -1 is
+      not accepted). bantime.increment must be true or false without quotes.
+      {% if 'ignoreip' in _f2b_d %}Addresses fail2ban must ignore go in office_static_ip and
+      fail2ban_ignore_ips, not here. {% endif %}bantime.formula, ignorecommand, action and banaction
+      are never written by auto_sec: set them in your own jail.local.
+      {% endif %}Nothing has been changed.
+  vars:
+    _f2b_d: "{{ fail2ban_defaults | default({}) }}"
+    _f2b_pairs: >-
+      {{ (_f2b_d | dict2items | map(attribute='key') | map('string')
+          | zip(_f2b_d | dict2items | map(attribute='value') | map('string')) | map('join', '=') | list)
+         if _f2b_d is mapping else [] }}
+    _f2b_pair_re: >-
+      ^({{ _f2b_key_pat | dict2items | map(attribute='key') | map('regex_escape')
+           | zip(_f2b_key_pat | dict2items | map(attribute='value')) | map('join', '=') | join('|') }})$
+
+- name: "fail2ban preflight P1: addresses fail2ban must ignore are IP addresses or networks"
+  when: _f2b_enabled | bool
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _f2b_ips is sequence
+      - _f2b_ips is not string
+      - _f2b_ips is not mapping
+      - _f2b_ips | map('string') | reject('match', _f2b_cidr_re) | list | length == 0
+      - _f2b_office | length == 0 or _f2b_office is match(_f2b_cidr_re)
+    fail_msg: >-
+      office_static_ip ("{{ _f2b_office }}") and every entry of fail2ban_ignore_ips
+      ({{ _f2b_ips }}) must be an IPv4/IPv6 address or network, for example
+      "203.0.113.7" or "198.51.100.0/24". auto_sec writes them into fail2ban's
+      ignoreip. Nothing has been changed.
+  vars:
+    _f2b_ips: "{{ fail2ban_ignore_ips | default([]) }}"
+    _f2b_office: "{{ office_static_ip | default('') | string | trim }}"
+
+# --- P2. Is fail2ban installed and running? (read-only) -------------------
+
+- name: "fail2ban preflight P2: installed fail2ban package"
+  when: _f2b_enabled | bool
+  ansible.builtin.command:
+    argv: [dpkg-query, -W, "-f=${db:Status-Abbrev} ${Version}", fail2ban]
+  register: _f2b_pf_pkg
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "fail2ban preflight P2: state of fail2ban.service"
+  when: _f2b_enabled | bool
+  ansible.builtin.command:
+    argv: [systemctl, is-active, fail2ban.service]
+  register: _f2b_pf_active
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "fail2ban preflight P2: is fail2ban.service enabled at boot?"
+  when: _f2b_enabled | bool
+  ansible.builtin.command:
+    argv: [systemctl, is-enabled, fail2ban.service]
+  register: _f2b_pf_unit
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "fail2ban preflight P2: remember the state before this run"
+  when: _f2b_enabled | bool
+  ansible.builtin.set_fact:
+    _f2b_installed_before: "{{ (_f2b_pf_pkg.rc | default(1)) == 0 and (_f2b_pf_pkg.stdout | default('')) is match('^.i') }}"
+    _f2b_version_before: "{{ (_f2b_pf_pkg.stdout | default('')).split()[1:2] | join('') | regex_replace('[^A-Za-z0-9.:+~-]', '?') }}"
+    _f2b_active_before: "{{ (_f2b_pf_active.stdout | default('') | trim) == 'active' }}"
+    _f2b_unit_enabled_before: "{{ (_f2b_pf_unit.stdout | default('') | trim) == 'enabled' }}"
+
+# --- P3. Trial run on a copy (only when role 03's fail2ban part runs) -----
+
+- name: "fail2ban preflight P3: the migration switch needs an installed fail2ban"
+  when:
+    - _f2b_enabled | bool
+    - _f2b_role_runs | bool
+    - _f2b_migrate | bool
+  ansible.builtin.assert:
+    quiet: true
+    that: _f2b_installed_before | bool
+    fail_msg: >-
+      fail2ban_migrate_jail_local is set, but fail2ban is not installed on
+      {{ inventory_hostname }}: there is nothing to migrate. Run again without
+      -e fail2ban_migrate_jail_local=true. Nothing has been changed.
+
+- name: "fail2ban preflight P3: trial run and decision"
+  when:
+    - _f2b_enabled | bool
+    - _f2b_role_runs | bool
+    - _f2b_installed_before | bool
+  block:
+    - name: "fail2ban preflight P3: trial run on a copy of /etc/fail2ban"
+      ansible.builtin.include_tasks:
+        file: trial.yml
+      vars:
+        _f2b_kind: main
+        _f2b_stage: preflight
+
+    - name: "fail2ban preflight P3: refuse or go on"
+      ansible.builtin.include_tasks:
+        file: decide.yml
+      vars:
+        _f2b_kind: main
+        _f2b_stage: preflight
+
+# auto_sec never deletes its own file when you turn it off: say so.
+- name: "fail2ban preflight P3: is an earlier 00-autosec.conf still in place?"
+  when:
+    - not (_f2b_enabled | bool)
+    - _f2b_role_runs | bool
+  ansible.builtin.stat:
+    path: "{{ _f2b_dropin }}"
+    get_checksum: false
+  register: _f2b_pf_left
+
+- name: "fail2ban preflight P3: note about the file an earlier run wrote"
+  when:
+    - _f2b_pf_left is not skipped
+    - _f2b_pf_left.stat.exists | default(false)
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: fail2ban_hardening_enabled is false, so role 03 leaves fail2ban alone.
+      {{ _f2b_dropin }} from an earlier auto_sec run is still in place and fail2ban
+      still reads it. Delete it yourself (then `fail2ban-client reload`) if you no
+      longer want its values.
+
+# --- P4. Summary -----------------------------------------------------------
+
+- name: "fail2ban preflight: summary"
+  when:
+    - _f2b_enabled | bool
+    - _f2b_role_runs | bool
+  ansible.builtin.debug:
+    msg:
+      installed: "{{ ('fail2ban ' ~ _f2b_version_before) if (_f2b_installed_before | bool) else 'no: role 03 installs fail2ban, then runs this check again before it writes anything' }}"
+      service: "{{ ('active' if (_f2b_active_before | bool) else 'NOT active') ~ ', ' ~ ('enabled' if (_f2b_unit_enabled_before | bool) else 'NOT enabled') ~ ' at boot' }}"
+      plan: "{{ _f2b_plan }}"
+      sshd_jail_after_this_run: "{{ _f2b_trial.sshd.effective | default({}) }}"
+      set_in: "{{ _f2b_trial.sshd.set_in | default({}) }}"
+      changes: "{{ _f2b_change_lines | default([]) }}"

@@ -18,6 +18,27 @@ office_static_ip: ""
 # More fixed IPs/CIDRs fail2ban must never ban.
 # fail2ban_ignore_ips: ["198.51.100.7"]
 
+# --- fail2ban (role 03) ------------------------------------------------
+# auto_sec writes only /etc/fail2ban/jail.d/00-autosec.conf. Your own
+# jail.local is never touched, and every value it sets wins.
+# fail2ban_defaults: {}               # auto_sec sets no fail2ban values
+# fail2ban_hardening_enabled: false   # leave fail2ban alone entirely
+
+# --- Updates, reboots, hostname, timezone (role 01) --------------------
+# By default auto_sec leaves all of these as the server has them and
+# writes no apt file. It only installs unattended-upgrades if it is
+# missing (its own setup turns the updates on), unless it was removed on
+# purpose.
+# unattended_upgrades_enabled: true  # auto (default) | true | keep
+# server_hostname: app.example.com   # default keep
+# timezone: "UTC"                    # default keep
+# Automatic reboot when an update needs one. Off unless you choose it:
+# unattended_automatic_reboot: true  # keep (default) | true | false
+# unattended_reboot_time: "03:30"    # required with true; QUOTE it
+# unattended_exclude_docker: true    # never update Docker automatically
+# unattended_upgrade_blacklist: ["nginx"]
+# unattended_origins: security       # default keep
+
 # --- SSH login (role 02) -----------------------------------------------
 # Quote every yes/no value: an unquoted no becomes false and the run
 # stops with "quote it".

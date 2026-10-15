@@ -1,0 +1,158 @@
+---
+# Runs role 01's own preflight pieces against a lab apt configuration,
+# unprivileged, on localhost only:
+#   plan.yml   (B1: variable checks and the plan)
+#   decide.yml (B4: finish the plan)
+#   trial.yml  (B5, B6: trial run with files/autosec-apt-sim, verify.yml)
+# and, with -e lab_prove=true, main step 4 after doing steps 1-3 to the lab
+# by hand:
+#   prove.yml  (the real configuration equals the trial run)
+# run.sh sets APT_CONFIG to the lab's apt.conf, so `apt-config dump` and the
+# trial run read <lab_dir>/parts instead of this machine's /etc/apt. The
+# values preflight B2 reads from a host come from the lab and from -e:
+#   ansible-playbook lab.yml -e @cases/<case>.yml -e lab_dir=<dir>
+#     -e lab_out=<facts.json> -e lab_render=<file> -e lab_scratch=<dir>
+#     [-e lab_installed=false] [-e lab_removed=true] [-e lab_pristine=<file>]
+#     [-e lab_dpkg_md5=<md5>]
+#     [-e lab_prove=true [-e lab_install_from=<dir>] [-e lab_inject=<text>]]
+#   lab_install_from  a directory with the package's 20auto-upgrades and
+#                     50unattended-upgrades (step 1 installs the package)
+#   lab_inject        the content of a file 99lab-inject that "something
+#                     else" adds between the trial run and the proof
+#   lab_removed       unattended-upgrades was removed, its config kept (rc)
+# A 51autosec-unattended-upgrades already in <lab_dir>/parts counts as
+# auto_sec's own file from an earlier run.
+# A refusal makes the play fail (non-zero rc); run.sh checks the message.
+- name: Role 01 preflight pieces against a lab apt configuration
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _role_dir: "{{ playbook_dir }}/../../../roles/01-base"
+    # Play vars beat the role defaults: point the role at the lab.
+    _base_apt_parts: "{{ lab_dir }}/parts"
+    _base_uu_file: "{{ lab_dir }}/parts/51autosec-unattended-upgrades"
+    _base_uu_dist_file: "{{ lab_dir }}/parts/50unattended-upgrades"
+    _base_run_dir: "{{ lab_scratch }}"
+    _base_sim_dir: "{{ lab_scratch }}/apt-sim"
+    _base_candidate: "{{ lab_scratch }}/apt-candidate"
+    _base_uu_pristine: "{{ lab_pristine | default(lab_dir ~ '/no-pristine') }}"
+  tasks:
+    - name: "B1: check the variables and make the plan (role 01 plan.yml)"
+      ansible.builtin.include_role:
+        name: 01-base
+        tasks_from: plan
+        public: true
+
+    - name: "B2 (lab): apt-config dump"
+      ansible.builtin.command:
+        argv: [apt-config, dump]
+      register: lab_dump
+      changed_when: false
+
+    - name: "B2 (lab): 50unattended-upgrades"
+      ansible.builtin.stat:
+        path: "{{ _base_uu_dist_file }}"
+        checksum_algorithm: sha256
+      register: lab_dist
+
+    - name: "B2 (lab): the distro copy"
+      ansible.builtin.stat:
+        path: "{{ _base_uu_pristine }}"
+        checksum_algorithm: md5
+      register: lab_pristine_stat
+
+    - name: "B2 (lab): auto_sec's own file from an earlier run"
+      ansible.builtin.stat:
+        path: "{{ _base_uu_file }}"
+      register: lab_own_stat
+
+    - name: "B2 (lab): what preflight would have read"
+      ansible.builtin.set_fact:
+        _base_uu_installed: "{{ lab_installed | default(true) | bool }}"
+        _base_uu_removed: "{{ lab_removed | default(false) | bool }}"
+        _base_uu_before: "{{ _base_kv }}"
+        _base_uu_dist_sha256: "{{ lab_dist.stat.checksum | default('') }}"
+        _base_uu_pristine_md5: "{{ lab_pristine_stat.stat.checksum | default('') }}"
+        _base_uu_dpkg_md5: "{{ lab_dpkg_md5 | default('') }}"
+        _base_uu_file_state: "{{ 'ours' if lab_own_stat.stat.exists else 'absent' }}"
+        _base_hostname_static: lab
+        _base_hostname_transient: lab
+        _base_tz_now: Europe/Berlin
+      vars:
+        _base_kv_lines: "{{ lab_dump.stdout_lines }}"
+
+    - name: "B4: finish the plan (role 01 decide.yml)"
+      ansible.builtin.include_role:
+        name: 01-base
+        tasks_from: decide
+
+    - name: "Keep a copy of the candidate for the unattended-upgrades checks"
+      when: not (_base_uu_plan_empty | bool)
+      ansible.builtin.template:
+        src: "{{ _role_dir }}/templates/51autosec-unattended-upgrades.j2"
+        dest: "{{ lab_render }}"
+        mode: "0644"
+
+    - name: "B5, B6: trial run (role 01 trial.yml)"
+      ansible.builtin.include_role:
+        name: 01-base
+        tasks_from: trial
+
+    - name: "Main steps 1-3, done to the lab by hand, then step 4"
+      when: lab_prove | default(false) | bool
+      block:
+        - name: "Step 1 (lab): the package's files appear"
+          when: lab_install_from is defined
+          ansible.builtin.copy:
+            src: "{{ lab_install_from }}/{{ item }}"
+            dest: "{{ lab_dir }}/parts/{{ item }}"
+            mode: "0644"
+          loop: [20auto-upgrades, 50unattended-upgrades]
+
+        - name: "Step 2 (lab): the distro's 50unattended-upgrades back"
+          when: _base_uu_restore | bool
+          ansible.builtin.copy:
+            src: "{{ _base_uu_pristine }}"
+            dest: "{{ _base_uu_dist_file }}"
+            mode: "0644"
+
+        - name: "Step 3 (lab): auto_sec's file"
+          when: not (_base_uu_plan_empty | bool)
+          ansible.builtin.copy:
+            src: "{{ lab_render }}"
+            dest: "{{ _base_uu_file }}"
+            mode: "0644"
+
+        - name: "Step 3 (lab): nothing to write: auto_sec's file goes"
+          when: _base_uu_plan_empty | bool
+          ansible.builtin.file:
+            path: "{{ _base_uu_file }}"
+            state: absent
+
+        - name: "Between the trial run and the proof, something else adds a file"
+          when: lab_inject is defined
+          ansible.builtin.copy:
+            content: "{{ lab_inject }}\n"
+            dest: "{{ lab_dir }}/parts/99lab-inject"
+            mode: "0644"
+
+        - name: "Step 4: prove (role 01 prove.yml)"
+          ansible.builtin.include_role:
+            name: 01-base
+            tasks_from: prove
+
+    - name: Write the facts
+      ansible.builtin.copy:
+        dest: "{{ lab_out }}"
+        mode: "0644"
+        content: >-
+          {{ {'before': _base_uu_before, 'after': _base_uu_sim_after, 'diff': _base_uu_diff,
+              's': _base_uu_sim_s, 'legacy': _base_uu_legacy, 'restore': _base_uu_restore,
+              'trial_pristine': _base_uu_trial_pristine, 'install': _base_uu_install,
+              'diff_lines': _base_uu_diff_lines,
+              'off_on_purpose': _base_uu_off_on_purpose, 'write_periodic': _base_uu_write_periodic,
+              'plan_empty': _base_uu_plan_empty, 'blacklist_re': _base_uu_blacklist_re,
+              'reboot': _base_uu_reboot, 'origins': _base_uu_origins,
+              'enabled_mode': _base_uu_enabled_mode,
+              'real_after': _base_uu_after | default(none)} | to_nice_json }}

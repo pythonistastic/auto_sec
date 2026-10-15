@@ -1,0 +1,5 @@
+---
+# The variables that rendered fixtures/legacy-0.4.jail.local.
+ssh_port: 2222
+office_static_ip: "203.0.113.7"
+fail2ban_ignore_ips: ["198.51.100.0/24", "2001:db8::1"]

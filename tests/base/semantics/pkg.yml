@@ -1,0 +1,28 @@
+---
+# Runs role 01's packages.yml (which packages role 01 installs, and what apt
+# would do to install them) on localhost, unprivileged. run.sh puts fake
+# dpkg-query and apt-get commands first in PATH; they print canned output
+# (fixtures/pkg-*.txt: real `apt-get -s` output).
+#   ansible-playbook pkg.yml -e lab_out=<facts.json>
+#     [-e lab_ctx=main] [-e lab_full_upgrade=true] [-e lab_uu_install=false]
+# A refusal makes the play fail (non-zero rc); run.sh checks the message.
+- name: Role 01 packages.yml against canned apt output
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # What role 01's plan (plan.yml, decide.yml) would have set.
+    _base_uu_install: "{{ lab_uu_install | default(true) | bool }}"
+    _base_full_upgrade: "{{ lab_full_upgrade | default(false) | bool }}"
+    _base_pkg_ctx: "{{ lab_ctx | default('preflight') }}"
+  tasks:
+    - name: "B5b: packages (role 01 packages.yml)"
+      ansible.builtin.include_role:
+        name: 01-base
+        tasks_from: packages
+
+    - name: Write the facts
+      ansible.builtin.copy:
+        dest: "{{ lab_out }}"
+        mode: "0644"
+        content: "{{ {'missing': _base_pkgs_missing, 'side': _base_pkg_side} | to_nice_json }}"

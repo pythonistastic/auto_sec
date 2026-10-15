@@ -1,0 +1,29 @@
+# Pinned fail2ban packages for tests/fail2ban/semantics/run.sh.
+#
+# Format (whitespace separated, one file per line):
+#   <set> <pool file name> <sha256> <url> [<fallback url>...]
+# <set> is a distro codename (jammy bookworm noble trixie resolute). run.sh
+# tries the URLs in order and uses a file only if its SHA256 matches. The
+# first URL is the official archive pool; the second is the official
+# snapshot service, which keeps the exact file after the archive drops a
+# superseded version.
+#
+# Every SHA256 below was checked against the signed archive index
+# (InRelease -> Packages.xz) of the suite named in the comment.
+# To bump a version: download the new .deb from the pool, check it the same
+# way, replace the file name, hash and both URLs, then run run.sh.
+
+# Ubuntu 22.04 jammy, fail2ban 0.11.2 (jammy universe)
+jammy fail2ban_0.11.2-6_all.deb 10d53979be0c5980654d5d030d4861173cf1e5a41e7028f15ef43f5b79739061 https://archive.ubuntu.com/ubuntu/pool/universe/f/fail2ban/fail2ban_0.11.2-6_all.deb https://snapshot.ubuntu.com/ubuntu/20261014T200000Z/pool/universe/f/fail2ban/fail2ban_0.11.2-6_all.deb
+
+# Debian 12 bookworm, fail2ban 1.0.2 (bookworm main)
+bookworm fail2ban_1.0.2-2_all.deb 9717b7aeef7b00f0df4c76045cd6dab2755cbe9fc99dbfe3cd114126880ec7f7 https://deb.debian.org/debian/pool/main/f/fail2ban/fail2ban_1.0.2-2_all.deb https://snapshot.debian.org/archive/debian/20260601T000000Z/pool/main/f/fail2ban/fail2ban_1.0.2-2_all.deb
+
+# Ubuntu 24.04 noble, fail2ban 1.0.2 (noble-updates universe; the canary's version)
+noble fail2ban_1.0.2-3ubuntu0.1_all.deb f0f1047f6787d3cbf2552bdbcadd5752e50d618b7b9bb3eafdb9ec50f44ee469 https://archive.ubuntu.com/ubuntu/pool/universe/f/fail2ban/fail2ban_1.0.2-3ubuntu0.1_all.deb https://snapshot.ubuntu.com/ubuntu/20261014T200000Z/pool/universe/f/fail2ban/fail2ban_1.0.2-3ubuntu0.1_all.deb
+
+# Debian 13 trixie, fail2ban 1.1.0 (trixie main)
+trixie fail2ban_1.1.0-8_all.deb ac35080546f1a1581163b2ebcb9796b08eb4abca3d3643082b76dce505cbd6d8 https://deb.debian.org/debian/pool/main/f/fail2ban/fail2ban_1.1.0-8_all.deb https://snapshot.debian.org/archive/debian/20260601T000000Z/pool/main/f/fail2ban/fail2ban_1.1.0-8_all.deb
+
+# Ubuntu 26.04 resolute, fail2ban 1.1.0 (resolute universe)
+resolute fail2ban_1.1.0-9_all.deb d3b55ebf95513cf04692d48e8bafe6e51dea415b30c0543c64ec5ff69030a8b1 https://archive.ubuntu.com/ubuntu/pool/universe/f/fail2ban/fail2ban_1.1.0-9_all.deb https://snapshot.ubuntu.com/ubuntu/20261014T200000Z/pool/universe/f/fail2ban/fail2ban_1.1.0-9_all.deb

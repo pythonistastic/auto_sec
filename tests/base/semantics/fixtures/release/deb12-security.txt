@@ -1,0 +1,4 @@
+Origin: Debian
+Label: Debian-Security
+Suite: oldstable-security
+Codename: bookworm-security
