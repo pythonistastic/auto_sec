@@ -122,14 +122,15 @@ DOMAIN="$REPLY"
 ask_required "Email for Let's Encrypt TLS registration"
 LE_EMAIL="$REPLY"
 
-# ---------------------------------------------------------------- deploy key
+# ------------------------------------------------------------------ ssh key
 say "SSH access"
 note "New to SSH keys? Here is all you need to know:"
 note "  A key comes in a PAIR - a PRIVATE key that stays secret on your"
 note "  computer, and a PUBLIC key that is safe to share and gets installed"
-note "  on the server. You log in by proving you hold the private key. This"
-note "  is far safer than a password, so the playbook turns passwords OFF."
-note "The playbook creates a 'deploy' user and installs your PUBLIC key."
+note "  on the server. You log in by proving you hold the private key."
+note "  Keys are far safer than passwords."
+note "auto_sec adds your PUBLIC key to the server. It only ever adds keys;"
+note "it never removes a key that is already there."
 echo
 
 validate_pubkey() {  # $1 = key string
@@ -193,6 +194,89 @@ else
   [ -f "$PUB_PATH" ] || die "Could not find or derive the public key ${PUB_PATH}."
   DEPLOY_PUBKEY="$(cat "$PUB_PATH")"
   validate_pubkey "$DEPLOY_PUBKEY" || die "\"$PUB_PATH\" does not look like a valid public key."
+  case "$SSH_KEY_FILE" in
+    /mnt/*)
+      warn "This key is in a Windows folder (${SSH_KEY_FILE})."
+      warn "In WSL those files look readable by everyone, and ssh may refuse"
+      warn "the key. Copy it into ~/.ssh inside WSL and use that path." ;;
+  esac
+fi
+
+# ------------------------------------------------------------ login account
+# ssh_admin_user is the account you AND Ansible log in as after setup. Its
+# keys are added, and tested on a brand-new connection, before any login
+# rule gets stricter. Same shape rule as preflight: it reaches file paths.
+valid_user() { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
+
+say "Login account"
+NOW_USER="root"
+if [ "$MODE" = "remote" ]; then
+  note "Which account do you use to log in to this server today?"
+  note "On a new VPS this is usually root."
+  ask "Account you log in as today" "root"
+  NOW_USER="$REPLY"
+  valid_user "$NOW_USER" || die "Not a valid user name: $NOW_USER"
+fi
+ADMIN_DEFAULT="deploy"
+[ "$NOW_USER" = "root" ] && ADMIN_DEFAULT="root"
+if [ "$MODE" = "local" ]; then
+  note "Which account will you log in as, from your laptop, from now on?"
+else
+  note "Which account should you (and Ansible) log in as from now on?"
+fi
+note "  root    - keep logging in as root, with your key."
+note "  deploy  - a separate account with sudo. auto_sec creates it."
+note "  You can also type an existing account that has passwordless sudo."
+ask "Admin login account" "$ADMIN_DEFAULT"
+ADMIN_USER="$REPLY"
+valid_user "$ADMIN_USER" || die "Not a valid user name: $ADMIN_USER"
+
+# -------------------------------------------------------------- login rules
+# These two have no default on purpose: preflight stops until they are set.
+say "Login rules"
+note "auto_sec can make SSH logins stricter. You choose. Nothing gets"
+note "stricter until a key login as ${ADMIN_USER} works on a new connection."
+note "Our advice: choose 'keep' for both now. Run once. Check that your key"
+note "login works. Then change them in ${HOSTVARS} and run again."
+echo
+note "Root login over SSH:"
+note "  keep              - leave it as the server has it now (recommended first)"
+note "  prohibit-password - root may log in with a key, never with a password"
+if [ "$ADMIN_USER" != "root" ]; then
+  note "  no                - root may not log in over SSH at all"
+fi
+ask "Root login" "keep"
+PERMIT_ROOT="$REPLY"
+case "$PERMIT_ROOT" in
+  keep|prohibit-password) ;;
+  no) [ "$ADMIN_USER" != "root" ] \
+        || die "You log in as root, so root login cannot be 'no'. Choose keep or prohibit-password." ;;
+  *) die "Must be keep, prohibit-password or no." ;;
+esac
+echo
+note "Password login over SSH (for every account):"
+note "  keep - leave it as the server has it now (recommended first)"
+note "  no   - keys only. Passwords stop working over SSH for everyone,"
+note "         including tools like VS Code that log in with a password."
+note "         Move those tools to a key first."
+ask "Password login" "keep"
+PASSWORD_AUTH="$REPLY"
+case "$PASSWORD_AUTH" in
+  keep|no) ;;
+  *) die "Must be keep or no." ;;
+esac
+
+# Local mode cannot test a new login from your own computer, so role 02
+# only applies SSH settings that change nothing there (preflight refuses).
+if [ "$MODE" = "local" ] && { [ "$PERMIT_ROOT" != "keep" ] || [ "$PASSWORD_AUTH" != "keep" ]; }; then
+  warn "You are on the server itself (local mode). From here auto_sec cannot"
+  warn "test a new login from your computer, so it only applies SSH settings"
+  warn "that change nothing. If your choice would change how SSH works today,"
+  warn "the whole run stops before changing anything. To tighten logins, run"
+  warn "auto_sec from your own computer (remote mode)."
+  if confirm "Use 'keep' for both for now (recommended)?"; then
+    PERMIT_ROOT="keep"; PASSWORD_AUTH="keep"
+  fi
 fi
 
 # --------------------------------------------------------------------- app
@@ -324,8 +408,10 @@ fi
 
 # ---------------------------------------------------------------- paranoia
 say "Paranoia level"
-note "standard: SSH port open (rate-limited, keys only)"
-note "high:     SSH port INVISIBLE until a valid fwknop knock packet (SPA)"
+note "standard: SSH port open, rate-limited, with fail2ban"
+note "high:     also installs fwknop (Single Packet Authorization)."
+note "          In this version the SSH port stays visible in high mode."
+note "          Hiding it behind a knock returns in a later release."
 ask "Level: standard or high" "standard"
 PARANOIA="$REPLY"
 [ "$PARANOIA" = "standard" ] || [ "$PARANOIA" = "high" ] || die "Must be standard or high."
@@ -334,20 +420,48 @@ if [ "$PARANOIA" = "high" ]; then
   FWKNOP_KEY="$(openssl rand -base64 32)"
   FWKNOP_HMAC="$(openssl rand -base64 64 | tr -d '\n')"
   warn "Before the first 'high' run, make sure you have provider console"
-  warn "access (VNC) as break-glass. See roles/04-fwknop/CLIENT-SIDE.md"
-  warn "for setting up the knock client on your machine."
+  warn "access (VNC) as break-glass. The knock client is not needed yet,"
+  warn "because SSH stays visible. To get ready for later, see"
+  warn "roles/04-fwknop/CLIENT-SIDE.md."
 fi
 
+# Local mode only: this machine's own addresses. Used only to refuse an
+# office IP that is the server itself; never written anywhere.
+is_own_ip() {  # $1 = address without /prefix
+  local ip
+  for ip in $(hostname -I 2>/dev/null || true) \
+            $(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || true); do
+    [ "$ip" = "$1" ] && return 0
+  done
+  return 1
+}
+
 OFFICE_IP=""
-if confirm "Keep a break-glass IP allowed on the SSH port (recommended)?"; then
-  DETECTED_IP="$(curl -s --max-time 5 https://api.ipify.org || true)"
-  # A network response is not trusted input: only offer it as the default if
-  # it actually looks like an IP address.
-  [[ "$DETECTED_IP" =~ ^[0-9a-fA-F:.]{2,45}$ ]] || DETECTED_IP=""
+note "A break-glass IP is your office or home STATIC IP. It may always"
+note "reach the SSH port without the rate limit, and fail2ban never bans it."
+if confirm "Add a break-glass IP (recommended if you have a static IP)?"; then
+  DETECTED_IP=""
+  if [ "$MODE" = "remote" ]; then
+    DETECTED_IP="$(curl -s --max-time 5 https://api.ipify.org || true)"
+    # A network response is not trusted input: only offer it as the default
+    # if it actually looks like an IP address.
+    [[ "$DETECTED_IP" =~ ^[0-9a-fA-F:.]{2,45}$ ]] || DETECTED_IP=""
+  else
+    # On the server, "my public IP" is the server itself. Never offer it.
+    note "Type the IP of your office or home, NOT this server's IP."
+    FROM_IP="${SSH_CONNECTION:-}"; FROM_IP="${FROM_IP%% *}"
+    if [[ "$FROM_IP" =~ ^[0-9a-fA-F:.]{2,45}$ ]]; then
+      note "(Your SSH session comes from ${FROM_IP}. Type it only if that is"
+      note "a static IP of yours.)"
+    fi
+  fi
   ask "Break-glass IP (your office/home static IP)" "${DETECTED_IP}"
   OFFICE_IP="$REPLY"
   [ -z "$OFFICE_IP" ] || [[ "$OFFICE_IP" =~ ^[0-9a-fA-F:.]{2,45}(/[0-9]{1,3})?$ ]] \
     || die "Not a valid IP address or CIDR: $OFFICE_IP"
+  if [ "$MODE" = "local" ] && [ -n "$OFFICE_IP" ] && is_own_ip "${OFFICE_IP%/*}"; then
+    die "${OFFICE_IP} is this server's own address. Use your office/home IP, or leave it empty."
+  fi
 fi
 
 # ------------------------------------------------------------ egress lockdown
@@ -397,11 +511,11 @@ fi
 # the subshell - the wizard would carry on and write an empty value. So check
 # every value here, in the main shell, before anything is written. The usual
 # source of a newline is a .pub file holding more than one key.
-for v in AGE_PUBLIC APP_PORT APP_TYPE B2_APP_KEY B2_BUCKET B2_KEY_ID \
-         CLIENT_NAME DB_ENGINE DB_NAME DB_PASSWORD DB_USER DEPLOY_PUBKEY \
-         DOMAIN FWKNOP_HMAC FWKNOP_KEY LE_EMAIL NODE_VERSION OFFICE_IP \
-         PARANOIA SERVER_IP SSH_KEY_FILE TG_CHAT TG_TOKEN WATCHER_MODE \
-         WATCHER_PATTERN; do
+for v in ADMIN_USER AGE_PUBLIC APP_PORT APP_TYPE B2_APP_KEY B2_BUCKET \
+         B2_KEY_ID CLIENT_NAME DB_ENGINE DB_NAME DB_PASSWORD DB_USER \
+         DEPLOY_PUBKEY DOMAIN FWKNOP_HMAC FWKNOP_KEY LE_EMAIL NODE_VERSION \
+         NOW_USER OFFICE_IP PARANOIA PASSWORD_AUTH PERMIT_ROOT SERVER_IP \
+         SSH_KEY_FILE TG_CHAT TG_TOKEN WATCHER_MODE WATCHER_PATTERN; do
   case "${!v-}" in
     *$'\n'*|*$'\r'*) die "$v contains a newline; refusing to write $HOSTVARS. (A .pub file with several keys? Pick one.)" ;;
   esac
@@ -421,6 +535,16 @@ say "Writing ${HOSTVARS}"
   echo "office_static_ip: $(yaml_str "${OFFICE_IP}")"
   echo "egress_lockdown: ${EGRESS}"
   echo
+  echo "# SSH login (role 02). Root login: keep | prohibit-password | 'no'."
+  echo "# Password login: keep | 'no'. Always quote 'no': unquoted, YAML"
+  echo "# reads it as false and preflight stops."
+  echo "ssh_admin_user: $(yaml_str "${ADMIN_USER}")"
+  echo "ssh_admin_public_keys:"
+  echo "  - $(yaml_str "${DEPLOY_PUBKEY}")"
+  echo "ssh_permit_root_login: $(yaml_str "${PERMIT_ROOT}")"
+  echo "ssh_password_authentication: $(yaml_str "${PASSWORD_AUTH}")"
+  echo
+  echo "# Also added (never exclusively) for the deploy user."
   echo "deploy_ssh_public_key: $(yaml_str "${DEPLOY_PUBKEY}")"
   echo
   echo "app_type: $(yaml_str "${APP_TYPE}")"
@@ -471,37 +595,109 @@ say "Writing inventory/${SERVER}.yml"
     echo "          ansible_connection: local"
   else
     echo "          ansible_host: $(yaml_str "${SERVER_IP}")"
-    echo "          ansible_user: deploy"
+    echo "          ansible_user: $(yaml_str "${ADMIN_USER}")"
     echo "          ansible_ssh_private_key_file: $(yaml_str "${SSH_KEY_FILE}")"
   fi
 } > "inventory/${SERVER}.yml"
 
 # -------------------------------------------------------------------- next
+# What the run will do to SSH logins, in plain words.
+describe_rules() {
+  note "SSH login rules once your choices are applied:"
+  if [ "$MODE" = "local" ]; then
+    note "  - You log in as ${ADMIN_USER}, with your laptop key."
+  else
+    note "  - You and Ansible log in as ${ADMIN_USER}, with your key."
+  fi
+  case "$PERMIT_ROOT" in
+    keep) note "  - Root login: not changed. It stays as the server has it now." ;;
+    prohibit-password) note "  - Root login: with a key only. Root passwords stop working over SSH." ;;
+    no) note "  - Root login over SSH: off." ;;
+  esac
+  case "$PASSWORD_AUTH" in
+    keep) note "  - Password login: not changed. It stays as the server has it now." ;;
+    no) note "  - Password login: off for every account. Only keys work." ;;
+  esac
+  if [ "$PERMIT_ROOT" = "keep" ] || [ "$PASSWORD_AUTH" = "keep" ]; then
+    note "  The run prints the real values. While root or password login is"
+    note "  still on, it says 'SSH login NOT hardened'. That is expected in"
+    note "  this first stage."
+  fi
+  if [ "$MODE" = "remote" ]; then
+    note "  If an SSH change locks Ansible out, it is undone by itself within"
+    note "  5 minutes. Do not reboot or edit /etc/ssh while a run is going."
+  fi
+}
+
+# Local mode only: today's effective values. Display only, never written.
+show_current_rules() {
+  local out line
+  if [ "$(id -u)" != "0" ] || [ ! -x /usr/sbin/sshd ]; then return 0; fi
+  out="$(/usr/sbin/sshd -T 2>/dev/null | grep -E '^(permitrootlogin|passwordauthentication) ' || true)"
+  [ -n "$out" ] || return 0
+  note "This server allows today (from sshd -T):"
+  while IFS= read -r line; do note "  ${line}"; done <<<"$out"
+}
+
 echo
 echo "===================================================================="
 say "Configuration complete."
 echo
+# RUN_CMD is eval'd below. It is built only from the validated server name
+# and the validated login user name.
 if [ "$MODE" = "local" ]; then
   RUN_CMD="sudo ansible-playbook -i inventory site.yml -l ${SERVER}"
   note "Harden this server now with:"
   note "  ${RUN_CMD}"
+  note "To preview the SSH part first (it writes no config files), add:"
+  note "  --check --diff --tags ssh"
+  echo
+  show_current_rules
+  describe_rules
+  echo
+  note "On the server itself, auto_sec only applies SSH settings that change"
+  note "nothing. To tighten logins later, run auto_sec from your own computer."
+  note "After the run, test your laptop key from a NEW terminal on your laptop:"
+  note "  ssh ${ADMIN_USER}@<this server's IP>"
 else
-  RUN_CMD="ansible-playbook -i inventory site.yml -l ${SERVER} -u root"
-  note "First run on a fresh VPS (connects as root):"
+  BASE_CMD="ansible-playbook -i inventory site.yml -l ${SERVER}"
+  RUN_CMD="${BASE_CMD}"
+  [ "$NOW_USER" = "$ADMIN_USER" ] || RUN_CMD="${BASE_CMD} -e ansible_user=${NOW_USER}"
+  note "Step 1. Connect once by hand. This records the server's host key"
+  note "and puts your key on the account you use today:"
+  note "  ssh-copy-id -i ${SSH_KEY_FILE}.pub ${NOW_USER}@${SERVER_IP}"
+  note "  (Type the password if asked. If the key is already there, it adds nothing.)"
+  note ""
+  note "Step 2. See what the SSH part would change. This writes no config files:"
+  note "  ${RUN_CMD} --check --diff --tags ssh"
+  note "  (A full --check stops at the firewall role on a new server: ufw and"
+  note "  fail2ban are not installed yet. The real run installs them.)"
+  note ""
+  note "Step 3. The real run:"
   note "  ${RUN_CMD}"
-  note "If your provider gave you a ROOT PASSWORD (not a key), add"
-  note "--ask-pass so Ansible can log in the first time (needs 'sshpass'):"
-  note "  ${RUN_CMD} --ask-pass"
+  if [ "$NOW_USER" != "$ADMIN_USER" ]; then
+    note ""
+    note "This first run logs in as ${NOW_USER}, because ${ADMIN_USER} does not"
+    note "exist yet or has no key. '-e ansible_user=${NOW_USER}' makes Ansible use"
+    note "${NOW_USER}. ('-u ${NOW_USER}' would not work: the inventory wins over -u.)"
+    note "Stricter login rules wait until Ansible logs in as ${ADMIN_USER}."
+    note "So run a SECOND time, without -e. It logs in as ${ADMIN_USER} with your key:"
+    note "  ${BASE_CMD}"
+  fi
   note ""
-  note "Subsequent runs use the deploy user + your key automatically:"
-  note "  ansible-playbook -i inventory site.yml -l ${SERVER}"
-  note ""
-  note "After hardening, passwords and root login are OFF. Connect with:"
-  note "  ssh -i ${SSH_KEY_FILE} deploy@${SERVER_IP}"
+  note "Later runs:"
+  note "  ${BASE_CMD}"
+  echo
+  describe_rules
+  echo
+  note "Connect with:"
+  note "  ssh -i ${SSH_KEY_FILE} ${ADMIN_USER}@${SERVER_IP}"
 fi
 echo
-note "Re-running is always safe: the playbook is idempotent and"
-note "self-corrects drift. Add it to cron for continuous enforcement."
+note "Is this server already in production? Then run only the SSH part for"
+note "now: add --tags ssh. A full run still overwrites jail.local, turns on"
+note "automatic reboots and changes the hostname (issues #2, #3, #7)."
+note "Do not put the full playbook in cron."
 echo
 if confirm "Run the playbook now?" n; then
   eval "$RUN_CMD"

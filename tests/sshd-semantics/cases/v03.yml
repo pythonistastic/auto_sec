@@ -1,0 +1,18 @@
+---
+# The block that matches what auto_sec 0.1-0.3 enforced (final.md section 5),
+# used when migrating a 0.3 host with ssh_migrate_sshd_config.
+deploy_user: deploy
+ssh_admin_user: deploy
+ssh_permit_root_login: "no"
+ssh_password_authentication: "no"
+ssh_allow_users: [deploy]
+ssh_extra_settings:
+  MaxAuthTries: 3
+  LoginGraceTime: 20
+  MaxSessions: 5
+  X11Forwarding: "no"
+  AllowAgentForwarding: "no"
+  AllowTcpForwarding: "no"
+  ClientAliveInterval: 300
+  ClientAliveCountMax: 2
+  LogLevel: VERBOSE

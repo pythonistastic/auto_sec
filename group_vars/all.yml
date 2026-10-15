@@ -4,15 +4,72 @@
 timezone: "UTC"
 deploy_user: "deploy"
 
-# SSH
-ssh_port: 22
-ssh_max_auth_tries: 3
+# --- SSH (role 02) --------------------------------------------------------
+# auto_sec writes only /etc/ssh/sshd_config.d/00-autosec.conf. It never
+# touches the main sshd_config or other drop-ins, and never moves the port.
+# Every sshd yes/no value (the login choices, ssh_extra_settings) must be
+# QUOTED: an unquoted no becomes false and the preflight stops with
+# "quote it", e.g. "no".
 
-# Your office/home static IP kept as break-glass direct SSH access.
+# The port sshd ALREADY listens on. auto_sec checks it and opens it in ufw,
+# but never moves sshd. To move the port, follow docs/ssh-port.md.
+ssh_port: 22
+
+# false: role 02 writes nothing. The read-only SSH checks still run.
+ssh_hardening_enabled: true
+
+# The account you and Ansible log in as. Its keys are added and tested on
+# a fresh connection. Stricter login rules are applied only on a run where
+# Ansible really is logged in as this user (set ansible_user to match).
+ssh_admin_user: "{{ deploy_user }}"
+
+# Public key lines for ssh_admin_user ("ssh-ed25519 AAAA... comment", no
+# options). Only added, never removed. deploy_ssh_public_key and
+# ssh_public_key_file still work: always installed for deploy_user.
+ssh_admin_public_keys: []
+
+# The two login choices have NO default on purpose: the run stops until you
+# set both in host_vars (the wizard asks). auto_sec never writes "yes".
+#   ssh_permit_root_login:       keep | prohibit-password | "no"
+#   ssh_password_authentication: keep | "no"
+# keep = leave the server's current setting alone. Stage 1 is keep/keep;
+# tighten per host later, after every client (e.g. VS Code) uses a key.
+
+# AllowUsers list. Empty = no AllowUsers line. If set, it must contain
+# ssh_admin_user.
+ssh_allow_users: []
+
+# Optional extra sshd settings. Empty = leave them as the server has them.
+# Allowed keys: MaxAuthTries LoginGraceTime MaxSessions X11Forwarding
+# AllowAgentForwarding AllowTcpForwarding ClientAliveInterval
+# ClientAliveCountMax LogLevel. Example: { MaxAuthTries: 4, X11Forwarding: "no" }
+# (ssh_max_auth_tries is gone: use ssh_extra_settings.MaxAuthTries.)
+ssh_extra_settings: {}
+
+# One-off switches. Pass them with -e on a single run, never in host_vars.
+#   ssh_migrate_sshd_config: lets role 02 bring back the Include line in a
+#     main sshd_config written by auto_sec 0.1-0.3 (or another tool).
+#   ssh_accept_unrequested_changes: lets one run continue when a login
+#     setting you did not set would change.
+ssh_migrate_sshd_config: false
+ssh_accept_unrequested_changes: false
+
+# At most this many hosts get an SSH change in one run; use -l for more.
+# The undo window (ssh_revert_seconds, default 300) is a role 02 default.
+ssh_max_hosts_per_run: 5
+
+# Your office/home static IP kept as break-glass direct SSH access, and
+# never banned by fail2ban. Must be YOUR address, not the server's.
 # Set to empty string to disable.
 office_static_ip: ""
 
-# Paranoia: standard | high
+# More fixed IPs/CIDRs fail2ban must never ban (jail.local ignoreip,
+# together with office_static_ip), e.g. ["203.0.113.7", "198.51.100.0/24"].
+fail2ban_ignore_ips: []
+
+# Paranoia: standard | high. high adds fwknop (Single Packet Authorization).
+# In 0.4.0 SSH stays visible (rate-limited) in high mode too; hiding SSH
+# behind fwknop returns in a later release.
 paranoia_level: "standard"
 
 # Backups

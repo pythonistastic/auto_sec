@@ -1,0 +1,300 @@
+---
+# roles/02-ssh-hardening/tasks/simulate.yml - P8, the trial run.
+#
+# Copies the config tree sshd reads into /run/auto-sec/ssh-sim (tmpfs, root
+# only), points the copy's Include at the copied drop-ins, adds the
+# candidate 00-autosec.conf (and the new main file when migrating) and asks
+# sshd itself what the result would be. Nothing under /etc changes, so this
+# runs in --check too. Included by preflight.yml.
+#
+# Sets _ssh_sim_after, _ssh_diff, _ssh_login_critical_change and
+# _ssh_dropin_differs. Refuses (fails the host) when the result is not what
+# you chose (a), or changes a login-critical setting you did not choose (b).
+# Shows the before/after difference (c).
+
+- name: "SSH trial run: remove an old scratch copy"
+  ansible.builtin.file:
+    path: "{{ _ssh_sim_dir }}"
+    state: absent
+  changed_when: false
+  check_mode: false
+  diff: false
+
+- name: "SSH trial run: scratch folders, root only"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  loop:
+    - "{{ _ssh_run_dir }}"
+    - "{{ _ssh_sim_dir }}"
+    - "{{ _ssh_sim_dir }}/sshd_config.d"
+  changed_when: false
+  check_mode: false
+  diff: false
+
+# The copy is only read in this file. `always` removes it, also when a
+# check below refuses the run.
+- name: "SSH trial run: build, check and compare the copy"
+  block:
+    # $1 is the main file to start from: the live one, or the distro's stock
+    # file when migrating a file written by auto_sec 0.1-0.3. $2 is the copy.
+    - name: "SSH trial run: copy the config tree sshd reads"
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - |
+            set -eu
+            cp -p -- "$1" "$2/sshd_config"
+            for f in /etc/ssh/sshd_config.d/*.conf; do
+              if [ -f "$f" ]; then cp -pL -- "$f" "$2/sshd_config.d/"; fi
+            done
+          - sh
+          - "{{ '/usr/share/openssh/sshd_config' if _ssh_migrate_kind == 'stock' else '/etc/ssh/sshd_config' }}"
+          - "{{ _ssh_sim_dir }}"
+      changed_when: false
+      check_mode: false
+
+    - name: "SSH trial run: point the copy's Include at the copied drop-ins"
+      when: _ssh_migrate_kind != 'include'
+      ansible.builtin.replace:
+        path: "{{ _ssh_sim_dir }}/sshd_config"
+        regexp: '(?i)^([ \t]*Include[ \t]+)(/etc/ssh/)?sshd_config\.d/\*\.conf([ \t]*)$'
+        replace: '\g<1>{{ _ssh_sim_dir }}/sshd_config.d/*.conf\g<3>'
+      changed_when: false
+      check_mode: false
+      diff: false
+
+    - name: "SSH trial run: migration adds the Include as line 1 of the copy"
+      when: _ssh_migrate_kind == 'include'
+      ansible.builtin.lineinfile:
+        path: "{{ _ssh_sim_dir }}/sshd_config"
+        line: "Include {{ _ssh_sim_dir }}/sshd_config.d/*.conf"
+        insertbefore: BOF
+        firstmatch: true
+      changed_when: false
+      check_mode: false
+      diff: false
+
+    - name: "SSH trial run: add the candidate 00-autosec.conf"
+      ansible.builtin.template:
+        src: 00-autosec.conf.j2
+        dest: "{{ _ssh_sim_dir }}/sshd_config.d/00-autosec.conf"
+        owner: root
+        group: root
+        mode: "0600"
+      changed_when: false
+      check_mode: false
+      diff: false
+
+    # Checks the whole merged config, not just our file: this is what catches a
+    # duplicate Subsystem on OpenSSH 8.9/9.2, for example.
+    - name: "SSH trial run: sshd -t on the whole copy"
+      ansible.builtin.command:
+        argv: [/usr/sbin/sshd, -t, -ddd, -f, "{{ _ssh_sim_dir }}/sshd_config"]
+      register: _ssh_sim_t
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    # sshd's own trace names every file it loaded: the copy must have read the
+    # candidate (proves the Include now points at the copy).
+    - name: "SSH trial run: the merged copy must pass sshd -t and read the candidate"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _ssh_sim_t.rc == 0
+          - >-
+            _ssh_sim_t.stderr_lines | select('search', 'load_server_config: filename ' ~ _ssh_sim_dir ~ '/sshd_config.d/00-autosec.conf$')
+            | list | length > 0
+        fail_msg: >-
+          With the new 00-autosec.conf{{ ' and the migrated sshd_config' if _ssh_migrate_kind != 'none' else '' }},
+          `sshd -t` fails: {{ _ssh_sim_t.stderr_lines | default([]) | reject('match', '^debug') | list }}.
+          Nothing has been changed.
+
+    - name: "SSH trial run: settings sshd would use, for the admin account"
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/sshd
+          - -T
+          - -f
+          - "{{ _ssh_sim_dir }}/sshd_config"
+          - -C
+          - "user={{ _ssh_admin }},host=autosec-check,addr={{ _ssh_c_addr }},lport={{ ssh_port | int }}"
+      register: _ssh_sim_eff_admin
+      changed_when: false
+      check_mode: false
+      vars:
+        _ssh_c_addr: "{{ _ssh_controller_ip | default('', true) or _ssh_placeholder_addr }}"
+
+    - name: "SSH trial run: settings sshd would use, for root"
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/sshd
+          - -T
+          - -f
+          - "{{ _ssh_sim_dir }}/sshd_config"
+          - -C
+          - "user=root,host=autosec-check,addr={{ _ssh_c_addr }},lport={{ ssh_port | int }}"
+      register: _ssh_sim_eff_root
+      changed_when: false
+      check_mode: false
+      vars:
+        _ssh_c_addr: "{{ _ssh_controller_ip | default('', true) or _ssh_placeholder_addr }}"
+
+    # Match blocks are not in the -ddd trace, so look at the files themselves.
+    - name: "SSH trial run: AuthenticationMethods lines anywhere in the copy"
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - |
+            for f in "$1/sshd_config" "$1"/sshd_config.d/*.conf; do
+              if [ -f "$f" ]; then grep -hiE '^[[:space:]]*AuthenticationMethods([[:space:]]|=)' -- "$f" || :; fi
+            done
+          - sh
+          - "{{ _ssh_sim_dir }}"
+      environment:
+        LC_ALL: C
+      register: _ssh_sim_authmethods
+      changed_when: false
+      check_mode: false
+
+    - name: "SSH trial run: 00-autosec.conf on disk now"
+      ansible.builtin.stat:
+        path: "{{ _ssh_dropin }}"
+        checksum_algorithm: sha256
+      register: _ssh_sim_live
+
+    - name: "SSH trial run: the candidate 00-autosec.conf"
+      ansible.builtin.stat:
+        path: "{{ _ssh_sim_dir }}/sshd_config.d/00-autosec.conf"
+        checksum_algorithm: sha256
+      register: _ssh_sim_cand
+
+    - name: "SSH trial run: remember the result"
+      ansible.builtin.set_fact:
+        _ssh_sim_after: "{{ _ssh_kv_pair }}"
+        _ssh_sim_lines: "{{ _ssh_sim_t.stderr_lines | default([]) | select('search', ':[0-9]+ setting ') | map('regex_replace', '[{}]', '?') | list }}"
+        _ssh_dropin_differs: >-
+          {{ not _ssh_sim_live.stat.exists
+             or _ssh_sim_live.stat.islnk
+             or _ssh_sim_live.stat.checksum != _ssh_sim_cand.stat.checksum
+             or _ssh_sim_live.stat.mode != '0600'
+             or _ssh_sim_live.stat.pw_name != 'root'
+             or _ssh_sim_live.stat.gr_name != 'root' }}
+      vars:
+        _ssh_kv_admin_lines: "{{ _ssh_sim_eff_admin.stdout_lines }}"
+        _ssh_kv_root_lines: "{{ _ssh_sim_eff_root.stdout_lines }}"
+
+    - name: "SSH trial run: what would change"
+      ansible.builtin.set_fact:
+        _ssh_diff: >-
+          {{ (((_ssh_before.admin | dict2items) | symmetric_difference(_ssh_sim_after.admin | dict2items))
+              + ((_ssh_before.root | dict2items) | symmetric_difference(_ssh_sim_after.root | dict2items)))
+             | map(attribute='key') | unique | sort }}
+
+    - name: "SSH trial run: does a login-critical setting change?"
+      ansible.builtin.set_fact:
+        _ssh_login_critical_change: "{{ _ssh_diff | intersect(_ssh_login_critical_keys) | length > 0 }}"
+
+    # (a) What you chose is what takes effect. Fails when a line above the
+    # Include in sshd_config, or a drop-in that sorts before 00-autosec.conf,
+    # sets the same keyword (sshd keeps the first value it reads).
+    - name: "SSH trial run (a): your choices take effect"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - ssh_permit_root_login == 'keep' or (_ssh_sim_after.root.permitrootlogin | default('')) in _ssh_want_root
+          - ssh_password_authentication == 'keep' or (_ssh_sim_after.admin.passwordauthentication | default('')) == ssh_password_authentication
+          - ssh_password_authentication == 'keep' or (_ssh_sim_after.root.passwordauthentication | default('')) == ssh_password_authentication
+          - _ssh_want_users | length == 0 or (_ssh_sim_after.admin.allowusers | default('')).split() | unique | sort == _ssh_want_users
+          - _ssh_want_users | length == 0 or (_ssh_sim_after.root.allowusers | default('')).split() | unique | sort == _ssh_want_users
+          - _ssh_extra_mismatch | length == 0
+        fail_msg: >-
+          After the trial run sshd would NOT use what you chose on {{ inventory_hostname }}:
+          permitrootlogin {{ _ssh_sim_after.root.permitrootlogin | default('?') }} (you chose
+          {{ ssh_permit_root_login }}), passwordauthentication
+          {{ _ssh_sim_after.admin.passwordauthentication | default('?') }} (you chose
+          {{ ssh_password_authentication }}), allowusers
+          {{ (_ssh_sim_after.admin.allowusers | default('')).split() }} (you chose {{ _ssh_want_users }}),
+          ssh_extra_settings not in effect: {{ _ssh_extra_mismatch }}.
+          sshd keeps the FIRST value it reads (AllowUsers adds up across files). The lines
+          that set these keywords, in the order sshd reads them:
+          {{ _ssh_sim_lines | select('search', '(?i) setting (PermitRootLogin|PasswordAuthentication|AllowUsers|' ~ (ssh_extra_settings | default({}) | list | join('|')) ~ ') ')
+             | map('regex_replace', '^debug3: ', '') | map('regex_replace', '/run/auto-sec/ssh-sim/', '/etc/ssh/') | list }}.
+          Remove or change the line that wins, then run again. Nothing has been changed.
+      vars:
+        _ssh_want_root: "{{ ['prohibit-password', 'without-password'] if ssh_permit_root_login == 'prohibit-password' else [ssh_permit_root_login] }}"
+        _ssh_want_users: "{{ ssh_allow_users | default([]) | map('string') | unique | sort }}"
+        _ssh_extra_keys: "{{ ssh_extra_settings | default({}) | list | map('lower') | list }}"
+        # AllowTcpForwarding "all" is printed by sshd -T as "yes".
+        _ssh_extra_want: >-
+          {{ dict(_ssh_extra_keys | zip(ssh_extra_settings | default({}) | dict2items | map(attribute='value')
+                  | map('string') | map('lower') | map('regex_replace', '^all$', 'yes'))) }}
+        _ssh_extra_got_admin: "{{ dict(_ssh_extra_keys | zip(_ssh_extra_keys | map('extract', _ssh_sim_after.admin) | map('default', '') | map('lower'))) }}"
+        _ssh_extra_got_root: "{{ dict(_ssh_extra_keys | zip(_ssh_extra_keys | map('extract', _ssh_sim_after.root) | map('default', '') | map('lower'))) }}"
+        _ssh_extra_mismatch: >-
+          {{ (((_ssh_extra_want | dict2items) | difference(_ssh_extra_got_admin | dict2items))
+              + ((_ssh_extra_want | dict2items) | difference(_ssh_extra_got_root | dict2items)))
+             | map(attribute='key') | unique | list }}
+
+    # (b) Nothing login-critical changes unless you chose it. Typical cause: the
+    # Include (migration) wakes an old drop-in, or a drop-in sorts before ours.
+    - name: "SSH trial run (b): no login-critical change you did not choose"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _ssh_moved | length == 0
+          - (ssh_accept_unrequested_changes | default(false) | bool) or _ssh_unrequested | length == 0
+        fail_msg: >-
+          {% if _ssh_moved | length > 0 %}The trial run would change {{ _ssh_moved }} on
+          {{ inventory_hostname }}. auto_sec never moves sshd's port or listen address:
+          do that by hand first (docs/ssh-port.md).
+          {% else %}The trial run would change login settings you did not choose on
+          {{ inventory_hostname }}: {{ _ssh_unrequested }}
+          (admin: {{ dict(_ssh_unrequested | zip(_ssh_unrequested | map('extract', _ssh_before.admin) | map('default', '(unset)')
+                          | zip(_ssh_unrequested | map('extract', _ssh_sim_after.admin) | map('default', '(unset)')) | map('join', ' -> '))) }};
+          root: {{ dict(_ssh_unrequested | zip(_ssh_unrequested | map('extract', _ssh_before.root) | map('default', '(unset)')
+                         | zip(_ssh_unrequested | map('extract', _ssh_sim_after.root) | map('default', '(unset)')) | map('join', ' -> '))) }}).
+          Lines that set them after the change, in read order:
+          {{ _ssh_sim_lines | select('search', '(?i) setting (' ~ (_ssh_unrequested | join('|')) ~ ') ')
+             | map('regex_replace', '^debug3: ', '') | map('regex_replace', '/run/auto-sec/ssh-sim/', '/etc/ssh/') | list }}.
+          Set these explicitly (ssh_permit_root_login, ssh_password_authentication,
+          ssh_allow_users, ssh_extra_settings), or, if the change is intended, run once
+          with -e ssh_accept_unrequested_changes=true.
+          {% endif %}Nothing has been changed.
+      vars:
+        _ssh_chosen: >-
+          {{ (['permitrootlogin'] if ssh_permit_root_login != 'keep' else [])
+             + (['passwordauthentication'] if ssh_password_authentication != 'keep' else [])
+             + (['allowusers'] if (ssh_allow_users | default([]) | length > 0) else [])
+             + (['denyusers'] if (_ssh_ci_deny_user | default('') | length > 0) else [])
+             + (ssh_extra_settings | default({}) | list | map('lower') | list) }}
+        _ssh_moved: "{{ _ssh_diff | intersect(_ssh_never_change_keys) }}"
+        _ssh_unrequested: "{{ _ssh_diff | intersect(_ssh_login_critical_keys) | difference(_ssh_chosen) }}"
+
+    # (c) Show the difference. In --check, the SSH part of the run stops here.
+    - name: "SSH trial run (c): effective settings before -> after"
+      ansible.builtin.debug:
+        msg:
+          admin: >-
+            {{ dict(_ssh_diff | zip(_ssh_diff | map('extract', _ssh_before.admin) | map('default', '(unset)')
+                                   | zip(_ssh_diff | map('extract', _ssh_sim_after.admin) | map('default', '(unset)'))
+                                   | map('join', ' -> '))) if _ssh_diff | length > 0 else 'no change' }}
+          root: >-
+            {{ dict(_ssh_diff | zip(_ssh_diff | map('extract', _ssh_before.root) | map('default', '(unset)')
+                                   | zip(_ssh_diff | map('extract', _ssh_sim_after.root) | map('default', '(unset)'))
+                                   | map('join', ' -> '))) if _ssh_diff | length > 0 else 'no change' }}
+
+  always:
+    - name: "SSH trial run: remove the copy"
+      ansible.builtin.file:
+        path: "{{ _ssh_sim_dir }}"
+        state: absent
+      changed_when: false
+      check_mode: false
+      diff: false

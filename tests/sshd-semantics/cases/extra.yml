@@ -1,0 +1,11 @@
+---
+# Logins kept; three extra settings that 00-hardening.conf also sets.
+deploy_user: deploy
+ssh_admin_user: deploy
+ssh_permit_root_login: keep
+ssh_password_authentication: keep
+ssh_allow_users: []
+ssh_extra_settings:
+  MaxAuthTries: 5
+  LoginGraceTime: 45
+  ClientAliveInterval: 120

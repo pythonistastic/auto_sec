@@ -1,0 +1,907 @@
+---
+# roles/02-ssh-hardening/tasks/preflight.yml
+#
+# Read-only SSH checks P1-P10. site.yml imports this file in pre_tasks with
+# tags [always], so a refusal happens BEFORE role 01 changes anything. It
+# also runs in --check. It writes only /run/sshd (`sshd -t` needs it as
+# root) and the trial-run copy under /run/auto-sec/.
+#
+# Trust boundary (SECURITY.md): what is read from the host is shown to you,
+# compared with values you typed, or used to refuse. It never becomes part
+# of a config file. The one host value used as a command argument is the
+# controller address from $SSH_CONNECTION (_ssh_controller_ip): it must
+# match a strict IPv4/IPv6 pattern and is passed as one argv element, to
+# `fail2ban-client set sshd addignoreip` and to `sshd -T -C addr=`.
+#
+# Facts for role 02 main, role 03 and role 10. Each one is set on every
+# host, also when ssh_hardening_enabled is false:
+#   _ssh_enabled                bool  ssh_hardening_enabled, as a boolean
+#   _ssh_local_mode             bool  ansible_connection == 'local'
+#   _ssh_login_user             str   account this run is logged in as ('' local)
+#   _ssh_controller_ip          str   controller address ('' if none, invalid
+#                                     or loopback)
+#   _ssh_server_port            int   server port of this connection (0 local)
+#   _ssh_socket_active          bool  ssh.socket is active
+#   _ssh_before                 dict  {admin: {...}, root: {...}} `sshd -T` now
+#   _ssh_sim_after              dict  the same, from the trial run
+#   _ssh_diff                   list  `sshd -T` keys that would change
+#   _ssh_login_critical_change  bool  one of them can lock someone out
+#   _ssh_needs_write            bool  role 02 main writes and loads sshd files
+#   _ssh_deferred               bool  a login change waits for ansible_user
+#   _ssh_deferred_reason        str
+#   _ssh_after, _ssh_hardened         start values; role 02 main updates them
+#
+# Checks that only protect role 02's own write (P5, P8, P9, the ufw check
+# and P10) run only when the tags select role 02 (tag "ssh"), so that for
+# example `--tags backups` is not refused because of an SSH change that
+# would not happen in that run.
+
+- name: "SSH preflight: start every SSH fact from a safe value"
+  ansible.builtin.set_fact:
+    _ssh_enabled: "{{ ssh_hardening_enabled | default(true) | bool }}"
+    _ssh_role_runs: >-
+      {{ (('all' in ansible_run_tags) or ('tagged' in ansible_run_tags) or ('ssh' in ansible_run_tags))
+         and ('ssh' not in ansible_skip_tags) and ('tagged' not in ansible_skip_tags) and ('all' not in ansible_skip_tags) }}
+    _ssh_local_mode: "{{ (ansible_connection | default('ssh')) == 'local' }}"
+    _ssh_admin: "{{ ssh_admin_user | default(deploy_user) }}"
+    _ssh_migrate: "{{ ssh_migrate_sshd_config | default(false) | bool }}"
+    _ssh_migrate_kind: none
+    _ssh_login_user: ""
+    _ssh_controller_ip: ""
+    _ssh_loopback_conn: false
+    _ssh_server_port: 0
+    _ssh_socket_active: false
+    _ssh_service_active: false
+    _ssh_has_include: false
+    _ssh_before: {admin: {}, root: {}}
+    _ssh_sim_after: {admin: {}, root: {}}
+    _ssh_diff: []
+    _ssh_login_critical_change: false
+    _ssh_dropin_differs: false
+    _ssh_needs_write: false
+    _ssh_deferred: false
+    _ssh_deferred_reason: ""
+    _ssh_after: {admin: {}, root: {}}
+    _ssh_hardened: false
+    _ssh_admin_keys: []
+    _ssh_deploy_keys: []
+    _ssh_ci_deny_user: ""
+
+- name: "SSH preflight: does this run apply role 02?"
+  ansible.builtin.set_fact:
+    _ssh_check_role: "{{ (_ssh_enabled | bool) and (_ssh_role_runs | bool) }}"
+
+# --- P1. Variable checks (no host access) ---------------------------------
+
+# CI only (tests/role02-live cases e0, e, f): renders "DenyUsers <user>" into
+# 00-autosec.conf so the login test after the change fails on purpose and
+# the rescue and the undo timer get exercised. Honoured only for a host
+# with autosec_ci: true, on a GitHub Actions controller that also sets
+# AUTOSEC_CI_INJECT_FAILURE=deny-user. Anywhere else it stops the run.
+- name: "SSH preflight P1: autosec_ci_inject_deny_user is a CI-only test switch"
+  when: autosec_ci_inject_deny_user is defined
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - autosec_ci | default(false) | bool
+      - lookup('ansible.builtin.env', 'GITHUB_ACTIONS') == 'true'
+      - lookup('ansible.builtin.env', 'AUTOSEC_CI_INJECT_FAILURE') == 'deny-user'
+      - autosec_ci_inject_deny_user is string
+      - autosec_ci_inject_deny_user is match(_ssh_user_re)
+    fail_msg: >-
+      autosec_ci_inject_deny_user is set. It is a test switch for auto_sec's own CI that
+      makes the SSH login test fail on purpose, and it works only there. Remove it.
+      Nothing has been changed.
+
+- name: "SSH preflight P1: CI-only injected DenyUsers line"
+  when:
+    - autosec_ci_inject_deny_user is defined
+    - _ssh_enabled | bool
+  ansible.builtin.set_fact:
+    _ssh_ci_deny_user: "{{ autosec_ci_inject_deny_user }}"
+
+- name: "SSH preflight P1: ssh_max_auth_tries was removed"
+  ansible.builtin.assert:
+    quiet: true
+    that: ssh_max_auth_tries is not defined
+    fail_msg: >-
+      ssh_max_auth_tries is set ({{ ssh_max_auth_tries | default('') }}), but auto_sec
+      0.4.0 removed it: it moved to ssh_extra_settings.MaxAuthTries, for example
+      `ssh_extra_settings: {MaxAuthTries: 3}`. Delete ssh_max_auth_tries from
+      group_vars/host_vars. Nothing has been changed.
+
+- name: "SSH preflight P1: on/off switches are true or false"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (ssh_hardening_enabled | default(true) | string | lower) in _ssh_bool_words
+      - (ssh_migrate_sshd_config | default(false) | string | lower) in _ssh_bool_words
+      - (ssh_accept_unrequested_changes | default(false) | string | lower) in _ssh_bool_words
+    fail_msg: >-
+      ssh_hardening_enabled ({{ ssh_hardening_enabled | default(true) }}),
+      ssh_migrate_sshd_config ({{ ssh_migrate_sshd_config | default(false) }}) and
+      ssh_accept_unrequested_changes ({{ ssh_accept_unrequested_changes | default(false) }})
+      must each be true or false. Nothing has been changed.
+  vars:
+    _ssh_bool_words: ["true", "false", "yes", "no", "1", "0", "on", "off"]
+
+- name: "SSH preflight P1: paranoia_level is standard or high"
+  ansible.builtin.assert:
+    quiet: true
+    that: (paranoia_level | default('standard')) in ['standard', 'high']
+    fail_msg: >-
+      paranoia_level is "{{ paranoia_level | default('') }}". It must be "standard" or
+      "high"; any other value would leave SSH without a firewall rule. Nothing has been changed.
+
+- name: "SSH preflight P1: fail2ban_ignore_ips is a list of IP addresses or networks"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _ssh_f2b_ips is sequence
+      - _ssh_f2b_ips is not string
+      - _ssh_f2b_ips is not mapping
+      - _ssh_f2b_ips | map('string') | reject('match', _ssh_cidr_re) | list | length == 0
+    fail_msg: >-
+      fail2ban_ignore_ips must be a list of IPv4/IPv6 addresses or networks, for
+      example ["198.51.100.7", "203.0.113.0/24"]. Got: {{ _ssh_f2b_ips }}.
+      Nothing has been changed.
+  vars:
+    _ssh_f2b_ips: "{{ fail2ban_ignore_ips | default([]) }}"
+    _ssh_cidr_re: >-
+      ^(((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(/(3[0-2]|[12]?[0-9]))?|(?=[0-9A-Fa-f:]*:)[0-9A-Fa-f:]{2,39}(/(12[0-8]|1[01][0-9]|[1-9]?[0-9]))?)$
+
+- name: "SSH preflight P1: the two login choices are set and valid"
+  when: _ssh_enabled | bool
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - ssh_permit_root_login is defined
+      - ssh_permit_root_login is string
+      - ssh_permit_root_login in ['keep', 'prohibit-password', 'no']
+      - ssh_password_authentication is defined
+      - ssh_password_authentication is string
+      - ssh_password_authentication in ['keep', 'no']
+    fail_msg: >-
+      {% for n, v, ok in [('ssh_permit_root_login', ssh_permit_root_login | default(none), ['keep', 'prohibit-password', 'no']),
+                          ('ssh_password_authentication', ssh_password_authentication | default(none), ['keep', 'no'])] %}
+      {% if v is none %}{{ n }} is not set. There is no default: choose {{ ok | join(', ') }}
+      ("keep" leaves it as the server has it now; quote "no").
+      {% elif v is boolean %}{{ n }} is {{ v }}: an unquoted yes or no becomes true or false in
+      YAML. Quote it, e.g. {{ n }}: "no".
+      {% elif v not in ok %}{{ n }} is "{{ v }}". Allowed: {{ ok | join(', ') }}. auto_sec never
+      writes yes; "keep" leaves the server's current setting alone.
+      {% endif %}{% endfor %}Nothing has been changed.
+
+- name: "SSH preflight P1: root login 'no' needs a non-root admin account"
+  when: _ssh_enabled | bool
+  ansible.builtin.assert:
+    quiet: true
+    that: not (ssh_permit_root_login == 'no' and _ssh_admin == 'root')
+    fail_msg: >-
+      ssh_permit_root_login is "no" but ssh_admin_user is root, so the account you
+      and Ansible log in as would be locked out. Use prohibit-password, or set
+      ssh_admin_user to a non-root account with passwordless sudo. Nothing has been changed.
+
+- name: "SSH preflight P1: account names have a safe shape"
+  when: _ssh_enabled | bool
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _ssh_admin is string
+      - _ssh_admin is match(_ssh_user_re)
+      - _ssh_allow is sequence
+      - _ssh_allow is not string
+      - _ssh_allow is not mapping
+      - _ssh_allow | map('string') | reject('match', _ssh_user_re) | list | length == 0
+      - _ssh_allow | length == 0 or _ssh_admin in _ssh_allow
+    fail_msg: >-
+      ssh_admin_user is "{{ _ssh_admin }}" and ssh_allow_users is {{ _ssh_allow }}.
+      Account names must match {{ _ssh_user_re }}. ssh_allow_users must be a list
+      ([] means no AllowUsers line), and when it is set it must contain
+      ssh_admin_user, or the account you log in with would be locked out.
+      Nothing has been changed.
+  vars:
+    _ssh_allow: "{{ ssh_allow_users | default([]) }}"
+
+- name: "SSH preflight P1: collect the public keys to add"
+  when: _ssh_enabled | bool
+  ansible.builtin.set_fact:
+    _ssh_deploy_keys: "{{ _ssh_dk_inline if _ssh_dk_inline | length > 0 else _ssh_dk_file }}"
+    _ssh_admin_keys: "{{ _ssh_ak if _ssh_ak is sequence and _ssh_ak is not string and _ssh_ak is not mapping else [_ssh_ak] }}"
+  vars:
+    _ssh_ak: "{{ ssh_admin_public_keys | default([]) }}"
+    _ssh_dk_inline: "{{ [deploy_ssh_public_key | string | trim] if (deploy_ssh_public_key | default('') | string | trim | length > 0) else [] }}"
+    _ssh_dk_file: >-
+      {{ (lookup('ansible.builtin.file', ssh_public_key_file).splitlines() | map('trim') | reject('match', '^(#|$)') | list)
+         if ssh_public_key_file is defined else [] }}
+
+- name: "SSH preflight P1: public keys are plain key lines (no options, one line each)"
+  when: _ssh_enabled | bool
+  ansible.builtin.assert:
+    quiet: true
+    that: (_ssh_admin_keys + _ssh_deploy_keys) | map('string') | reject('match', _ssh_key_re) | list | length == 0
+    fail_msg: >-
+      These public keys (ssh_admin_public_keys, deploy_ssh_public_key or the lines of
+      ssh_public_key_file) are not a single plain key line:
+      {{ (_ssh_admin_keys + _ssh_deploy_keys) | map('string') | reject('match', _ssh_key_re) | map('truncate', 60) | list }}.
+      Use the exact line from the .pub file, e.g. "ssh-ed25519 AAAA... you@laptop",
+      with no options (from=, command=) and no line breaks. Nothing has been changed.
+
+- name: "SSH preflight P1: ssh_extra_settings uses allowed keywords and values"
+  when: _ssh_enabled | bool
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _ssh_extra is mapping
+      - _ssh_extra_pairs | reject('match', _ssh_extra_re) | list | length == 0
+    fail_msg: >-
+      {% if _ssh_extra is not mapping %}ssh_extra_settings must be a mapping, e.g.
+      {MaxAuthTries: 4, X11Forwarding: "no"}.{% else %}ssh_extra_settings has entries
+      auto_sec does not accept: {{ _ssh_extra_pairs | reject('match', _ssh_extra_re) | list }}.{% endif %}
+      Allowed keywords (exact spelling) and values: {{ _ssh_extra_allowed }}. Quote yes
+      and no ("no"), give times in plain seconds, and leave out anything you want
+      to keep as the server has it. Nothing has been changed.
+  vars:
+    _ssh_extra: "{{ ssh_extra_settings | default({}) }}"
+    _ssh_extra_pairs: >-
+      {{ (_ssh_extra | dict2items | map(attribute='key') | map('string')
+          | zip(_ssh_extra | dict2items | map(attribute='value') | map('string')) | map('join', '=') | list)
+         if _ssh_extra is mapping else [] }}
+    _ssh_extra_re: >-
+      ^({{ _ssh_extra_allowed | dict2items | map(attribute='key')
+           | zip(_ssh_extra_allowed | dict2items | map(attribute='value')) | map('join', '=') | join('|') }})$
+
+- name: "SSH preflight P1: undo window and host cap are in range"
+  when: _ssh_enabled | bool
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - ssh_revert_seconds | string is match('^[0-9]{3,4}$')
+      - (ssh_revert_seconds | int) >= 120
+      - (ssh_revert_seconds | int) <= 1800
+      - ssh_max_hosts_per_run | default(5) | string is match('^[0-9]{1,4}$')
+      - (ssh_max_hosts_per_run | default(5) | int) >= 1
+    fail_msg: >-
+      ssh_revert_seconds is {{ ssh_revert_seconds }} (allowed 120-1800) and
+      ssh_max_hosts_per_run is {{ ssh_max_hosts_per_run | default(5) }} (a whole
+      number, at least 1). Nothing has been changed.
+
+# --- P2. Platform (only when hardening is enabled) ------------------------
+
+- name: "SSH preflight P2: is this a Debian-family host?"
+  when: _ssh_enabled | bool
+  ansible.builtin.stat:
+    path: /etc/debian_version
+    get_checksum: false
+  register: _ssh_pf_debian
+
+- name: "SSH preflight P2: installed openssh-server version"
+  when: _ssh_enabled | bool
+  ansible.builtin.command:
+    argv: [dpkg-query, --show, openssh-server]
+  register: _ssh_pf_pkg
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "SSH preflight P2: Debian or Ubuntu with OpenSSH 8.2 or newer"
+  when: _ssh_enabled | bool
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _ssh_pf_debian.stat.exists
+      - _ssh_pf_pkg.rc == 0
+      - _ssh_pkg_ver is version('8.2', '>=')
+    fail_msg: >-
+      Role 02 supports Debian and Ubuntu with openssh-server 8.2 or newer (the first
+      version whose sshd reads sshd_config.d). This host: {{ ansible_facts['distribution'] | default('unknown OS') }},
+      openssh-server {{ _ssh_pf_pkg.stdout | default('') | trim | default('not installed', true) }}.
+      Set ssh_hardening_enabled: false for this host to run the other roles.
+      Nothing has been changed.
+  vars:
+    _ssh_pkg_ver: >-
+      {{ (_ssh_pf_pkg.stdout | default('')).split() | last | default('')
+         | regex_replace('^[0-9]+:', '') | regex_search('^[0-9]+\.[0-9]+') | default('0.0', true) }}
+
+# --- P3. Who is connected (remote mode only) ------------------------------
+
+# The login tests rely on the ssh plugin's ssh_args (paramiko, for example,
+# would reuse its cached connection and prove nothing).
+- name: "SSH preflight P3: Ansible connects with the ssh plugin (or locally)"
+  when:
+    - _ssh_check_role | bool
+    - not (_ssh_local_mode | bool)
+  ansible.builtin.assert:
+    quiet: true
+    that: (ansible_connection | default('ssh')) in ['ssh', 'smart', 'ansible.builtin.ssh', 'ansible.legacy.ssh']
+    fail_msg: >-
+      ansible_connection is "{{ ansible_connection | default('') }}". Role 02 tests every
+      SSH change with a brand-new login through Ansible's ssh connection plugin, so
+      use ansible_connection: ssh (or local when you run auto_sec on the server
+      itself), or set ssh_hardening_enabled: false. Nothing has been changed.
+
+# The login tests (prove.yml) and the probe below set ansible_ssh_args and
+# ansible_become as task variables. Only extra vars (-e) beat those: an
+# `-e ansible_ssh_args=...` would let a "brand-new login" test reuse the
+# run's own ControlPersist connection and prove nothing, and an
+# `-e ansible_become=true` would run them through sudo. The values below
+# are placeholders that only show whether -e replaced them.
+- name: "SSH preflight P3: no -e ansible_ssh_args or -e ansible_become"
+  when:
+    - _ssh_check_role | bool
+    - not (_ssh_local_mode | bool)
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - ansible_ssh_args == '-o AutosecProbe=task-var'
+      - not (ansible_become | bool)
+    fail_msg: >-
+      This run passes {{ ((['-e ansible_ssh_args'] if ansible_ssh_args != '-o AutosecProbe=task-var' else [])
+      + (['-e ansible_become'] if (ansible_become | bool) else [])) | join(' and ') }} on the
+      command line. Extra vars override role 02's login tests, which must open a
+      brand-new SSH connection without sudo; with that override a test could reuse
+      this run's own connection and prove nothing. Remove it: put extra ssh options
+      in ansible_ssh_common_args (inventory), and leave become to site.yml.
+      Nothing has been changed.
+  vars:
+    ansible_ssh_args: -o AutosecProbe=task-var
+    ansible_become: false
+
+# No become: this is the account Ansible itself logged in as. The output is
+# only compared and shown, apart from the controller address (see top).
+# `become: false` alone is not enough: an inventory `ansible_become: true`
+# beats the keyword, and sudo drops $SSH_CONNECTION. A task variable beats
+# the inventory.
+- name: "SSH preflight P3: account and connection of this run"
+  when: not (_ssh_local_mode | bool)
+  ansible.builtin.raw: >-
+    printf 'AUTOSEC_CONN=%s\n' "$SSH_CONNECTION"; printf 'AUTOSEC_USER='; id -un
+  become: false
+  changed_when: false
+  check_mode: false
+  register: _ssh_pf_who
+  vars:
+    ansible_become: false
+
+- name: "SSH preflight P3: login user, controller address and server port"
+  when: not (_ssh_local_mode | bool)
+  ansible.builtin.set_fact:
+    _ssh_login_user: "{{ _ssh_who_user if _ssh_who_user is match('^[a-z_][a-z0-9_.-]{0,31}[$]?$') else '?' }}"
+    _ssh_controller_ip: >-
+      {{ _ssh_conn[0] if (_ssh_conn | length == 4
+                          and (_ssh_conn[0] is match(_ssh_ipv4_re) or _ssh_conn[0] is match(_ssh_ipv6_re))
+                          and _ssh_conn[0] is not match('^127\.')
+                          and _ssh_conn[0] | lower not in ['::1', '0:0:0:0:0:0:0:1'])
+         else '' }}
+    # Ansible reached sshd from the server itself (ansible_host 127.0.0.1,
+    # or a tunnel that ends on the server): P9 treats that like local mode.
+    _ssh_loopback_conn: >-
+      {{ _ssh_conn | length == 4
+         and (_ssh_conn[0] is match('^127\.') or _ssh_conn[0] is match('(?i)^::ffff:127\.')
+              or _ssh_conn[0] | lower in ['::1', '0:0:0:0:0:0:0:1']) }}
+    _ssh_server_port: "{{ (_ssh_conn[3] | int) if (_ssh_conn | length == 4 and _ssh_conn[3] is match('^[0-9]{1,5}$')) else 0 }}"
+  vars:
+    _ssh_who: "{{ _ssh_pf_who.stdout_lines | default([]) | map('trim') | list }}"
+    _ssh_who_user: "{{ _ssh_who | select('match', '^AUTOSEC_USER=') | first | default('AUTOSEC_USER=') | regex_replace('^AUTOSEC_USER=', '') }}"
+    _ssh_conn: "{{ (_ssh_who | select('match', '^AUTOSEC_CONN=') | first | default('AUTOSEC_CONN=') | regex_replace('^AUTOSEC_CONN=', '')).split() }}"
+
+# --- P4. Current config ---------------------------------------------------
+
+- name: "SSH preflight P4: is sshd installed?"
+  ansible.builtin.stat:
+    path: /usr/sbin/sshd
+    get_checksum: false
+  register: _ssh_pf_sshd
+
+- name: "SSH preflight P4: does the privilege-separation directory exist?"
+  when: _ssh_pf_sshd.stat.exists
+  ansible.builtin.stat:
+    path: /run/sshd
+    get_checksum: false
+  register: _ssh_pf_privsep
+
+# `sshd -t` and `sshd -T` as root stop with "Missing privilege separation
+# directory: /run/sshd" when it is missing. ssh.service only creates it while
+# it runs (socket-activated hosts, or local mode with sshd stopped).
+- name: "SSH preflight P4: create /run/sshd for sshd -t"
+  when: _ssh_pf_sshd.stat.exists and not _ssh_pf_privsep.stat.exists
+  ansible.builtin.file:
+    path: /run/sshd
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  check_mode: false
+
+# `-ddd` makes sshd print every line it reads, as "<file>:<line> setting
+# <Keyword> <value>", in the order it reads them (Include expanded, lines
+# inside inactive Match blocks left out). rc is the plain `sshd -t` verdict.
+- name: "SSH preflight P4: check the current config and trace the lines sshd reads"
+  when: _ssh_pf_sshd.stat.exists
+  ansible.builtin.command:
+    argv: [/usr/sbin/sshd, -t, -ddd]
+  register: _ssh_pf_t
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "SSH preflight P4: settings sshd uses now, for the admin account"
+  when: _ssh_pf_sshd.stat.exists
+  ansible.builtin.command:
+    argv: [/usr/sbin/sshd, -T, -C, "user={{ _ssh_admin }},host=autosec-check,addr={{ _ssh_c_addr }},lport={{ ssh_port | int }}"]
+  register: _ssh_pf_eff_admin
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  vars:
+    _ssh_c_addr: "{{ _ssh_controller_ip | default('', true) or _ssh_placeholder_addr }}"
+
+- name: "SSH preflight P4: settings sshd uses now, for root"
+  when: _ssh_pf_sshd.stat.exists
+  ansible.builtin.command:
+    argv: [/usr/sbin/sshd, -T, -C, "user=root,host=autosec-check,addr={{ _ssh_c_addr }},lport={{ ssh_port | int }}"]
+  register: _ssh_pf_eff_root
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  vars:
+    _ssh_c_addr: "{{ _ssh_controller_ip | default('', true) or _ssh_placeholder_addr }}"
+
+- name: "SSH preflight P4: remember the current settings"
+  ansible.builtin.set_fact:
+    _ssh_before: "{{ _ssh_kv_pair }}"
+    _ssh_after: "{{ _ssh_kv_pair }}"
+    _ssh_hardened: >-
+      {{ (_ssh_kv_pair.root.permitrootlogin | default('yes')) != 'yes'
+         and (_ssh_kv_pair.admin.passwordauthentication | default('yes')) == 'no'
+         and (_ssh_kv_pair.root.passwordauthentication | default('yes')) == 'no' }}
+    _ssh_cfg_lines: "{{ _ssh_pf_t.stderr_lines | default([]) | select('search', ':[0-9]+ setting ') | map('regex_replace', '[{}]', '?') | list }}"
+  vars:
+    _ssh_kv_admin_lines: "{{ _ssh_pf_eff_admin.stdout_lines | default([]) if (_ssh_pf_eff_admin.rc | default(1)) == 0 else [] }}"
+    _ssh_kv_root_lines: "{{ _ssh_pf_eff_root.stdout_lines | default([]) if (_ssh_pf_eff_root.rc | default(1)) == 0 else [] }}"
+
+- name: "SSH preflight P4: the current sshd config must be valid"
+  when: _ssh_enabled | bool
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _ssh_pf_sshd.stat.exists
+      - _ssh_pf_t.rc == 0
+      - _ssh_before.admin | length > 0
+      - _ssh_before.root | length > 0
+    fail_msg: >-
+      `sshd -t` fails on {{ inventory_hostname }} right now:
+      {{ (_ssh_pf_t.stderr_lines | default([]) | reject('match', '^debug') | list
+          + _ssh_pf_eff_admin.stderr_lines | default([]) + _ssh_pf_eff_root.stderr_lines | default([])) | unique | list }}.
+      Fix that first; auto_sec does not change SSH on top of a broken config.
+      Nothing has been changed.
+
+- name: "SSH preflight P4: SSH lines in the order sshd reads them (for most keywords the FIRST one wins)"
+  when: _ssh_enabled | bool
+  ansible.builtin.debug:
+    msg: >-
+      {{ _ssh_cfg_lines | select('search', _ssh_show_re, ignorecase=True)
+         | map('regex_replace', '^debug3: ', '') | map('regex_replace', ' setting ', '  ') | list }}
+  vars:
+    _ssh_show_re: >-
+      setting (Port|ListenAddress|PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PubkeyAuthentication|AuthenticationMethods|AllowUsers|DenyUsers|AllowGroups|DenyGroups|MaxAuthTries|LoginGraceTime|MaxSessions|AllowTcpForwarding|UsePAM|LogLevel)
+
+# --- P5. Main-file shape (only when hardening is enabled) -----------------
+
+- name: "SSH preflight P5: read sshd_config"
+  when: _ssh_enabled | bool
+  ansible.builtin.slurp:
+    src: /etc/ssh/sshd_config
+  register: _ssh_pf_main
+
+- name: "SSH preflight P5: read the distro's stock sshd_config (used only when migrating)"
+  when: _ssh_enabled | bool
+  ansible.builtin.stat:
+    path: /usr/share/openssh/sshd_config
+    get_checksum: false
+  register: _ssh_pf_stock_stat
+
+- name: "SSH preflight P5: read the stock sshd_config"
+  when: (_ssh_enabled | bool) and _ssh_pf_stock_stat.stat.exists
+  ansible.builtin.slurp:
+    src: /usr/share/openssh/sshd_config
+  register: _ssh_pf_stock
+
+- name: "SSH preflight P5: Include line and file origin"
+  when: _ssh_enabled | bool
+  ansible.builtin.set_fact:
+    _ssh_has_include: "{{ _ssh_main is search(_ssh_include_re) }}"
+    _ssh_include_in_match: "{{ (_ssh_main | regex_replace(_ssh_include_re ~ '[\\s\\S]*', '')) is search('(?im)^[ \\t]*Match[ \\t]') }}"
+    _ssh_legacy_main: "{{ _ssh_main.startswith(_ssh_legacy_header) }}"
+    _ssh_stock_ok: >-
+      {{ (_ssh_stock is search(_ssh_include_re))
+         and not ((_ssh_stock | regex_replace(_ssh_include_re ~ '[\\s\\S]*', '')) is search('(?im)^[ \\t]*Match[ \\t]')) }}
+    _ssh_migrate_kind: >-
+      {{ 'none' if (_ssh_main is search(_ssh_include_re) or not (_ssh_migrate | bool))
+         else ('stock' if _ssh_main.startswith(_ssh_legacy_header) else 'include') }}
+  vars:
+    _ssh_main: "{{ _ssh_pf_main.content | b64decode }}"
+    _ssh_stock: "{{ (_ssh_pf_stock.content | b64decode) if (_ssh_pf_stock.content is defined) else '' }}"
+
+- name: "SSH preflight P5: sshd_config must read sshd_config.d"
+  when: _ssh_check_role | bool
+  ansible.builtin.assert:
+    quiet: true
+    that: (_ssh_has_include | bool) or (_ssh_migrate | bool)
+    fail_msg: >-
+      {% if _ssh_legacy_main | bool %}/etc/ssh/sshd_config on {{ inventory_hostname }} was
+      written by auto_sec 0.1-0.3 and has no Include line, so sshd ignores
+      sshd_config.d. Today sshd uses: {{ _ssh_before.root | dict2items
+      | selectattr('key', 'in', ['port', 'permitrootlogin', 'passwordauthentication', 'allowusers', 'maxauthtries', 'logingracetime', 'maxsessions', 'x11forwarding', 'allowagentforwarding', 'allowtcpforwarding', 'clientaliveinterval', 'clientalivecountmax', 'loglevel'])
+      | items2dict }}. Set ssh_admin_user, ssh_permit_root_login,
+      ssh_password_authentication, ssh_allow_users and ssh_extra_settings to the
+      values you want (CHANGELOG "Upgrading" has the block that matches 0.3), then
+      run once with --tags ssh -l {{ inventory_hostname }} -e ssh_migrate_sshd_config=true.
+      Under the automatic undo, the distro's stock sshd_config comes back and
+      00-autosec.conf carries your settings.
+      {% else %}/etc/ssh/sshd_config on {{ inventory_hostname }} has no line
+      "Include /etc/ssh/sshd_config.d/*.conf", so sshd would ignore auto_sec's file.
+      Run once with -e ssh_migrate_sshd_config=true: auto_sec then adds that line as
+      line 1, after a trial run and under the automatic undo. Do not add it by hand:
+      it can wake old drop-ins (for example 50-cloud-init) that change who can log in.
+      {% endif %}Nothing has been changed.
+
+- name: "SSH preflight P5: the migration switch only fits a sshd_config without the Include"
+  when: (_ssh_check_role | bool) and (_ssh_migrate | bool)
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not (_ssh_has_include | bool)
+      - _ssh_migrate_kind != 'stock' or (_ssh_stock_ok | bool)
+    fail_msg: >-
+      {% if _ssh_has_include | bool %}ssh_migrate_sshd_config is set, but
+      /etc/ssh/sshd_config already reads sshd_config.d: there is nothing to migrate.
+      Run again without -e ssh_migrate_sshd_config=true.
+      {% else %}/usr/share/openssh/sshd_config is missing or has no top-level
+      "Include /etc/ssh/sshd_config.d/*.conf" line, so auto_sec cannot restore the
+      distro's file. Reinstall openssh-server's stock file or fix sshd_config by hand.
+      {% endif %}Nothing has been changed.
+
+- name: "SSH preflight P5: the Include must not sit inside a Match block"
+  when: (_ssh_check_role | bool) and (_ssh_has_include | bool)
+  ansible.builtin.assert:
+    quiet: true
+    that: not (_ssh_include_in_match | bool)
+    fail_msg: >-
+      In /etc/ssh/sshd_config the "Include ...sshd_config.d/*.conf" line comes after
+      a Match line, so the drop-ins (and auto_sec's file) only apply to that Match.
+      Move the Include above every Match line yourself, check with `sshd -t`, reload
+      with a second session open, then run again. Nothing has been changed.
+
+# --- P6. Are the files on disk the ones sshd is running? ------------------
+
+- name: "SSH preflight P6: LogLevel must let the run see sshd reloads"
+  when: _ssh_check_role | bool
+  ansible.builtin.assert:
+    quiet: true
+    that: (_ssh_before.root.loglevel | default('INFO') | upper) not in ['QUIET', 'FATAL', 'ERROR']
+    fail_msg: >-
+      sshd runs with LogLevel {{ _ssh_before.root.loglevel | default('') }}. At that level
+      sshd does not log its reloads, and auto_sec checks that log to confirm a change
+      was loaded. Use INFO or VERBOSE (for example ssh_extra_settings: {LogLevel:
+      VERBOSE}, or fix the line that sets it). Nothing has been changed.
+
+- name: "SSH preflight P6: no undo pending, and sshd runs the files on disk"
+  when: _ssh_enabled | bool
+  ansible.builtin.include_tasks:
+    file: guard.yml
+  vars:
+    _ssh_guard_action: fresh
+
+# --- P7. Port and socket (always: they also protect role 03) --------------
+
+- name: "SSH preflight P7: are ssh.socket and ssh.service active?"
+  ansible.builtin.command:
+    argv: [systemctl, is-active, ssh.socket, ssh.service]
+  register: _ssh_pf_units
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "SSH preflight P7: remember the unit states"
+  ansible.builtin.set_fact:
+    _ssh_socket_active: "{{ (_ssh_pf_units.stdout_lines | default([]))[0:1] == ['active'] }}"
+    _ssh_service_active: "{{ (_ssh_pf_units.stdout_lines | default([]))[1:2] == ['active'] }}"
+
+- name: "SSH preflight P7: addresses ssh.socket listens on"
+  when: _ssh_socket_active | bool
+  ansible.builtin.command:
+    argv: [systemctl, show, -p, Listen, --value, ssh.socket]
+  register: _ssh_pf_listen
+  changed_when: false
+  check_mode: false
+
+- name: "SSH preflight P7: does sshd listen on ssh_port?"
+  when: not (_ssh_socket_active | bool) and _ssh_pf_sshd.stat.exists
+  ansible.builtin.command:
+    argv: [ss, -Htlnp, sport, "=", ":{{ ssh_port | int }}"]
+  register: _ssh_pf_ss
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "SSH preflight P7: ssh_port is the port sshd already listens on"
+  when: _ssh_pf_sshd.stat.exists
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      # Socket activation: systemd holds the port. Its ports must be ssh_port
+      # and must equal what sshd_config asks for, or a reboot, daemon-reload or
+      # openssh update moves the listener (Ubuntu's socket generator).
+      - not (_ssh_socket_active | bool) or (ssh_port | int) in _ssh_sock_ports
+      - not (_ssh_socket_active | bool) or _ssh_conf_ports | length == 0 or _ssh_conf_ports == _ssh_sock_ports
+      - not (_ssh_socket_active | bool) or _ssh_listenaddr_lines | length == 0
+      # Plain service: sshd itself must be listening on ssh_port.
+      - (_ssh_socket_active | bool) or '"sshd"' in (_ssh_pf_ss.stdout | default(''))
+      - (_ssh_socket_active | bool) or _ssh_conf_ports | length == 0 or (ssh_port | int) in _ssh_conf_ports
+    fail_msg: >-
+      {% if _ssh_socket_active | bool %}ssh.socket listens on port(s) {{ _ssh_sock_ports }} and
+      the sshd config asks for {{ _ssh_conf_ports }}{% if _ssh_listenaddr_lines | length > 0 %},
+      with ListenAddress lines {{ _ssh_listenaddr_lines | map('regex_replace', '^debug3: ', '') | list }}{% endif %};
+      ssh_port is {{ ssh_port }}. {% else %}{{ 'sshd listens' if '"sshd"' in (_ssh_pf_ss.stdout | default('')) else 'No sshd process listens' }}
+      on ssh_port {{ ssh_port }}, and the sshd config asks for port(s) {{ _ssh_conf_ports }}. {% endif %}auto_sec 0.4
+      never moves the SSH port: ssh_port must be the port sshd listens on now, and
+      on socket-activated hosts the config must ask for exactly the socket's ports
+      with no ListenAddress (otherwise a reboot or openssh update moves the
+      listener and the firewall can lock you out). Set ssh_port to the port you
+      connect to, or move the port by hand first (docs/ssh-port.md).
+      Nothing has been changed.
+  vars:
+    _ssh_sock_ports: >-
+      {{ _ssh_pf_listen.stdout_lines | default([])
+         | map('regex_replace', '^.*:([0-9]+) \(Stream\)$', '\1') | select('match', '^[0-9]+$')
+         | map('int') | unique | sort }}
+    _ssh_conf_ports: "{{ (_ssh_before.root.port | default('')).split() | map('int') | unique | sort }}"
+    _ssh_listenaddr_lines: "{{ _ssh_cfg_lines | select('search', ' setting ListenAddress ', ignorecase=True) | list }}"
+
+# Role 02 loads a change with `systemctl try-reload-or-restart ssh.service`.
+# That does nothing to an sshd started some other way (by hand, or by
+# another unit): the change would stay on disk, unloaded and untested,
+# until the next restart (issue #9). Without ssh.socket, the listener on
+# ssh_port must be ssh.service's main process.
+- name: "SSH preflight P7: main process of ssh.service"
+  when:
+    - _ssh_check_role | bool
+    - not (_ssh_socket_active | bool)
+    - _ssh_service_active | bool
+  ansible.builtin.command:
+    argv: [systemctl, show, -p, MainPID, --value, ssh.service]
+  register: _ssh_pf_mainpid
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "SSH preflight P7: the sshd on ssh_port is the one ssh.service runs"
+  when:
+    - _ssh_check_role | bool
+    - not (_ssh_socket_active | bool)
+    - _ssh_pf_sshd.stat.exists
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _ssh_service_active | bool
+      - _ssh_mainpid is match('^[1-9][0-9]*$')
+      - ('pid=' ~ _ssh_mainpid ~ ',') in (_ssh_pf_ss.stdout | default(''))
+    fail_msg: >-
+      The sshd listening on ssh_port {{ ssh_port }} on {{ inventory_hostname }} is not the one
+      ssh.service runs ({{ 'ssh.service is not active' if not (_ssh_service_active | bool)
+      else 'ssh.service main process: ' ~ (_ssh_mainpid | default('unknown', true)) }}; listener:
+      {{ _ssh_pf_ss.stdout | default('') | regex_replace('[{}]', '?') | trim | default('none', true) }}).
+      auto_sec loads SSH changes with `systemctl try-reload-or-restart ssh.service`, which
+      would not reach that sshd: a change would sit on disk, untested, until the next
+      restart. Run sshd through ssh.service or ssh.socket, or set
+      ssh_hardening_enabled: false for this host. Nothing has been changed.
+  vars:
+    _ssh_mainpid: "{{ _ssh_pf_mainpid.stdout | default('') | trim }}"
+
+- name: "SSH preflight P7: this run is connected to ssh_port"
+  when: not (_ssh_local_mode | bool)
+  ansible.builtin.assert:
+    quiet: true
+    that: (_ssh_server_port | int) == (ssh_port | int)
+    fail_msg: >-
+      {% if (_ssh_server_port | int) == 0 %}Could not read $SSH_CONNECTION on
+      {{ inventory_hostname }}, so auto_sec cannot tell which SSH port this run uses.
+      (sudo drops it: do not pass -e ansible_become=true.)
+      {% else %}This run reached sshd on server port {{ _ssh_server_port }}, but ssh_port
+      is {{ ssh_port }}. The firewall (role 03) opens only ssh_port, so the port you
+      use could be closed. Set ssh_port: {{ _ssh_server_port }}.
+      {% endif %}Nothing has been changed.
+
+# --- P8. Trial run on a copy (only when hardening is enabled) -------------
+
+- name: "SSH preflight P8: trial run on a copy of the config"
+  when: _ssh_check_role | bool
+  ansible.builtin.include_tasks:
+    file: simulate.yml
+
+# --- P9. Extra checks when a login-critical setting changes ---------------
+
+- name: "SSH preflight P9: decide whether this run may write"
+  when: _ssh_check_role | bool
+  ansible.builtin.set_fact:
+    _ssh_deferred: "{{ _ssh_defer }}"
+    _ssh_deferred_reason: >-
+      {{ ('Ansible is logged in as ' ~ _ssh_login_user ~ ', not ' ~ _ssh_admin ~ '. Set ansible_user: '
+          ~ _ssh_admin ~ ' (and no -e ansible_user) and run again.') if (_ssh_defer | bool) else '' }}
+    _ssh_needs_write: "{{ ((_ssh_dropin_differs | bool) or _ssh_migrate_kind != 'none') and not (_ssh_defer | bool) }}"
+  vars:
+    _ssh_defer: >-
+      {{ (_ssh_login_critical_change | bool) and not (_ssh_local_mode | bool) and _ssh_login_user != _ssh_admin }}
+
+# An SSH login to 127.0.0.1 (or ::1) is local mode in disguise: its login
+# tests use a key stored on the server and prove nothing about your own
+# computer. auto_sec's own CI (role02-live on a GitHub runner, autosec_ci:
+# true) is the one exception.
+- name: "SSH preflight P9: local mode only applies changes that change nothing"
+  when:
+    - _ssh_check_role | bool
+    - (_ssh_local_mode | bool) or ((_ssh_loopback_conn | bool) and not _ssh_ci_loopback_ok)
+  ansible.builtin.assert:
+    quiet: true
+    that: _ssh_diff | length == 0
+    fail_msg: >-
+      This SSH change must be run from your own computer (remote mode), not on the
+      server itself. {% if not (_ssh_local_mode | bool) %}This run reaches sshd from the server
+      itself (from a loopback address), so its login tests cannot show that your own
+      computer can still log in. {% endif %}In local mode auto_sec cannot test a new login, so it only
+      writes SSH settings that leave every effective value unchanged; this one would
+      change {{ _ssh_diff }}. Nothing has been changed.
+  vars:
+    _ssh_ci_loopback_ok: "{{ (autosec_ci | default(false) | bool) and lookup('ansible.builtin.env', 'GITHUB_ACTIONS') == 'true' }}"
+
+- name: "SSH preflight P9: turning passwords off needs keys to work and no password step"
+  when:
+    - _ssh_check_role | bool
+    - not (_ssh_deferred | bool)
+    - "'passwordauthentication' in _ssh_diff"
+    - ssh_password_authentication == 'no'
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (_ssh_sim_after.admin.pubkeyauthentication | default('')) == 'yes'
+      - (_ssh_sim_after.root.pubkeyauthentication | default('')) == 'yes'
+      - (_ssh_sim_after.admin.kbdinteractiveauthentication | default(_ssh_sim_after.admin.challengeresponseauthentication | default(''))) == 'no'
+      - (_ssh_sim_after.root.kbdinteractiveauthentication | default(_ssh_sim_after.root.challengeresponseauthentication | default(''))) == 'no'
+      - _ssh_sim_authmethods.stdout_lines | default([]) | select('search', '(?i)(password|keyboard-interactive)') | list | length == 0
+    fail_msg: >-
+      ssh_password_authentication is "no", but on {{ inventory_hostname }} sshd would
+      still need or offer another password step: pubkeyauthentication
+      {{ _ssh_sim_after.root.pubkeyauthentication | default('?') }}, kbdinteractiveauthentication
+      {{ _ssh_sim_after.root.kbdinteractiveauthentication | default(_ssh_sim_after.root.challengeresponseauthentication | default('?')) }},
+      AuthenticationMethods lines {{ _ssh_sim_authmethods.stdout_lines | default([]) }}.
+      auto_sec never writes KbdInteractiveAuthentication or AuthenticationMethods
+      (PAM two-factor setups need them). Turn passwords off by hand on such hosts,
+      or keep "keep". Nothing has been changed.
+
+- name: "SSH preflight P9: accounts that would lose SSH when passwords go off"
+  when:
+    - _ssh_check_role | bool
+    - not (_ssh_deferred | bool)
+    - "'passwordauthentication' in _ssh_diff"
+    - ssh_password_authentication == 'no'
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - |
+        # Names only: accounts with a usable password hash and no authorized_keys.
+        awk -F: '$2 != "" && $2 !~ /^[!*]/ { print $1 }' /etc/shadow | while IFS= read -r u; do
+          h=$(getent passwd "$u" | cut -d: -f6)
+          if [ -z "$h" ] || [ ! -s "$h/.ssh/authorized_keys" ]; then printf '%s\n' "$u"; fi
+        done
+  register: _ssh_pf_pwonly
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "SSH preflight P9: warn about accounts that only have a password"
+  when:
+    - _ssh_pf_pwonly is not skipped
+    - _ssh_pf_pwonly.stdout_lines | default([]) | length > 0
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: these accounts on {{ inventory_hostname }} have a password but no
+      ~/.ssh/authorized_keys: {{ _ssh_pf_pwonly.stdout_lines }}. They lose SSH access
+      when passwords go off. Password clients such as VS Code must move to a key first.
+
+- name: "SSH preflight P9: warn when MaxAuthTries is low while passwords stay on"
+  when:
+    - _ssh_check_role | bool
+    - (_ssh_sim_after.admin.passwordauthentication | default('no')) == 'yes'
+    - (_ssh_sim_after.admin.maxauthtries | default('6') | int) < 6
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: MaxAuthTries is {{ _ssh_sim_after.admin.maxauthtries }} while password
+      login stays on. A client whose ssh-agent offers that many keys fails before
+      the password prompt ("Too many authentication failures").
+
+- name: "SSH preflight P9: stricter login settings wait for the right account"
+  when: _ssh_deferred | bool
+  ansible.builtin.debug:
+    msg: >-
+      DEFERRED on {{ inventory_hostname }}: {{ _ssh_deferred_reason }} Login settings
+      change only on a run where Ansible really is logged in as ssh_admin_user. Keys
+      are still added and tested in this run. The report says SSH login NOT hardened.
+
+# The login tests after a change open NEW connections. If ufw is active and
+# no rule admits a new connection to ssh_port, they are dropped and every
+# run is undone. Typical case: a high-mode host set up by auto_sec 0.1-0.3,
+# whose role 04 deleted the SSH rule and left fwknop in charge. A rule
+# counts when it names ssh_port, an app profile, or no port at all, and is
+# not limited to another single source address. Shown only, never used.
+- name: "SSH preflight P9: ufw state and rules"
+  when:
+    - _ssh_needs_write | bool
+    - not (_ssh_local_mode | bool)
+  ansible.builtin.command:
+    argv: [sh, -c, "command -v ufw >/dev/null 2>&1 || exit 0; ufw status | head -n 1; ufw show added"]
+  environment:
+    LANG: C
+    LC_ALL: C
+  register: _ssh_pf_ufw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "SSH preflight P9: an active ufw must let new SSH connections reach ssh_port"
+  when:
+    - _ssh_pf_ufw is not skipped
+    - "(_ssh_pf_ufw.stdout_lines | default([]))[0:1] == ['Status: active']"
+  ansible.builtin.assert:
+    quiet: true
+    that: _ssh_ufw_open | length > 0
+    fail_msg: >-
+      ufw is active on {{ inventory_hostname }}, but none of its rules lets a new connection
+      from this controller reach ssh_port {{ ssh_port }} (`ufw show added`: {{ _ssh_ufw_rules }}).
+      The login test after the change opens new SSH connections; they would be
+      dropped, and the change undone. Typical cause: a high-mode host set up by
+      auto_sec 0.1-0.3, whose fwknop role deleted the SSH rule. Add the rule first,
+      from a session that is already open: `sudo ufw limit {{ ssh_port | int }}/tcp`
+      (or run --tags firewall). Then run again. Nothing has been changed.
+  vars:
+    _ssh_ufw_rules: "{{ _ssh_pf_ufw.stdout_lines | default([]) | select('match', '^ufw ') | map('regex_replace', '[{}]', '?') | list }}"
+    _ssh_ufw_in: >-
+      {{ _ssh_ufw_rules | select('match', '^ufw (allow|limit) ') | reject('match', '^ufw (allow|limit) out ')
+         | reject('search', ' from (?!any( |$))(?!' ~ (_ssh_controller_ip | regex_escape) ~ '( |$))[^ /]+( |$)') | list }}
+    _ssh_ufw_open: >-
+      {{ (_ssh_ufw_in | select('search', '(?<![0-9.:])' ~ (ssh_port | int) ~ '(?![0-9.])') | list)
+         + (_ssh_ufw_in | select('search', '(?i)( app |OpenSSH)') | list)
+         + (_ssh_ufw_in | reject('search', '( port |/tcp|/udp|^ufw (allow|limit) (in )?(on \S+ )?[0-9])') | list) }}
+
+# --- P10. How many hosts change SSH in this run ---------------------------
+
+- name: "SSH preflight P10: at most ssh_max_hosts_per_run hosts change SSH per run"
+  when:
+    - _ssh_check_role | bool
+    - not ansible_check_mode
+  ansible.builtin.assert:
+    quiet: true
+    that: _ssh_changing | length <= (ssh_max_hosts_per_run | default(5) | int)
+    fail_msg: >-
+      This run would change sshd on {{ _ssh_changing | length }} hosts
+      ({{ _ssh_changing | join(', ') }}). SSH changes go to at most
+      {{ ssh_max_hosts_per_run | default(5) }} hosts per run (ssh_max_hosts_per_run), so
+      every changed host can prove a fresh login inside its undo window. Use -l to
+      pick fewer hosts. Nothing has been changed.
+  vars:
+    _ssh_changing: >-
+      {{ ansible_play_batch | zip(ansible_play_batch | map('extract', hostvars, '_ssh_needs_write') | map('default', false) | map('bool'))
+         | selectattr(1) | map('first') | list }}
+
+- name: "SSH preflight: summary"
+  when: _ssh_enabled | bool
+  ansible.builtin.debug:
+    msg:
+      mode: "{{ 'local' if (_ssh_local_mode | bool) else 'remote, logged in as ' ~ _ssh_login_user ~ ', server port ' ~ _ssh_server_port }}"
+      ssh_socket_active: "{{ _ssh_socket_active }}"
+      keys_that_change: "{{ _ssh_diff }}"
+      login_critical_change: "{{ _ssh_login_critical_change }}"
+      migration: "{{ _ssh_migrate_kind }}"
+      writes_00_autosec_conf: "{{ _ssh_needs_write }}"
+      deferred: "{{ _ssh_deferred_reason if (_ssh_deferred | bool) else false }}"

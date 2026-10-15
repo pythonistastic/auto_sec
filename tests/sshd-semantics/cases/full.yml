@@ -1,0 +1,18 @@
+---
+# Every option set, every allowed extra key: the template must still never
+# write Port, ListenAddress, Subsystem, KbdInteractiveAuthentication or UsePAM.
+deploy_user: deploy
+ssh_admin_user: deploy
+ssh_permit_root_login: prohibit-password
+ssh_password_authentication: "no"
+ssh_allow_users: [deploy, ops]
+ssh_extra_settings:
+  MaxAuthTries: 4
+  LoginGraceTime: 25
+  MaxSessions: 4
+  X11Forwarding: "no"
+  AllowAgentForwarding: "no"
+  AllowTcpForwarding: "no"
+  ClientAliveInterval: 240
+  ClientAliveCountMax: 3
+  LogLevel: VERBOSE

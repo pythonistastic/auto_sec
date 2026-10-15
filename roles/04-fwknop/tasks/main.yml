@@ -1,8 +1,11 @@
 ---
-# Single Packet Authorization. SSH port stays CLOSED until a valid
-# encrypted packet arrives, then opens for the sender's IP only.
-# SAFETY: confirm provider console (Contabo VNC) access before enabling,
-# and keep office_static_ip break-glass rule until comfortable.
+# Single Packet Authorization (fwknopd), paranoia_level: high.
+#
+# 0.4.0: SSH stays VISIBLE. Role 03 keeps the rate-limited SSH rule in
+# both paranoia levels and this role never deletes it, so a broken or
+# unconfigured fwknop can never lock you out. Hiding SSH behind fwknop
+# (with a proven knock and login under the undo guard) returns in a later
+# release. Until then fwknopd runs alongside the open, rate-limited port.
 
 - name: Install fwknop server
   ansible.builtin.apt:
@@ -27,16 +30,37 @@
     mode: "0600"
   notify: restart fwknopd
 
-- name: Remove open SSH rule from UFW (fwknop takes over)
-  community.general.ufw:
-    rule: limit
-    port: "{{ ssh_port | int }}"
-    proto: tcp
-    delete: true
-  failed_when: false
-
-- name: Enable fwknopd
+- name: Enable and start fwknopd
   ansible.builtin.service:
     name: fwknop-server
     state: started
     enabled: true
+
+# Load a changed config now, so the check below sees the daemon that will
+# actually run, not the one from before this run.
+- name: Restart fwknopd now if its config changed
+  ansible.builtin.meta: flush_handlers
+
+# Skipped in --check: the daemon may not be installed or started yet.
+- name: Read fwknopd state
+  ansible.builtin.command: systemctl is-active fwknop-server
+  register: _fwknopd_state
+  changed_when: false
+  failed_when: false
+  # Only waits while systemd still reports "activating".
+  until: _fwknopd_state.stdout != 'activating'
+  retries: 5
+  delay: 2
+  when: not ansible_check_mode
+
+- name: Refuse to continue unless fwknopd is active
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _fwknopd_state.stdout == 'active'
+    fail_msg: >-
+      fwknopd is not running (systemctl is-active fwknop-server says
+      "{{ _fwknopd_state.stdout }}"). SSH is unaffected: the rate-limited
+      SSH rule stays in place. Check `journalctl -u fwknop-server` (often
+      PCAP_INTF or the keys in access.conf), then run again.
+  when: not ansible_check_mode

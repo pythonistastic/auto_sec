@@ -1,0 +1,116 @@
+---
+# roles/02-ssh-hardening/tasks/prove.yml - one login test on a BRAND-NEW
+# SSH connection (never Ansible's shared ControlPersist connection, which
+# keeps working after sshd stops accepting new logins).
+#
+# It goes through Ansible's own ssh connection plugin, so the inventory host
+# and port, ProxyJump in ansible_ssh_common_args, known_hosts, ~/.ssh/config,
+# the agent and the key decide exactly as they do for the run itself. ssh
+# keeps the FIRST value it sees for an option and Ansible puts ssh_args
+# first, so the test's options, placed at the very start of
+# ansible_ssh_args, win over the run's usual ssh_args (appended after them,
+# so a ProxyJump set there still applies, while ControlMaster=auto and
+# ControlPersist lose) and over ansible_ssh_common_args.
+# Only extra vars beat task variables: an `-e ansible_ssh_args=...` would
+# make the test reuse the run's ControlPersist connection, and an
+# `-e ansible_become=true` would run it through sudo. Preflight P3 refuses
+# both; the first task below checks again, right where it matters. An
+# inventory `ansible_become: true` is beaten by the task variable.
+#
+# Inputs:
+#   _ssh_prove_mode   ansible  key-only login as ssh_admin_user, the way
+#                              Ansible connects (agent, ~/.ssh/config and the
+#                              inventory key may all offer keys)
+#                     pinned   the same with IdentitiesOnly=yes: only the
+#                              inventory key (ansible_ssh_private_key_file)
+#                     normal   a new login exactly as this run logs in (same
+#                              account, same method, a password too)
+#   _ssh_prove_label  shown in task names and messages
+#   _ssh_prove_delay  seconds to wait first (0 or 10: the retry)
+# Output: _ssh_prove_ok (bool), _ssh_prove_msg (str)
+#
+# ansible_ssh_user (not ansible_user) is set on purpose: as a task variable
+# it also wins over `-e ansible_user=...`, which the first run on a new
+# server uses. The test prints `id -un` and the result must be
+# ssh_admin_user, so an `-e ansible_ssh_user=...` cannot make a test as the
+# wrong account pass. A non-root admin must also pass `sudo -n true`.
+
+# Read here, in a task without the test's own ansible_ssh_args: the
+# inventory's ansible_ssh_args, else ANSIBLE_SSH_ARGS / ansible.cfg /
+# Ansible's default.
+- name: "SSH login test: the ssh_args this run normally uses, {{ _ssh_prove_label }}"
+  ansible.builtin.set_fact:
+    _ssh_prove_base_args: "{{ lookup('ansible.builtin.config', 'ssh_args', plugin_type='connection', plugin_name='ssh') | default('', true) }}"
+
+- name: "SSH login test: the test's own ssh options, {{ _ssh_prove_label }}"
+  ansible.builtin.set_fact:
+    _ssh_prove_args: >-
+      -o ControlMaster=no -o ControlPath=none{{ (' -o BatchMode=yes -o PreferredAuthentications=publickey'
+      ~ ' -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no') if _ssh_prove_mode in ['ansible', 'pinned'] else '' }}{{
+      ' -o IdentitiesOnly=yes' if _ssh_prove_mode == 'pinned' else '' }} {{ _ssh_prove_base_args }}
+
+- name: "SSH login test: no -e override replaces the test's options, {{ _ssh_prove_label }}"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - ansible_ssh_args == _ssh_prove_args
+      - not (ansible_become | bool)
+    fail_msg: >-
+      -e ansible_ssh_args or -e ansible_become on the command line replaces the options
+      of role 02's login test, so it would not be a brand-new login without sudo.
+      Remove it (put extra ssh options in ansible_ssh_common_args).
+  vars:
+    ansible_ssh_args: "{{ _ssh_prove_args }}"
+    ansible_become: false
+
+- name: "SSH login test: wait before trying again, {{ _ssh_prove_label }}"
+  when: (_ssh_prove_delay | default(0) | int) > 0
+  ansible.builtin.wait_for:
+    timeout: "{{ _ssh_prove_delay | int }}"
+  delegate_to: localhost
+  become: false
+  check_mode: false
+  vars:
+    ansible_become: false
+
+- name: "SSH login test: key-only login as the admin account, {{ _ssh_prove_label }}"
+  when: _ssh_prove_mode in ['ansible', 'pinned']
+  ansible.builtin.raw: "{{ 'id -un' if _ssh_admin == 'root' else 'id -un && sudo -n true' }}"
+  become: false
+  changed_when: false
+  failed_when: false
+  ignore_unreachable: true
+  check_mode: false
+  register: _ssh_prove_key
+  vars:
+    ansible_ssh_user: "{{ _ssh_admin }}"
+    ansible_ssh_args: "{{ _ssh_prove_args }}"
+    ansible_become: false
+
+- name: "SSH login test: new login the way this run logs in, {{ _ssh_prove_label }}"
+  when: _ssh_prove_mode == 'normal'
+  ansible.builtin.raw: id -un
+  become: false
+  changed_when: false
+  failed_when: false
+  ignore_unreachable: true
+  check_mode: false
+  register: _ssh_prove_normal
+  vars:
+    ansible_ssh_args: "{{ _ssh_prove_args }}"
+    ansible_become: false
+
+- name: "SSH login test: result, {{ _ssh_prove_label }}"
+  ansible.builtin.set_fact:
+    _ssh_prove_ok: >-
+      {{ (_ssh_prove_r is not skipped) and not (_ssh_prove_r.unreachable | default(false))
+         and (_ssh_prove_r.rc | default(1)) == 0
+         and (_ssh_prove_mode == 'normal' or _ssh_prove_who == _ssh_admin) }}
+    _ssh_prove_msg: >-
+      {{ ((_ssh_prove_r.msg | default('')) ~ ' ' ~ (_ssh_prove_r.stderr | default('')) ~ ' ' ~
+          ('(logged in as ' ~ _ssh_prove_who ~ ', expected ' ~ _ssh_admin ~ ')'
+           if (_ssh_prove_mode != 'normal' and _ssh_prove_who != _ssh_admin and (_ssh_prove_r.rc | default(1)) == 0) else ''))
+         | regex_replace('[{}]', '?') | regex_replace('\s+', ' ') | trim | truncate(400) }}
+  vars:
+    _ssh_prove_r: "{{ _ssh_prove_normal if _ssh_prove_mode == 'normal' else _ssh_prove_key }}"
+    _ssh_prove_who: "{{ _ssh_prove_r.stdout_lines | default([]) | map('trim') | select | first | default('') }}"

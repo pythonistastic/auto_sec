@@ -1,26 +1,674 @@
 ---
-# Key source, in order of precedence:
-#   deploy_ssh_public_key      inline public key string (wizard sets this)
-#   ssh_public_key_file        path to a .pub file on the control machine
-#   default                    ~/.ssh/clients/<host>.pub (agency layout)
-- name: Install authorized key for deploy user (inline key)
-  ansible.posix.authorized_key:
-    user: "{{ deploy_user }}"
-    key: "{{ deploy_ssh_public_key }}"
-    exclusive: true
-  when: deploy_ssh_public_key is defined
+# roles/02-ssh-hardening/tasks/main.yml - role 02 apply phase (tags: ssh).
+#
+# Preflight (tasks/preflight.yml, imported by site.yml pre_tasks) already
+# checked everything and set the _ssh_* facts. This file:
+#   1. lets fail2ban ignore the controller for this run (runtime only)
+#   2. adds keys; it never removes or rewrites an authorized_keys line
+#   3. tests a key login on a new connection BEFORE any change
+#   4. skips 5-6 when 00-autosec.conf is already right (and no migration)
+#   5. installs and arms the automatic undo
+#   6. writes, checks, loads and tests the change under the undo
+#   8. records the effective settings (_ssh_after, _ssh_hardened)
+# There is no handler: the change is loaded here, at once (issue #9), with
+# `systemctl try-reload-or-restart ssh.service`. auto_sec never writes Port,
+# ListenAddress, Subsystem, KbdInteractiveAuthentication or UsePAM, never
+# touches ssh.socket and never runs daemon-reload while the undo is armed.
 
-- name: Install authorized key for deploy user (key file)
-  ansible.posix.authorized_key:
-    user: "{{ deploy_user }}"
-    key: "{{ lookup('file', ssh_public_key_file | default('~/.ssh/clients/' + inventory_hostname + '.pub')) }}"
-    exclusive: true
-  when: deploy_ssh_public_key is not defined
+- name: "SSH: the preflight must have run in this play"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _ssh_enabled is defined
+      - _ssh_needs_write is defined
+      - _ssh_sim_after is defined
+      # Preflight skips its role-02-only checks unless the tags select
+      # "ssh"; role 02 must then not run under some other tag.
+      - _ssh_role_runs | default(false) | bool
+    fail_msg: >-
+      Role 02 needs its preflight, and the role must be tagged "ssh". site.yml
+      runs the preflight in pre_tasks (import_role name=02-ssh-hardening
+      tasks_from=preflight, tags always) and tags role 02 "ssh". Do the same in
+      any other playbook that uses role 02. Nothing has been changed.
 
-- name: Harden sshd_config
-  ansible.builtin.template:
-    src: sshd_config.j2
-    dest: /etc/ssh/sshd_config
-    mode: "0600"
-    validate: "sshd -t -f %s"
-  notify: restart sshd
+- name: "SSH: apply the SSH settings"
+  when: _ssh_enabled | bool
+  block:
+    # --- 1. fail2ban exception (remote mode, runtime only) ----------------
+    # Failed tests must never get the controller banned: a ban would also
+    # cut the connection the undo needs. It is removed in `always` below
+    # and by the guard's undo. While it is in place, the address is kept in
+    # _ssh_f2b_marker (/run, root only): a run stopped before `always` (Ctrl-C,
+    # a crash, a lost connection before the undo was armed) leaves the
+    # exception behind, and the next run removes it here, on the host. The
+    # recorded address never comes back into Ansible. An address that also
+    # appears in fail2ban's own config files is left alone.
+    - name: "SSH 1: remove a fail2ban exception left by an interrupted run"
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - |
+            m=$1
+            [ -f "$m" ] || exit 0
+            ip=$(head -n 1 -- "$m")
+            case $ip in
+              '' | *[!0-9A-Fa-f.:]*) rm -f -- "$m"; exit 0 ;;
+            esac
+            if grep -rqswF -e "$ip" -- /etc/fail2ban/jail.local /etc/fail2ban/jail.d 2>/dev/null; then
+              rm -f -- "$m"; exit 0
+            fi
+            if fail2ban-client set sshd delignoreip "$ip" >/dev/null 2>&1; then echo removed; fi
+            rm -f -- "$m"
+          - sh
+          - "{{ _ssh_f2b_marker }}"
+      register: _ssh_f2b_stale
+      changed_when: "'removed' in _ssh_f2b_stale.stdout"
+      check_mode: false
+
+    - name: "SSH 1: is fail2ban's sshd jail running, and what does it ignore?"
+      when:
+        - not (_ssh_local_mode | bool)
+        - _ssh_controller_ip | length > 0
+      ansible.builtin.command:
+        argv: [fail2ban-client, get, sshd, ignoreip]
+      register: _ssh_f2b_get
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "SSH 1: let fail2ban ignore this controller during the run"
+      when:
+        - _ssh_f2b_get is not skipped
+        - _ssh_f2b_get.rc == 0
+        - _ssh_f2b_get.stdout_lines | select('search', '(^|\s)' ~ (_ssh_controller_ip | regex_escape) ~ '$') | list | length == 0
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - |
+            umask 077
+            mkdir -p -- "${2%/*}" && printf '%s\n' "$1" > "$2"
+            fail2ban-client set sshd addignoreip "$1" && exit 0
+            rc=$?
+            rm -f -- "$2"
+            exit "$rc"
+          - sh
+          - "{{ _ssh_controller_ip }}"
+          - "{{ _ssh_f2b_marker }}"
+      register: _ssh_f2b_add
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "SSH 1: remember whether this run added the exception"
+      ansible.builtin.set_fact:
+        _ssh_f2b_added: "{{ _ssh_f2b_add is not skipped and (_ssh_f2b_add.rc | default(1)) == 0 }}"
+
+    - name: "SSH 1: warn when the exception could not be added"
+      when:
+        - _ssh_f2b_add is not skipped
+        - (_ssh_f2b_add.rc | default(1)) != 0
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: could not add {{ _ssh_controller_ip }} to fail2ban's sshd ignore list
+          ({{ _ssh_f2b_add.stderr | default('') | trim }}). The run continues; failed login
+          tests may count towards a ban.
+
+    # --- 2. Keys: add only ------------------------------------------------
+    - name: "SSH 2: keys this run makes sure are present"
+      ansible.builtin.set_fact:
+        _ssh_key_plan: >-
+          {{ ((([_ssh_admin] * (_ssh_admin_keys | length)) | zip(_ssh_admin_keys) | list)
+              + (([deploy_user] * (_ssh_deploy_keys | length)) | zip(_ssh_deploy_keys) | list))
+             | map('list') | unique | list }}
+
+    # A key counts as present when its base64 data is anywhere in the file,
+    # whatever the options or comment on that line: such lines are left
+    # alone. rc 0 present, 1 missing, 3 no such account, 4 ~/.ssh or
+    # authorized_keys is a symlink or not a plain file/folder (left alone:
+    # root must not write through a link the account controls).
+    - name: "SSH 2: is each key already in the account's authorized_keys?"
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - |
+            h=$(getent passwd "$1" | cut -d: -f6)
+            [ -n "$h" ] || exit 3
+            d=$h/.ssh f=$h/.ssh/authorized_keys
+            if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then exit 4; fi
+            if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then exit 4; fi
+            [ -f "$f" ] || exit 1
+            grep -qF -e "$2" -- "$f"
+          - sh
+          - "{{ item.0 }}"
+          - "{{ item.1.split()[1] }}"
+      loop: "{{ _ssh_key_plan }}"
+      loop_control:
+        label: "{{ item.0 }}: {{ item.1 | truncate(50) }}"
+      register: _ssh_key_check
+      changed_when: false
+      failed_when: _ssh_key_check.rc not in [0, 1, 3, 4]
+      check_mode: false
+
+    - name: "SSH 2: the admin account must exist"
+      when: not ansible_check_mode
+      ansible.builtin.assert:
+        quiet: true
+        that: _ssh_admin not in _ssh_key_missing_users
+        fail_msg: >-
+          ssh_admin_user {{ _ssh_admin }} does not exist on {{ inventory_hostname }}. Role 01
+          creates deploy_user ({{ deploy_user }}) in a full run; create any other
+          ssh_admin_user yourself first. Nothing in sshd has been changed.
+      vars:
+        _ssh_key_missing_users: "{{ _ssh_key_check.results | selectattr('rc', 'equalto', 3) | map(attribute='item') | map('first') | unique | list }}"
+
+    - name: "SSH 2: deploy_user does not exist yet, so its key waits"
+      when:
+        - not ansible_check_mode
+        - deploy_user in _ssh_key_missing_users
+        - deploy_user != _ssh_admin
+      ansible.builtin.debug:
+        msg: >-
+          Note: {{ deploy_user }} does not exist on {{ inventory_hostname }} yet (role 01 creates
+          it in a full run), so its key from deploy_ssh_public_key/ssh_public_key_file is
+          added on a later run.
+      vars:
+        _ssh_key_missing_users: "{{ _ssh_key_check.results | selectattr('rc', 'equalto', 3) | map(attribute='item') | map('first') | unique | list }}"
+
+    # Appended with lineinfile, which writes every other line back byte for
+    # byte. (ansible.posix.authorized_key re-serialises the whole file and
+    # drops earlier lines whose key data repeats on a later line, such as
+    # the same key with two different from= options.) "~user" is expanded
+    # on the host by the module, so no host value is passed back in.
+    # Ownership and modes are what authorized_key set: ~/.ssh 0700, the
+    # file 0600, both owned by the account.
+    - name: "SSH 2: ~/.ssh exists for each account that gets a key"
+      when: item.rc == 1
+      ansible.builtin.file:
+        path: "~{{ item.item.0 }}/.ssh"
+        state: directory
+        owner: "{{ item.item.0 }}"
+        mode: "0700"
+      loop: "{{ _ssh_key_check.results }}"
+      loop_control:
+        label: "{{ item.item.0 }}"
+
+    - name: "SSH 2: append each missing key (existing lines are never removed or rewritten)"
+      when: item.rc == 1
+      ansible.builtin.lineinfile:
+        path: "~{{ item.item.0 }}/.ssh/authorized_keys"
+        line: "{{ item.item.1 }}"
+        create: true
+        owner: "{{ item.item.0 }}"
+        mode: "0600"
+      loop: "{{ _ssh_key_check.results }}"
+      loop_control:
+        label: "{{ item.item.0 }}: {{ item.item.1 | truncate(50) }}"
+
+    - name: "SSH 2: warn about key files that are links (left alone)"
+      when: _ssh_key_check.results | selectattr('rc', 'equalto', 4) | list | length > 0
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: not adding {{ _ssh_key_check.results | selectattr('rc', 'equalto', 4) | map(attribute='item') | map('join', ': ')
+          | map('truncate', 70) | list }}: that account's ~/.ssh or ~/.ssh/authorized_keys is a
+          symlink or not a plain file, and auto_sec does not write through it. Add the key by
+          hand if you need it.
+
+    - name: "SSH 2: keys that were already there (their lines are left exactly as they are)"
+      when: _ssh_key_check.results | selectattr('rc', 'equalto', 0) | list | length > 0
+      ansible.builtin.debug:
+        msg: "{{ _ssh_key_check.results | selectattr('rc', 'equalto', 0) | map(attribute='item') | map('join', ': ') | map('truncate', 70) | list }}"
+
+    - name: "SSH 2: keys for accounts that role 01 creates later in this run (check mode)"
+      when:
+        - ansible_check_mode
+        - _ssh_key_check.results | selectattr('rc', 'equalto', 3) | list | length > 0
+      ansible.builtin.debug:
+        msg: >-
+          Would add {{ _ssh_key_check.results | selectattr('rc', 'equalto', 3) | map(attribute='item') | map('join', ': ') | map('truncate', 70) | list }}
+          once the account exists.
+
+    - name: "SSH 2: does this run add a key for the admin account?"
+      ansible.builtin.set_fact:
+        _ssh_admin_key_new: >-
+          {{ _ssh_key_check.results | selectattr('rc', 'in', [1, 3]) | map(attribute='item') | map('first')
+             | select('equalto', _ssh_admin) | list | length > 0 }}
+        _ssh_strict: "{{ (_ssh_needs_write | bool) and (_ssh_login_critical_change | bool) }}"
+        _ssh_pin: "{{ (ansible_ssh_private_key_file | default(ansible_private_key_file | default(''))) | string | length > 0 }}"
+
+    # --- 3. Key login test BEFORE the change (remote mode) ----------------
+    - name: "SSH 3: key test skipped in check mode (the key would be added first)"
+      when:
+        - not (_ssh_local_mode | bool)
+        - ansible_check_mode
+        - _ssh_admin_key_new | bool
+      ansible.builtin.debug:
+        msg: >-
+          Check mode: the key for {{ _ssh_admin }} is not on {{ inventory_hostname }} yet, so
+          the key login test is skipped. A real run adds the key first, then tests it.
+
+    - name: "SSH 3: key login test before the change, as Ansible connects"
+      when:
+        - not (_ssh_local_mode | bool)
+        - not (ansible_check_mode and (_ssh_admin_key_new | bool))
+      ansible.builtin.include_tasks:
+        file: prove.yml
+      vars:
+        _ssh_prove_mode: ansible
+        _ssh_prove_label: before the change, as Ansible connects
+
+    - name: "SSH 3: remember the result, as Ansible connects"
+      when:
+        - not (_ssh_local_mode | bool)
+        - not (ansible_check_mode and (_ssh_admin_key_new | bool))
+      ansible.builtin.set_fact:
+        _ssh_pre_ok: "{{ _ssh_prove_ok | bool }}"
+        _ssh_pre_msg: "{{ _ssh_prove_msg }}"
+
+    - name: "SSH 3: key login test before the change, inventory key only"
+      when:
+        - not (_ssh_local_mode | bool)
+        - not (ansible_check_mode and (_ssh_admin_key_new | bool))
+        - _ssh_strict | bool
+        - _ssh_pin | bool
+      ansible.builtin.include_tasks:
+        file: prove.yml
+      vars:
+        _ssh_prove_mode: pinned
+        _ssh_prove_label: before the change, inventory key only
+
+    - name: "SSH 3: remember the result, inventory key only"
+      when:
+        - not (_ssh_local_mode | bool)
+        - not (ansible_check_mode and (_ssh_admin_key_new | bool))
+        - _ssh_strict | bool
+        - _ssh_pin | bool
+      ansible.builtin.set_fact:
+        _ssh_pre_ok: "{{ (_ssh_pre_ok | bool) and (_ssh_prove_ok | bool) }}"
+        _ssh_pre_msg: "{{ (_ssh_pre_msg ~ ' ' ~ _ssh_prove_msg) | trim }}"
+
+    - name: "SSH 3: stricter login settings need a working key first"
+      when:
+        - not (_ssh_local_mode | bool)
+        - not (ansible_check_mode and (_ssh_admin_key_new | bool))
+        - _ssh_strict | bool
+      ansible.builtin.assert:
+        quiet: true
+        that: _ssh_pre_ok | bool
+        fail_msg: >-
+          A new key-only SSH login as {{ _ssh_admin }} to {{ inventory_hostname }} failed
+          ({{ _ssh_pre_msg }}). auto_sec changes no login setting until that works. Check
+          ssh_admin_public_keys, the private key the inventory uses
+          (ansible_ssh_private_key_file, kept in WSL ~/.ssh), and{{ ' passwordless sudo for ' ~ _ssh_admin if _ssh_admin != 'root' else '' }}
+          ~/.ssh/authorized_keys on the server. Nothing in sshd has been changed.
+
+    - name: "SSH 3: warn when the key does not work yet"
+      when:
+        - not (_ssh_local_mode | bool)
+        - not (ansible_check_mode and (_ssh_admin_key_new | bool))
+        - not (_ssh_strict | bool)
+        - not (_ssh_pre_ok | bool)
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: a new key-only SSH login as {{ _ssh_admin }} does not work yet
+          ({{ _ssh_pre_msg }}). Nothing stricter is applied in this run, so the run
+          continues and password login is untouched. Fix the key before you tighten logins.
+
+    # --- 4. Check mode: show the file this run would write ----------------
+    - name: "SSH 4: the 00-autosec.conf a real run would write (check mode, --diff shows it)"
+      when:
+        - ansible_check_mode
+        - _ssh_needs_write | bool
+      ansible.builtin.template:
+        src: 00-autosec.conf.j2
+        dest: "{{ _ssh_dropin }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    # --- 5-6. The change, under the automatic undo ------------------------
+    - name: "SSH 5-6: change sshd under the automatic undo"
+      when:
+        - _ssh_needs_write | bool
+        - not ansible_check_mode
+      block:
+        - name: "SSH 5: still no undo pending, and sshd still runs the files on disk"
+          ansible.builtin.include_tasks:
+            file: guard.yml
+          vars:
+            _ssh_guard_action: fresh
+
+        - name: "SSH 5: install the automatic undo"
+          ansible.builtin.include_tasks:
+            file: guard.yml
+          vars:
+            _ssh_guard_action: install
+
+        - name: "SSH 5: name this change"
+          ansible.builtin.set_fact:
+            _ssh_guard_id: "autosec-{{ '%012x' | format(281474976710655 | random) }}"
+            _ssh_guard_paths: "{{ [_ssh_dropin] + (['/etc/ssh/sshd_config'] if _ssh_migrate_kind != 'none' else []) }}"
+
+        - name: "SSH 5: arm the automatic undo"
+          ansible.builtin.include_tasks:
+            file: guard.yml
+          vars:
+            _ssh_guard_action: arm
+            _ssh_guard_f2b_ip: "{{ _ssh_controller_ip if (_ssh_f2b_added | default(false) | bool) else '' }}"
+
+        - name: "SSH 6: write, check, load and test (undone on any failure)"
+          block:
+            - name: "SSH 6a: the undo is still armed by this run"
+              ansible.builtin.include_tasks:
+                file: guard.yml
+              vars:
+                _ssh_guard_action: check
+
+            - name: "SSH 6b: migration, put back the distro's stock sshd_config"
+              when: _ssh_migrate_kind == 'stock'
+              ansible.builtin.copy:
+                src: /usr/share/openssh/sshd_config
+                dest: /etc/ssh/sshd_config
+                remote_src: true
+                owner: root
+                group: root
+                mode: "0644"
+
+            - name: "SSH 6b: migration, make sshd_config read sshd_config.d (Include as line 1)"
+              when: _ssh_migrate_kind == 'include'
+              ansible.builtin.lineinfile:
+                path: /etc/ssh/sshd_config
+                line: Include /etc/ssh/sshd_config.d/*.conf
+                insertbefore: BOF
+                firstmatch: true
+
+            # No `validate: sshd -t -f %s`: on that file alone sshd finds no
+            # host key on hosts whose HostKey lines point elsewhere, so it
+            # would always fail there. The trial run (P8) already checked
+            # this exact content inside the whole config, and 6d checks the
+            # live merged config, inside this block.
+            - name: "SSH 6c: write 00-autosec.conf"
+              ansible.builtin.template:
+                src: 00-autosec.conf.j2
+                dest: "{{ _ssh_dropin }}"
+                owner: root
+                group: root
+                mode: "0600"
+
+            - name: "SSH 6d: sshd -t on the whole config"
+              ansible.builtin.command:
+                argv: [/usr/sbin/sshd, -t]
+              changed_when: false
+
+            - name: "SSH 6e: settings sshd will use, for the admin account"
+              ansible.builtin.command:
+                argv: [/usr/sbin/sshd, -T, -C, "user={{ _ssh_admin }},host=autosec-check,addr={{ _ssh_c_addr }},lport={{ ssh_port | int }}"]
+              register: _ssh_live_admin
+              changed_when: false
+              vars:
+                _ssh_c_addr: "{{ _ssh_controller_ip | default('', true) or _ssh_placeholder_addr }}"
+
+            - name: "SSH 6e: settings sshd will use, for root"
+              ansible.builtin.command:
+                argv: [/usr/sbin/sshd, -T, -C, "user=root,host=autosec-check,addr={{ _ssh_c_addr }},lport={{ ssh_port | int }}"]
+              register: _ssh_live_root
+              changed_when: false
+              vars:
+                _ssh_c_addr: "{{ _ssh_controller_ip | default('', true) or _ssh_placeholder_addr }}"
+
+            - name: "SSH 6e: the live result must equal the trial run"
+              ansible.builtin.assert:
+                quiet: true
+                that: _ssh_live == _ssh_sim_after
+                fail_msg: >-
+                  The files now on disk give different settings than the trial run:
+                  {{ (((_ssh_live.admin | dict2items) | symmetric_difference(_ssh_sim_after.admin | dict2items))
+                      + ((_ssh_live.root | dict2items) | symmetric_difference(_ssh_sim_after.root | dict2items)))
+                     | map(attribute='key') | unique | list }}. Something changed the SSH files
+                  or the openssh package during this run.
+              vars:
+                _ssh_kv_admin_lines: "{{ _ssh_live_admin.stdout_lines }}"
+                _ssh_kv_root_lines: "{{ _ssh_live_root.stdout_lines }}"
+                _ssh_live: "{{ _ssh_kv_pair }}"
+
+            - name: "SSH 6f: the undo is still armed by this run"
+              ansible.builtin.include_tasks:
+                file: guard.yml
+              vars:
+                _ssh_guard_action: check
+
+            - name: "SSH 6f: is ssh.service running?"
+              ansible.builtin.command:
+                argv: [systemctl, is-active, ssh.service]
+              register: _ssh_load_state
+              changed_when: false
+              failed_when: false
+
+            # Runs `sshd -t`, then SIGHUP: same process, open sessions stay.
+            # With ssh.service not running (per-connection sockets) it does
+            # nothing, and the next connection reads the new files.
+            - name: "SSH 6f: load the new settings now"
+              ansible.builtin.command:
+                argv: [systemctl, try-reload-or-restart, ssh.service]
+              changed_when: true
+
+            - name: "SSH 6g: sshd logged that it loaded the new settings"
+              when: _ssh_load_state.stdout | trim == 'active'
+              ansible.builtin.command:
+                argv:
+                  - sh
+                  - -c
+                  - |
+                    w=$(stat -c %Z -- "$1") || exit 2
+                    s=$(systemctl show -p ExecMainStartTimestamp --timestamp=unix --value ssh.service 2>/dev/null) || s=
+                    s=${s#@}
+                    case "$s" in ''|*[!0-9]*) s=0 ;; esac
+                    [ "$s" -ge "$w" ] && exit 0
+                    journalctl -u ssh.service -o short-unix --no-pager --since "@$w" 2>/dev/null \
+                      | grep -qF 'Received SIGHUP; restarting.'
+                  - sh
+                  - "{{ _ssh_dropin }}"
+              register: _ssh_loaded
+              until: _ssh_loaded.rc == 0
+              retries: 4
+              delay: 2
+              changed_when: false
+
+            - name: "SSH 6h: key login test after the change, as Ansible connects"
+              when:
+                - not (_ssh_local_mode | bool)
+                - _ssh_login_critical_change | bool
+              ansible.builtin.include_tasks:
+                file: prove.yml
+              vars:
+                _ssh_prove_mode: ansible
+                _ssh_prove_label: after the change, as Ansible connects
+
+            - name: "SSH 6h: second try, as Ansible connects"
+              when:
+                - not (_ssh_local_mode | bool)
+                - _ssh_login_critical_change | bool
+                - not (_ssh_prove_ok | bool)
+              ansible.builtin.include_tasks:
+                file: prove.yml
+              vars:
+                _ssh_prove_mode: ansible
+                _ssh_prove_label: after the change, as Ansible connects, second try
+                _ssh_prove_delay: 10
+
+            - name: "SSH 6h: the admin account still logs in, as Ansible connects"
+              when:
+                - not (_ssh_local_mode | bool)
+                - _ssh_login_critical_change | bool
+              ansible.builtin.assert:
+                quiet: true
+                that: _ssh_prove_ok | bool
+                fail_msg: "A new key-only login as {{ _ssh_admin }} failed after the change: {{ _ssh_prove_msg }}"
+
+            - name: "SSH 6h: key login test after the change, inventory key only"
+              when:
+                - not (_ssh_local_mode | bool)
+                - _ssh_login_critical_change | bool
+                - _ssh_pin | bool
+              ansible.builtin.include_tasks:
+                file: prove.yml
+              vars:
+                _ssh_prove_mode: pinned
+                _ssh_prove_label: after the change, inventory key only
+
+            - name: "SSH 6h: second try, inventory key only"
+              when:
+                - not (_ssh_local_mode | bool)
+                - _ssh_login_critical_change | bool
+                - _ssh_pin | bool
+                - not (_ssh_prove_ok | bool)
+              ansible.builtin.include_tasks:
+                file: prove.yml
+              vars:
+                _ssh_prove_mode: pinned
+                _ssh_prove_label: after the change, inventory key only, second try
+                _ssh_prove_delay: 10
+
+            - name: "SSH 6h: the inventory key still logs in"
+              when:
+                - not (_ssh_local_mode | bool)
+                - _ssh_login_critical_change | bool
+                - _ssh_pin | bool
+              ansible.builtin.assert:
+                quiet: true
+                that: _ssh_prove_ok | bool
+                fail_msg: "A new login with only the inventory key failed after the change: {{ _ssh_prove_msg }}"
+
+            - name: "SSH 6h: new login after the change, the way this run logs in"
+              when:
+                - not (_ssh_local_mode | bool)
+                - not (_ssh_login_critical_change | bool)
+              ansible.builtin.include_tasks:
+                file: prove.yml
+              vars:
+                _ssh_prove_mode: normal
+                _ssh_prove_label: after the change, as this run logs in
+
+            - name: "SSH 6h: second try, the way this run logs in"
+              when:
+                - not (_ssh_local_mode | bool)
+                - not (_ssh_login_critical_change | bool)
+                - not (_ssh_prove_ok | bool)
+              ansible.builtin.include_tasks:
+                file: prove.yml
+              vars:
+                _ssh_prove_mode: normal
+                _ssh_prove_label: after the change, as this run logs in, second try
+                _ssh_prove_delay: 10
+
+            - name: "SSH 6h: this run's own login still works"
+              when:
+                - not (_ssh_local_mode | bool)
+                - not (_ssh_login_critical_change | bool)
+              ansible.builtin.assert:
+                quiet: true
+                that: _ssh_prove_ok | bool
+                fail_msg: "A new login the way this run logs in failed after the change: {{ _ssh_prove_msg }}"
+
+            - name: "SSH 6i: keep the change"
+              ansible.builtin.include_tasks:
+                file: guard.yml
+              vars:
+                _ssh_guard_action: disarm
+
+          rescue:
+            - name: "SSH 6: put the previous SSH files back now"
+              ansible.builtin.include_tasks:
+                file: guard.yml
+              vars:
+                _ssh_guard_action: revert
+
+            - name: "SSH 6: stop this host"
+              ansible.builtin.fail:
+                msg: >-
+                  SSH change undone on {{ inventory_hostname }}. Failed step:
+                  {{ ansible_failed_task.name | default('?') }}. Reason:
+                  {{ ((ansible_failed_result.msg | default('')) ~ ' ' ~ (ansible_failed_result.stderr | default('')))
+                     | string | regex_replace('[{}]', '?') | regex_replace('\s+', ' ') | trim | truncate(500) }}.
+                  {% if (_ssh_guard_revert_rc | default(-1) | int) == 0 %}Restored the SSH files as they
+                  were before this run and reloaded sshd. Those files were the live config when
+                  this run started (checked by preflight).
+                  {% else %}The undo reported rc {{ _ssh_guard_revert_rc | default('?') }}
+                  ({{ _ssh_guard_revert_err | default('') }}). Check from the provider console
+                  with `sudo auto-sec-ssh-guard status`: if line 1 still says "pending", its
+                  timer undoes the change at the deadline; otherwise look at the files it
+                  lists as left in place, and at `sshd -t`, by hand.
+                  {% endif %}No later role ran on this host.
+
+  always:
+    # The record goes only once the exception is gone; otherwise the next
+    # run retries.
+    - name: "SSH: remove this run's fail2ban exception"
+      when: _ssh_f2b_added | default(false) | bool
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - fail2ban-client set sshd delignoreip "$1" && rm -f -- "$2"
+          - sh
+          - "{{ _ssh_controller_ip }}"
+          - "{{ _ssh_f2b_marker }}"
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+# --- 8. After -----------------------------------------------------------------
+
+- name: "SSH 8: settings sshd uses after this run, for the admin account"
+  when: _ssh_enabled | bool
+  ansible.builtin.command:
+    argv: [/usr/sbin/sshd, -T, -C, "user={{ _ssh_admin }},host=autosec-check,addr={{ _ssh_c_addr }},lport={{ ssh_port | int }}"]
+  register: _ssh_final_admin
+  changed_when: false
+  check_mode: false
+  vars:
+    _ssh_c_addr: "{{ _ssh_controller_ip | default('', true) or _ssh_placeholder_addr }}"
+
+- name: "SSH 8: settings sshd uses after this run, for root"
+  when: _ssh_enabled | bool
+  ansible.builtin.command:
+    argv: [/usr/sbin/sshd, -T, -C, "user=root,host=autosec-check,addr={{ _ssh_c_addr }},lport={{ ssh_port | int }}"]
+  register: _ssh_final_root
+  changed_when: false
+  check_mode: false
+  vars:
+    _ssh_c_addr: "{{ _ssh_controller_ip | default('', true) or _ssh_placeholder_addr }}"
+
+- name: "SSH 8: remember the effective settings"
+  when: _ssh_enabled | bool
+  ansible.builtin.set_fact:
+    _ssh_after: "{{ _ssh_kv_pair }}"
+    _ssh_hardened: >-
+      {{ (_ssh_kv_pair.root.permitrootlogin | default('yes')) != 'yes'
+         and (_ssh_kv_pair.admin.passwordauthentication | default('yes')) == 'no'
+         and (_ssh_kv_pair.root.passwordauthentication | default('yes')) == 'no' }}
+  vars:
+    _ssh_kv_admin_lines: "{{ _ssh_final_admin.stdout_lines }}"
+    _ssh_kv_root_lines: "{{ _ssh_final_root.stdout_lines }}"
+
+- name: "SSH 8: login settings in effect"
+  when: _ssh_enabled | bool
+  ansible.builtin.debug:
+    msg: >-
+      {{ _ssh_after.root | dict2items | selectattr('key', 'in', _ssh_show) | items2dict }}
+  vars:
+    _ssh_show: [port, permitrootlogin, passwordauthentication, pubkeyauthentication, kbdinteractiveauthentication,
+                allowusers, maxauthtries, logingracetime, x11forwarding, allowagentforwarding, allowtcpforwarding]
+
+- name: "SSH 8: say so when SSH login is not hardened"
+  when:
+    - _ssh_enabled | bool
+    - not (_ssh_hardened | bool)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: SSH login NOT hardened on {{ inventory_hostname }}: permitrootlogin
+      {{ _ssh_after.root.permitrootlogin | default('?') }}, passwordauthentication
+      {{ _ssh_after.admin.passwordauthentication | default('?') }}.
+      {{ _ssh_deferred_reason if (_ssh_deferred | bool) else 'This follows your choices (keep leaves the server as it is).' }}

@@ -14,21 +14,9 @@
   # --- Preflight: fail BEFORE any change if required vars are missing, so
   #     the server is never left half-hardened (SSH locked, run aborted).
   #     This block is also the single source of truth for "required vars".
+  #     SSH variables (login choices, keys, ssh_extra_settings) and the live
+  #     SSH setup are checked by role 02's preflight, imported at the end.
   pre_tasks:
-    - name: "Preflight: an SSH public key for the deploy user is required"
-      tags: [always]
-      ansible.builtin.assert:
-        quiet: true
-        that:
-          - >-
-            (deploy_ssh_public_key is defined and deploy_ssh_public_key | length > 0)
-            or (ssh_public_key_file is defined)
-        fail_msg: >-
-          Set deploy_ssh_public_key (the public key string) OR
-          ssh_public_key_file (a path to a .pub file) in host_vars, so the
-          deploy user can log in. Aborting BEFORE any change so the server
-          is never left half-hardened.
-
     - name: "Preflight: variables required by the features you enabled"
       tags: [always]
       ansible.builtin.assert:
@@ -96,13 +84,13 @@
           # the hostname module, so it must be a plain hostname-like label.
           - inventory_hostname is match('^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$')
           - inventory_hostname is not search('\.\.')
-          # Reaches sshd_config, audit rules and /home/<user> paths.
+          # Reaches sudoers, audit rules and /home/<user> paths.
           - deploy_user is match('^[a-z_][a-z0-9_-]{0,31}$')
-          # Reaches sshd_config, ufw and fwknop access.conf.
+          # Reaches ufw, jail.local and fwknop access.conf. It must be the
+          # port sshd already listens on (role 02's preflight checks that);
+          # auto_sec never moves sshd.
           - ssh_port | string is match('^[0-9]{1,5}$')
           - (ssh_port | int) > 0 and (ssh_port | int) < 65536
-          - ssh_max_auth_tries | string is match('^[0-9]{1,2}$')
-          - (ssh_max_auth_tries | int) > 0 and (ssh_max_auth_tries | int) <= 10
           # Reaches `tar -C`, pm2 --hp, the file module and the canary.
           # Must be absolute, traversal-free, and never '/'.
           - app_dir is match('^/[A-Za-z0-9._/-]+$')
@@ -191,6 +179,74 @@
           An alerting or detector value has an unsafe shape (see the failed
           assertion). Nothing has been changed on the server.
 
+    # Any other value (a typo, "High") used to skip the SSH firewall rule
+    # and fwknop alike.
+    - name: "Preflight: paranoia_level must be standard or high"
+      tags: [always]
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - paranoia_level in ['standard', 'high']
+        fail_msg: >-
+          paranoia_level is "{{ paranoia_level }}". Set it to "standard" or
+          "high" (lowercase) in host_vars. Nothing has been changed on the
+          server.
+
+    # Lands in jail.local (an INI file) next to office_static_ip, so every
+    # entry must be a plain IPv4/IPv6 address or CIDR range. Hostnames are
+    # refused: fail2ban would resolve them through DNS on every check.
+    # Same pattern as role 02's preflight (_ssh_cidr_re); keep them equal.
+    - name: "Preflight: fail2ban_ignore_ips must be a list of IP addresses"
+      tags: [always]
+      vars:
+        _f2b_ips: "{{ fail2ban_ignore_ips | default([]) }}"
+        _ip_or_cidr: >-
+          ^(((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(/(3[0-2]|[12]?[0-9]))?|(?=[0-9A-Fa-f:]*:)[0-9A-Fa-f:]{2,39}(/(12[0-8]|1[01][0-9]|[1-9]?[0-9]))?)$
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _f2b_ips is sequence
+          - _f2b_ips is not string
+          - _f2b_ips is not mapping
+          - _f2b_ips | map('string') | reject('match', _ip_or_cidr) | list | length == 0
+        fail_msg: >-
+          fail2ban_ignore_ips must be a list of IP addresses or CIDR ranges,
+          for example ["203.0.113.7", "198.51.100.0/24"]. Got: {{ _f2b_ips }}.
+          Nothing has been changed on the server.
+
+    # The break-glass address must be where YOU connect from. The server's
+    # own address there (the old wizard default in local mode) opens nothing
+    # for you. Host facts are used only to refuse, never as a value.
+    - name: "Preflight: office_static_ip must not be one of the server's own addresses"
+      tags: [always]
+      vars:
+        _office_addr: "{{ office_static_ip | default('') | string | regex_replace('/[0-9]+$', '') | lower }}"
+        _own_addrs: >-
+          {{ ((ansible_facts['all_ipv4_addresses'] | default([]))
+              + (ansible_facts['all_ipv6_addresses'] | default([]))
+              + ['127.0.0.1', '::1', ansible_host | default('') | string])
+             | map('lower') | list }}
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _office_addr | length == 0 or _office_addr not in _own_addrs
+        fail_msg: >-
+          office_static_ip ({{ office_static_ip | default('') }}) is an address of this
+          server itself. Set it to the fixed IP of the place you connect
+          FROM (your office or home), or to "" to turn break-glass off.
+          Nothing has been changed on the server.
+
+    # --- SSH preflight (role 02) -------------------------------------------
+    # Read-only checks of every SSH variable and of the live SSH setup
+    # (config, port, socket, pending undo), before role 01 or anything else
+    # changes the server. Tagged always, so `--tags firewall` still gets the
+    # port checks that protect role 03. Also runs in --check.
+    - name: "Preflight: SSH checks (read-only)"
+      ansible.builtin.import_role:
+        name: 02-ssh-hardening
+        tasks_from: preflight
+      tags: [always]
+
   # --- Core hardening: always applied.
   roles:
     - { role: 01-base, tags: ["base"] }
@@ -200,7 +256,7 @@
   # --- Optional + detection layers: loaded dynamically so parse-time
   #     module resolution in an optional role can't break the core run.
   tasks:
-    - name: "Layer 04: Single Packet Authorization (invisible SSH)"
+    - name: "Layer 04: Single Packet Authorization (fwknop)"
       ansible.builtin.include_role:
         name: 04-fwknop
         apply: { tags: ["fwknop"] }

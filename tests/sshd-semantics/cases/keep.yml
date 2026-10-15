@@ -1,0 +1,8 @@
+---
+# Stage 1: change nothing about logins. Must render comments only.
+deploy_user: deploy
+ssh_admin_user: deploy
+ssh_permit_root_login: keep
+ssh_password_authentication: keep
+ssh_allow_users: []
+ssh_extra_settings: {}

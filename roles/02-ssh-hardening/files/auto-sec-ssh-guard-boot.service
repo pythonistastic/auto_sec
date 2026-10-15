@@ -1,0 +1,21 @@
+# Installed by auto_sec role 02-ssh-hardening. Enabled through a
+# sysinit.target.wants/ symlink, so no daemon-reload is needed.
+#
+# A reboot inside the undo window loses the transient revert timer (it
+# lives in /run). This unit puts the previous SSH files back early in the
+# next boot, before sshd starts, so sshd starts with the config that was
+# live before the unconfirmed change. Files only: no reload is needed.
+# It does nothing unless a change is still pending.
+[Unit]
+Description=auto_sec: undo an unconfirmed SSH config change after a reboot
+DefaultDependencies=no
+After=local-fs.target
+Before=ssh.socket ssh.service sysinit.target
+ConditionPathExists=/var/lib/auto-sec/ssh-guard/pending
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/auto-sec-ssh-guard revert --boot
+
+[Install]
+WantedBy=sysinit.target

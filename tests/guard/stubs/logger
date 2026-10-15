@@ -1,0 +1,5 @@
+#!/bin/sh
+# Test stub for logger: appends "<epoch> <args>" to ../log (the test's journal).
+d=$(dirname "$(dirname "$(readlink -f "$0")")")
+echo "$(date +%s) $*" >> "$d/log"
+exit 0

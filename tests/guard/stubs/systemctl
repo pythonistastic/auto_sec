@@ -1,0 +1,14 @@
+#!/bin/sh
+# Test stub for systemctl. Calls about the guard's own transient units go to
+# the real systemctl (user or system manager, see ../scope), so the timers
+# are real. Anything else (the sshd reload) is only logged and answered
+# with the code stored in ../reload_rc.
+d=$(dirname "$(dirname "$(readlink -f "$0")")")
+echo "$(date +%s) systemctl $*" >> "$d/calls"
+case "$*" in
+  *auto-sec-ssh-guard-*)
+    real=$(cat "$d/real_systemctl")
+    if [ "$(cat "$d/scope")" = user ]; then exec "$real" --user "$@"; fi
+    exec "$real" "$@" ;;
+esac
+exit "$(cat "$d/reload_rc")"

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Test stub for sshd. "sshd -t" exits with the code stored in ../sshd_t_rc,
+# so a test can make the config look valid or broken at any moment.
+d=$(dirname "$(dirname "$(readlink -f "$0")")")
+echo "$(date +%s) sshd $*" >> "$d/calls"
+if [ "${1:-}" = -t ]; then
+  rc=$(cat "$d/sshd_t_rc")
+  [ "$rc" = 0 ] || echo "stub: config broken (sshd_t_rc=$rc)" >&2
+  exit "$rc"
+fi
+exit 0

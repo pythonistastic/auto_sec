@@ -1,0 +1,8 @@
+---
+# Logins kept; an AllowUsers list.
+deploy_user: deploy
+ssh_admin_user: deploy
+ssh_permit_root_login: keep
+ssh_password_authentication: keep
+ssh_allow_users: [deploy]
+ssh_extra_settings: {}

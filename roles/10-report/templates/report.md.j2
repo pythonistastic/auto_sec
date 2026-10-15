@@ -1,3 +1,33 @@
+{#- SSH lines show EFFECTIVE values (sshd -T), never intent:
+    _ssh_after   live values: role 02's preflight sets it to the values at
+                 the start of the run, role 02 main updates it at its end;
+    _ssh_before  preflight's view, used if _ssh_after is empty;
+    neither      (preflight skipped): no SSH claim is made.
+    Each is {admin: {...}, root: {...}} keyed by lowercase sshd -T keyword;
+    a value may be a string or a list (keywords sshd prints more than once).
+    "Hardened" uses the same rule as role 02's _ssh_hardened (root's
+    permitrootlogin is not "yes", passwordauthentication is "no" for both
+    the admin and root views), computed from the values shown, so the
+    verdict always matches the values printed, whichever of the two facts
+    they came from. -#}
+{%- macro _sshd(view, key) -%}
+{%- set _v = view[key] | default('') -%}
+{%- if _v is string or _v is not iterable -%}{{ _v | string | trim }}{%- else -%}{{ _v | map('string') | join(' ') | trim }}{%- endif -%}
+{%- endmacro -%}
+{%- set _sa = _ssh_after | default({}, true) -%}
+{%- set _sv = _sa if (_sa.admin | default({}, true) | length > 0) else (_ssh_before | default({}, true)) -%}
+{%- set _sv_admin = _sv.admin | default({}, true) -%}
+{%- set _sv_root = _sv.root | default(_sv_admin, true) -%}
+{%- set _prl = _sshd(_sv_root, 'permitrootlogin') | lower -%}
+{%- set _pwd = _sshd(_sv_admin, 'passwordauthentication') | lower -%}
+{%- set _pwd_root = _sshd(_sv_root, 'passwordauthentication') | lower -%}
+{%- set _kbd = _sshd(_sv_admin, 'kbdinteractiveauthentication') | lower -%}
+{%- set _pub = _sshd(_sv_admin, 'pubkeyauthentication') | lower -%}
+{%- set _users = _sshd(_sv_admin, 'allowusers').split() | join(', ') -%}
+{%- set _ssh_known = _prl | length > 0 and _pwd | length > 0 -%}
+{%- set _hard = _prl != 'yes' and _pwd == 'no' and _pwd_root == 'no' -%}
+{%- set _why = (['root can log in with a password'] if _prl == 'yes' else [])
+             + (['password login is enabled'] if (_pwd != 'no' or _pwd_root != 'no') else []) -%}
 # Server Security Report
 
 **Client:** {{ client_name }}
@@ -12,15 +42,45 @@
 
 - Operating system fully patched, automatic security updates enabled
   (nightly, reboot window 04:00 {{ timezone }} when required)
-- SSH: key-based authentication only, root login disabled,
-  password login disabled, access restricted to authorized users
-- Firewall: default deny on all inbound traffic, only web ports
-  (80/443) exposed
+{% if _ssh_known %}
+- SSH login (effective settings, read from the SSH server during this run):
+  - Root login: {{ {'yes': 'allowed, with a password or a key', 'prohibit-password': 'key only', 'without-password': 'key only', 'forced-commands-only': 'key only, fixed commands', 'no': 'disabled'}[_prl] | default(_prl) }}
+  - Password login: {{ 'enabled' if _pwd != 'no' else ('enabled for root only' if _pwd_root != 'no' else 'disabled') }}
+{% if _pwd == 'no' and _kbd == 'yes' %}
+  - Keyboard-interactive login: enabled (it may still ask for a password)
+{% endif %}
+  - Key login: {{ 'enabled' if _pub == 'yes' else 'disabled' }}
+  - Accounts allowed to log in: {{ ('only ' ~ _users) if _users | length > 0 else 'any account (no AllowUsers list)' }}
+{% if not _hard %}
+- **SSH login NOT hardened:** {{ _why | join(' and ') }}.
+{% if _ssh_deferred | default(false) | bool and _ssh_deferred_reason | default('') | length > 0 %}
+  Stricter settings were not applied in this run: {{ _ssh_deferred_reason | replace('\n', ' ') }}
+{% endif %}
+{% endif %}
+{% else %}
+- SSH login: settings were not checked in this run, so this report makes
+  no claim about them
+{% endif %}
+{% if not (ssh_hardening_enabled | default(true) | bool) %}
+- SSH login settings are not managed by auto_sec on this server
+  (ssh_hardening_enabled is false)
+{% endif %}
+{# The SSH firewall claim comes from `ufw status verbose` (role 10's own
+    task), not from intent: a host set up by 0.1-0.3 in high mode may
+    still have no SSH rule. #}
+{% set _ssh_fw_limit = (ufw_status.stdout | default('')) is search('(?m)^' ~ (ssh_port | int) ~ '/tcp +LIMIT IN ') %}
+- Firewall: default deny on all inbound traffic. Open ports: web
+  (80/443){% if _ssh_fw_limit %} and SSH (port {{ ssh_port | int }}, rate-limited){% else %}. No rate-limited
+  SSH rule for port {{ ssh_port | int }} was found (see the firewall status below){% endif %}
+
 - Intrusion throttling: fail2ban active with escalating ban times
 {% if paranoia_level == "high" %}
-- Single Packet Authorization (fwknop): the SSH port is invisible to
-  scanners and opens only for authorized, cryptographically verified
-  requests, for {{ fwknop_open_seconds }} seconds at a time
+- Single Packet Authorization (fwknop) is set up.{% if _ssh_fw_limit %} In this release SSH
+  is not hidden behind it: the SSH port stays reachable, rate-limited by
+  the firewall{% else %} No rate-limited SSH rule was found, so whether
+  the SSH port is reachable without a knock depends on the firewall rules
+  below{% endif %}
+
 {% endif %}
 - Web server hardened: TLS enforced (auto-renewing certificates),
   security headers active, version disclosure disabled

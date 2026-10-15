@@ -1,0 +1,8 @@
+---
+# Stage 2: exactly the two login choices change.
+deploy_user: deploy
+ssh_admin_user: deploy
+ssh_permit_root_login: prohibit-password
+ssh_password_authentication: "no"
+ssh_allow_users: []
+ssh_extra_settings: {}

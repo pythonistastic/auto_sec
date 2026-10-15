@@ -1,0 +1,520 @@
+#!/bin/bash
+#
+# auto-sec-ssh-guard - automatic undo for auto_sec SSH config changes.
+#
+# Installed by role 02-ssh-hardening as /usr/local/sbin/auto-sec-ssh-guard
+# (root, 0700). The play arms it before it writes SSH config files and
+# disarms it only after a fresh login worked. If the play never disarms
+# (lost connection, crash, failed login test), a systemd timer puts the
+# files back at an absolute deadline. After a reboot inside the window,
+# auto-sec-ssh-guard-boot.service puts them back before sshd starts.
+#
+#   arm <id> <deadline_epoch_utc> [--f2b-ignore <ip>] -- <path>...
+#                   Snapshot each path (or note that it is absent), then
+#                   start the revert timer. Refuses with 7 (another change
+#                   is pending), 8 (the CURRENT config fails sshd -t),
+#                   9 (deadline not within now+60s .. now+3600s), 2 (usage).
+#                   --f2b-ignore only records the controller address so a
+#                   revert can drop the play's runtime fail2ban ignore.
+#   check <id>      0 = armed by <id> and the timer is waiting.
+#                   3 = already reverted or deadline passed, 4 = not
+#                   pending, 6 = pending but the revert timer is not active.
+#                   Also records each path's current content as "written
+#                   by this run" when it differs from the snapshot.
+#   disarm <id>     0 = disarmed (the change stays), 3 = already reverted
+#                   or the deadline passed (a late disarm reverts first),
+#                   4 = nothing pending for <id>.
+#   revert <id>     Undo now (run by the timer, or by the play's rescue).
+#                   Reloads sshd only if sshd -t passes, and drops the
+#                   fail2ban ignore. 1 = some path was left in place or
+#                   sshd was not reloaded; 4 = another change is pending.
+#   revert --boot   Undo whatever is pending, files only: sshd is not
+#                   running yet, and the fail2ban ignore did not survive
+#                   the reboot.
+#   status          Line 1 is "idle" or "pending <id>"; details follow.
+#
+# A path is put back only if it still holds what this run wrote (as seen
+# by check) or is unchanged since arm. Any other content is left in place
+# and logged, so an old snapshot never overwrites later edits. When check
+# never saw this run's version of a changed path (the play stopped between
+# a write and its next check), revert assumes the run wrote it only until
+# GRACE seconds after the deadline.
+#
+# State lives in $STATE_DIR (root 0700): "pending" holds the armed id (the
+# boot unit's ConditionPathExists), run/ holds the snapshot, the deadline
+# and per-path hashes, reverted.<id> records a revert. Every subcommand
+# holds an flock on $STATE_DIR/.lock; exit 5 means the lock wait timed out.
+# Messages go to syslog/journal (tag auto-sec-ssh-guard) and to stderr.
+set -uo pipefail
+
+# --- paths (tests rewrite this block) ---
+readonly STATE_DIR=/var/lib/auto-sec/ssh-guard
+readonly SSHD=/usr/sbin/sshd
+readonly SYSTEMCTL=systemctl
+readonly SYSTEMD_RUN=systemd-run
+readonly F2B=fail2ban-client
+readonly LOGGER=logger
+# --- end paths ---
+
+readonly TAG=auto-sec-ssh-guard
+readonly UNIT_PREFIX=auto-sec-ssh-guard-
+readonly RUN="$STATE_DIR/run"
+readonly MIN_AHEAD=60      # earliest allowed deadline, seconds from now
+readonly MAX_AHEAD=3600    # latest allowed deadline, seconds from now
+readonly GRACE=300         # see the header: unseen writes count as ours
+readonly LOCK_WAIT=120
+readonly MAX_PATHS=16
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+LC_ALL=C    # plain ASCII ranges in the id/path patterns below
+export PATH LC_ALL
+umask 077
+SELF=$(readlink -f -- "$0")
+readonly SELF
+
+log()  { "$LOGGER" -t "$TAG" -- "$*" >/dev/null 2>&1 || true; printf '%s: %s\n' "$TAG" "$*" >&2; }
+warn() { "$LOGGER" -t "$TAG" -p user.err -- "$*" >/dev/null 2>&1 || true; printf '%s: %s\n' "$TAG" "$*" >&2; }
+
+usage() {
+  cat >&2 <<'EOF'
+usage: auto-sec-ssh-guard arm <id> <deadline_epoch_utc> [--f2b-ignore <ip>] -- <path>...
+       auto-sec-ssh-guard check <id>
+       auto-sec-ssh-guard disarm <id>
+       auto-sec-ssh-guard revert <id> | revert --boot
+       auto-sec-ssh-guard status
+EOF
+  exit "${1:-2}"
+}
+
+# ---------------------------------------------------------------- checks
+# Ids name a systemd unit and a state file. A leading "-" is refused so an
+# id can never be mistaken for an option such as --boot, and "boot" so the
+# timer's unit can never clash with auto-sec-ssh-guard-boot.service.
+valid_id() { [[ $1 =~ ^[A-Za-z0-9_-]{1,64}$ && $1 != -* && $1 != boot ]]; }
+
+valid_ipv4() {
+  local o
+  [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do (( 10#$o <= 255 )) || return 1; done
+}
+
+# Strict shapes only: the address ends up as an argument to fail2ban-client.
+valid_ip() {
+  valid_ipv4 "$1" && return 0
+  if [[ $1 =~ ^::[fF]{4}:(.+)$ ]]; then valid_ipv4 "${BASH_REMATCH[1]}"; return; fi
+  [[ ${#1} -le 39 && $1 =~ ^[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4}){2,7}$ ]]
+}
+
+# Absolute, plain characters, no empty, "." or ".." parts, no trailing "/".
+valid_path() {
+  [[ $1 =~ ^/[A-Za-z0-9._@+/-]+$ ]] || return 1
+  [[ $1 != */ && $1 != *//* && $1 != */./* && $1 != */../* && $1 != */. && $1 != */.. ]]
+}
+
+# ----------------------------------------------------------------- state
+now() { date +%s; }
+fmt_time() { date -u -d "@$1" '+%Y-%m-%d %H:%M:%S UTC'; }
+
+# "absent" or "sha256:<hex>". Fails when the path is not a plain file.
+state_of() {
+  local h
+  [ -L "$1" ] && return 1
+  if [ ! -e "$1" ]; then echo absent; return 0; fi
+  [ -f "$1" ] || return 1
+  h=$(sha256sum < "$1") || return 1
+  echo "sha256:${h%% *}"
+}
+
+pending_id() { cat -- "$STATE_DIR/pending" 2>/dev/null || true; }
+
+prepare() {
+  if ! { mkdir -p -- "$STATE_DIR" && chmod 0700 -- "$STATE_DIR"; }; then
+    warn "cannot create $STATE_DIR (run as root)"; exit 1
+  fi
+}
+
+take_lock() {
+  exec 9>"$STATE_DIR/.lock" || { warn "cannot open $STATE_DIR/.lock"; exit 1; }
+  flock -w "$LOCK_WAIT" 9 ||
+    { warn "another auto-sec-ssh-guard run held the lock for ${LOCK_WAIT}s: gave up"; exit 5; }
+}
+
+# The run/ snapshot must belong to the pending id.
+run_matches() {
+  [ -d "$RUN" ] && [ "$(cat -- "$RUN/id" 2>/dev/null)" = "$1" ] &&
+    [[ $(cat -- "$RUN/count" 2>/dev/null) =~ ^[1-9][0-9]?$ ]] &&
+    [[ $(cat -- "$RUN/deadline" 2>/dev/null) =~ ^[0-9]{1,12}$ ]]
+}
+
+# sshd -t needs its privilege separation directory, which is missing on
+# socket-activated hosts until ssh.service first ran.
+ensure_run_sshd() {
+  if [ "$(id -u)" -eq 0 ] && [ ! -d /run/sshd ]; then install -d -m 0755 /run/sshd; fi
+}
+
+sshd_test() {
+  local out
+  ensure_run_sshd
+  out=$("$SSHD" -t 2>&1) && return 0
+  warn "sshd -t: ${out:-failed}"
+  return 1
+}
+
+# Where a path stands: unchanged | ours | unseen | other.
+#   ours   = what check recorded as this run's write
+#   unseen = changed, but check never saw this run's version
+verdict() {  # <before> <written> <current>
+  if [ "$3" = "$1" ]; then echo unchanged
+  elif [ -n "$2" ] && [ "$3" = "$2" ]; then echo ours
+  elif [ -z "$2" ]; then echo unseen
+  else echo other
+  fi
+}
+
+short() { case $1 in sha256:*) echo "${1:0:19}" ;; *) echo "$1" ;; esac; }
+
+# ------------------------------------------------------------------- arm
+cmd_arm() {
+  local id deadline ip='' p q n t cal st
+  local -a paths=()
+  [ $# -ge 2 ] || usage
+  id=$1 deadline=$2
+  shift 2
+  valid_id "$id" || { warn "bad id: use 1-64 of A-Z a-z 0-9 _ - (no leading -, not 'boot')"; exit 2; }
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --f2b-ignore)
+        [ $# -ge 2 ] || usage
+        valid_ip "$2" || { warn "bad --f2b-ignore address"; exit 2; }
+        ip=$2; shift 2 ;;
+      --) shift; break ;;
+      *) warn "unexpected argument before --: $1"; exit 2 ;;
+    esac
+  done
+  [ $# -gt 0 ] || { warn "arm: no paths after --"; exit 2; }
+  [ $# -le "$MAX_PATHS" ] || { warn "arm: at most $MAX_PATHS paths"; exit 2; }
+  for p in "$@"; do
+    valid_path "$p" || { warn "arm: refusing path '$p' (absolute, plain characters, no . or .. parts)"; exit 2; }
+    for q in "${paths[@]}"; do
+      [ "$q" != "$p" ] || { warn "arm: path given twice: $p"; exit 2; }
+    done
+    paths+=("$p")
+  done
+  [[ $deadline =~ ^[0-9]{1,12}$ ]] || { warn "arm: deadline must be a UTC epoch in seconds"; exit 9; }
+
+  prepare
+  take_lock
+  t=$(now)
+  if (( 10#$deadline < t + MIN_AHEAD || 10#$deadline > t + MAX_AHEAD )); then
+    warn "arm: deadline $deadline is not between now+${MIN_AHEAD}s and now+${MAX_AHEAD}s (now $t)"
+    exit 9
+  fi
+  deadline=$(( 10#$deadline ))
+  if [ -e "$STATE_DIR/pending" ]; then
+    warn "another change ($(pending_id)) is still pending: refusing to arm. See: auto-sec-ssh-guard status"
+    exit 7
+  fi
+  sshd_test || { warn "the CURRENT config fails sshd -t: refusing to arm (the undo target must be valid)"; exit 8; }
+
+  # Build the snapshot beside the old one, then swap it in.
+  if ! { rm -rf -- "$RUN.new" && mkdir -- "$RUN.new"; }; then warn "arm: cannot create $RUN.new"; exit 1; fi
+  n=0
+  for p in "${paths[@]}"; do
+    n=$((n + 1))
+    mkdir -- "$RUN.new/$n" || { warn "arm: cannot write the snapshot"; exit 1; }
+    printf '%s\n' "$p" > "$RUN.new/$n/path"
+    if ! st=$(state_of "$p"); then
+      warn "arm: $p exists but is not a plain file: refusing"
+      rm -rf -- "$RUN.new"; exit 2
+    fi
+    if [ "$st" != absent ]; then
+      if ! cp -p -- "$p" "$RUN.new/$n/orig" || [ "$(state_of "$RUN.new/$n/orig")" != "$st" ]; then
+        warn "arm: could not copy $p"; rm -rf -- "$RUN.new"; exit 1
+      fi
+    fi
+    printf '%s\n' "$st" > "$RUN.new/$n/before"
+  done
+  printf '%s\n' "$id" > "$RUN.new/id"
+  printf '%s\n' "$n" > "$RUN.new/count"
+  printf '%s\n' "$t" > "$RUN.new/armed_at"
+  printf '%s\n' "$deadline" > "$RUN.new/deadline"
+  [ -z "$ip" ] || printf '%s\n' "$ip" > "$RUN.new/f2b_ignore"
+  if ! { rm -rf -- "$RUN" && mv -- "$RUN.new" "$RUN"; }; then warn "arm: cannot install the snapshot"; exit 1; fi
+  rm -f -- "$STATE_DIR/reverted.$id"
+  find "$STATE_DIR" -maxdepth 1 -name 'reverted.*' -mtime +7 -delete 2>/dev/null
+
+  # "pending" is written last: a half-built snapshot is never pending.
+  if ! { printf '%s\n' "$id" > "$STATE_DIR/pending.new" &&
+         mv -f -- "$STATE_DIR/pending.new" "$STATE_DIR/pending"; }; then
+    rm -f -- "$RUN/f2b_ignore"
+    warn "arm: cannot write $STATE_DIR/pending"; exit 1
+  fi
+  cal=$(fmt_time "$deadline")
+  if ! "$SYSTEMD_RUN" --quiet --collect --unit="$UNIT_PREFIX$id" \
+      --timer-property=AccuracySec=1s --on-calendar="$cal" "$SELF" revert "$id"; then
+    rm -f -- "$STATE_DIR/pending" "$RUN/f2b_ignore"
+    warn "could not start the revert timer: NOT armed"
+    exit 1
+  fi
+  log "armed $id: unless disarmed, ${paths[*]} go back at $cal (in $((deadline - t))s)"
+  echo "armed $id until $cal"
+}
+
+# ----------------------------------------------------------------- check
+# Record each path's current content as this run's write when it differs
+# from the snapshot. Non-plain files are never recorded.
+record_written() {
+  local i n d p st
+  n=$(cat -- "$RUN/count")
+  for ((i = 1; i <= n; i++)); do
+    d="$RUN/$i"
+    p=$(cat -- "$d/path")
+    st=$(state_of "$p") || continue
+    [ "$st" = "$(cat -- "$d/before")" ] || printf '%s\n' "$st" > "$d/written"
+  done
+}
+
+cmd_check() {
+  local id=$1 t deadline
+  if [ -e "$STATE_DIR/reverted.$id" ]; then warn "check: change $id was already reverted"; exit 3; fi
+  [ "$(pending_id)" = "$id" ] || { warn "check: change $id is not pending"; exit 4; }
+  run_matches "$id" || { warn "check: the snapshot for $id is missing or damaged"; exit 1; }
+  record_written
+  t=$(now)
+  deadline=$(cat -- "$RUN/deadline")
+  if (( t >= deadline )); then
+    warn "check: the deadline for $id has passed: the change is being reverted"
+    exit 3
+  fi
+  if ! "$SYSTEMCTL" is-active --quiet "$UNIT_PREFIX$id.timer"; then
+    warn "check: change $id is pending but its revert timer is not active"
+    exit 6
+  fi
+  echo "armed $id: $((deadline - t))s left"
+}
+
+# ---------------------------------------------------------------- revert
+put_back() {  # <snapshot dir> <path> <before>
+  local tmp
+  if [ "$3" = absent ]; then rm -f -- "$2"; return; fi
+  tmp="$(dirname -- "$2")/.auto-sec-ssh-guard.$$"
+  if cp -p -- "$1/orig" "$tmp" && mv -f -- "$tmp" "$2"; then return 0; fi
+  rm -f -- "$tmp"
+  return 1
+}
+
+# Content unchanged: still put back owner and mode if the run changed them.
+put_back_meta() {  # <snapshot dir> <path>
+  [ "$(stat -c '%a %u %g' -- "$1/orig")" = "$(stat -c '%a %u %g' -- "$2")" ] || put_back "$1" "$2" present
+}
+
+# The play's runtime fail2ban ignore lives in fail2ban's memory only, so it
+# is gone after a reboot: boot mode only forgets the stored address.
+drop_f2b_ignore() {  # <boot: 0|1>
+  local ip
+  [ -s "$RUN/f2b_ignore" ] || return 0
+  ip=$(cat -- "$RUN/f2b_ignore")
+  if [ "$1" = 0 ] && valid_ip "$ip"; then
+    if "$F2B" set sshd delignoreip "$ip" >/dev/null 2>&1; then
+      log "removed the controller's runtime fail2ban ignore"
+    else
+      log "could not remove the runtime fail2ban ignore (fail2ban not running?)"
+    fi
+  fi
+  rm -f -- "$RUN/f2b_ignore"
+}
+
+do_revert() {  # <id|--boot>; caller holds the lock. Returns 0, 1 or 4.
+  local want=$1 boot=0 id t deadline in_window i n d p before written cur v rc=0
+  local -a notes=()
+  [ "$want" = --boot ] && boot=1
+  id=$(pending_id)
+  if [ -z "$id" ]; then
+    if [ "$boot" = 0 ] && [ -e "$STATE_DIR/reverted.$want" ]; then
+      log "change $want was already reverted"
+    else
+      log "nothing pending"
+    fi
+    return 0
+  fi
+  if [ "$boot" = 0 ] && [ "$id" != "$want" ]; then
+    warn "the pending change is $id, not $want: left alone"
+    return 4
+  fi
+  if ! run_matches "$id"; then
+    warn "the snapshot for pending change $id is missing or damaged: nothing restored. Check /etc/ssh by hand, then remove $STATE_DIR/pending"
+    return 1
+  fi
+  t=$(now)
+  deadline=$(cat -- "$RUN/deadline")
+  in_window=0
+  (( t <= deadline + GRACE )) && in_window=1
+  [ "$boot" = 1 ] && log "boot: undoing pending change $id before sshd starts"
+
+  n=$(cat -- "$RUN/count")
+  for ((i = 1; i <= n; i++)); do
+    d="$RUN/$i"
+    p=$(cat -- "$d/path")
+    before=$(cat -- "$d/before")
+    written=$(cat -- "$d/written" 2>/dev/null || true)
+    if ! cur=$(state_of "$p"); then
+      warn "$p is no longer a plain file: left in place"
+      notes+=("left $p (not a plain file)"); rc=1; continue
+    fi
+    v=$(verdict "$before" "$written" "$cur")
+    if [ "$v" = unseen ] && [ "$in_window" = 0 ]; then v=stale; fi
+    case $v in
+      unchanged)
+        [ "$before" = absent ] || put_back_meta "$d" "$p" ||
+          { warn "could not restore owner/mode of $p"; rc=1; }
+        log "$p: unchanged since arm"
+        notes+=("unchanged $p") ;;
+      ours|unseen)
+        if put_back "$d" "$p" "$before"; then
+          if [ "$before" = absent ]; then log "removed $p (created by this run)"; notes+=("removed $p")
+          else log "restored $p"; notes+=("restored $p"); fi
+        else
+          warn "could not put back $p"; notes+=("FAILED $p"); rc=1
+        fi ;;
+      other)
+        warn "$p was changed by someone else after this run wrote it: left in place, NOT overwritten. Check it by hand."
+        notes+=("left $p (changed by someone else)"); rc=1 ;;
+      stale)
+        warn "$p changed after arm and this run never confirmed writing it; the deadline passed over ${GRACE}s ago: left in place, NOT overwritten. Check it by hand."
+        notes+=("left $p (unconfirmed change, snapshot too old)"); rc=1 ;;
+    esac
+  done
+
+  if [ "$boot" = 0 ]; then
+    if sshd_test; then
+      if "$SYSTEMCTL" try-reload-or-restart ssh.service; then
+        log "sshd reloaded"
+      else
+        warn "sshd reload failed"; notes+=("sshd reload failed"); rc=1
+      fi
+    else
+      warn "the config on disk FAILS sshd -t: NOT reloading (the running sshd keeps its config). Fix /etc/ssh from a console."
+      notes+=("sshd -t failed: not reloaded"); rc=1
+    fi
+    "$SYSTEMCTL" stop "$UNIT_PREFIX$id.timer" >/dev/null 2>&1 || true
+  fi
+  drop_f2b_ignore "$boot"
+
+  {
+    printf 'reverted %s at %s%s\n' "$id" "$(fmt_time "$t")" "$([ "$boot" = 1 ] && echo ' (boot)')"
+    printf '%s\n' "${notes[@]}"
+  } > "$STATE_DIR/reverted.$id"
+  cp -f -- "$STATE_DIR/reverted.$id" "$RUN/result"
+  rm -f -- "$STATE_DIR/pending"
+  if [ "$rc" = 0 ]; then log "reverted change $id"; else warn "reverted change $id with problems: ${notes[*]}"; fi
+  return "$rc"
+}
+
+# ---------------------------------------------------------------- disarm
+cmd_disarm() {
+  local id=$1 t
+  if [ -e "$STATE_DIR/reverted.$id" ]; then
+    warn "change $id was ALREADY REVERTED (the timer fired first): it is not in place"
+    exit 3
+  fi
+  [ "$(pending_id)" = "$id" ] || { warn "change $id is not pending"; exit 4; }
+  run_matches "$id" || { warn "the snapshot for $id is missing or damaged"; exit 1; }
+  t=$(now)
+  if (( t >= $(cat -- "$RUN/deadline") )); then
+    warn "disarm $id came after the deadline: reverting instead"
+    do_revert "$id"
+    exit 3
+  fi
+  rm -f -- "$STATE_DIR/pending"
+  "$SYSTEMCTL" stop "$UNIT_PREFIX$id.timer" >/dev/null 2>&1 || true
+  rm -f -- "$RUN/f2b_ignore"
+  printf 'disarmed %s at %s\n' "$id" "$(fmt_time "$t")" > "$RUN/result"
+  log "disarmed $id: the change stays"
+  echo "disarmed $id"
+}
+
+# ---------------------------------------------------------------- status
+cmd_status() {
+  local id rid t deadline i n d p before written cur v
+  id=$(pending_id)
+  if [ -n "$id" ]; then echo "pending $id"; else echo idle; fi
+  [ -d "$RUN" ] || return 0
+  rid=$(cat -- "$RUN/id" 2>/dev/null)
+  if [ -n "$id" ] && ! run_matches "$id"; then
+    echo "state:    DAMAGED (no usable snapshot for $id): check /etc/ssh by hand, then remove $STATE_DIR/pending"
+    return 0
+  fi
+  if ! run_matches "$rid"; then
+    echo "last:     snapshot unreadable"
+    return 0
+  fi
+  t=$(now)
+  deadline=$(cat -- "$RUN/deadline")
+  echo "change:   $rid"
+  echo "armed:    $(fmt_time "$(cat -- "$RUN/armed_at")")"
+  if [ -z "$id" ]; then
+    echo "deadline: $(fmt_time "$deadline")"
+  elif (( deadline > t )); then
+    echo "deadline: $(fmt_time "$deadline") (in $((deadline - t))s)"
+  else
+    echo "deadline: $(fmt_time "$deadline") (passed $((t - deadline))s ago)"
+  fi
+  if [ -n "$id" ]; then
+    if "$SYSTEMCTL" is-active --quiet "$UNIT_PREFIX$id.timer"; then
+      echo "timer:    active ($UNIT_PREFIX$id.timer)"
+    else
+      echo "timer:    NOT active: a reboot runs 'revert --boot'; or run: auto-sec-ssh-guard revert $id"
+    fi
+    [ -s "$RUN/f2b_ignore" ] && echo "fail2ban: a revert removes the controller's runtime ignore"
+  fi
+  n=$(cat -- "$RUN/count")
+  for ((i = 1; i <= n; i++)); do
+    d="$RUN/$i"
+    p=$(cat -- "$d/path")
+    before=$(cat -- "$d/before")
+    written=$(cat -- "$d/written" 2>/dev/null || true)
+    cur=$(state_of "$p") || cur=not-a-plain-file
+    v=$(verdict "$before" "$written" "$cur")
+    case $v in
+      ours) v="written by this run" ;;
+      unseen) v="changed since arm (not yet seen by check)" ;;
+      other) v="changed by someone else after this run wrote it" ;;
+    esac
+    echo "file:     $p"
+    echo "          before $(short "$before"), now $(short "$cur"): $v"
+  done
+  [ -s "$RUN/result" ] && sed -e '1s/^/last:     /' -e '2,$s/^/          /' -- "$RUN/result"
+  return 0
+}
+
+# ------------------------------------------------------------------ main
+main() {
+  local cmd=${1:-}
+  [ $# -ge 1 ] || usage
+  shift
+  case $cmd in
+    arm)
+      cmd_arm "$@" ;;
+    check|disarm)
+      [ $# -eq 1 ] || usage
+      valid_id "$1" || { warn "bad id"; exit 2; }
+      prepare; take_lock
+      "cmd_$cmd" "$1" ;;
+    revert)
+      [ $# -eq 1 ] || usage
+      [ "$1" = --boot ] || valid_id "$1" || { warn "bad id"; exit 2; }
+      prepare; take_lock
+      do_revert "$1"
+      exit $? ;;
+    status)
+      [ $# -eq 0 ] || usage
+      prepare; take_lock
+      cmd_status ;;
+    -h|--help|help)
+      usage 0 ;;
+    *)
+      usage ;;
+  esac
+}
+
+main "$@"

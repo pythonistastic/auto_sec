@@ -1,0 +1,268 @@
+---
+# roles/02-ssh-hardening/tasks/guard.yml - the automatic undo.
+#
+# Included with _ssh_guard_action set to one of:
+#   fresh    read-only (preflight P6, and again just before arming): no
+#            undo may be pending, and when ssh.service runs, no file sshd
+#            reads may have changed since sshd last loaded its config.
+#   install  the guard script, its boot-time unit and the
+#            sysinit.target.wants link (no daemon-reload: boot use only).
+#   arm      needs _ssh_guard_id and _ssh_guard_paths; optional
+#            _ssh_guard_f2b_ip. The deadline is computed on the server.
+#   check    the undo must still be armed, by _ssh_guard_id.
+#   disarm   keep the change (rc 3: the timer already put the files back).
+#   revert   put the files back now (never fails the task; sets
+#            _ssh_guard_revert_rc).
+#
+# Guard CLI (files/auto-sec-ssh-guard, installed as _ssh_guard_bin):
+#   arm <id> <deadline_epoch_utc> [--f2b-ignore <ip>] -- <path>...
+#     rc 0 armed, 7 another change pending, 8 current config fails sshd -t,
+#     9 deadline out of range, 2 usage
+#   check <id>   rc 0 armed by <id>
+#   disarm <id>  rc 0 disarmed, 3 already reverted, 4 not pending
+#   revert <id> | revert --boot | status
+
+# --- fresh ----------------------------------------------------------------
+
+- name: "SSH guard: is an earlier undo still pending?"
+  when: _ssh_guard_action == 'fresh'
+  ansible.builtin.stat:
+    path: "{{ _ssh_guard_pending }}"
+    get_checksum: false
+  register: _ssh_guard_pend
+
+- name: "SSH guard: no earlier change may still be waiting for its undo"
+  when: _ssh_guard_action == 'fresh'
+  ansible.builtin.assert:
+    quiet: true
+    that: not _ssh_guard_pend.stat.exists
+    fail_msg: >-
+      An earlier auto_sec SSH change on {{ inventory_hostname }} is still waiting for its
+      automatic undo ({{ _ssh_guard_pending }} exists). Check with
+      `sudo auto-sec-ssh-guard status` (line 1 is "pending <id>"). Wait for the undo, or
+      put the files back now with `sudo auto-sec-ssh-guard revert <id>` (it reloads sshd
+      when `sshd -t` passes), test a new login, then run again.
+      Nothing has been changed.
+
+# Prints "active=", "start=" and "hup=" (epoch seconds; empty when
+# unknown) and one "ctime=<epoch> <path>" line per file sshd reads. $1 is 1
+# when sshd_config includes sshd_config.d. The file list comes from sshd's
+# own trace ("load_server_config: filename <path>": the main file and
+# every Include, wherever it points), plus the folder of each included
+# file and of each Include glob that matched nothing ("<file> line <n>: no
+# match for <glob>"), so a file added to or removed from such a folder
+# also counts. Both trace lines exist in OpenSSH 8.9 to 10.2. The names
+# are used here, on the host, and only printed; nothing is written.
+- name: "SSH guard: when did sshd last load its config, and when did its files change?"
+  when: _ssh_guard_action == 'fresh'
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - |
+        inc=$1
+        state=$(systemctl is-active ssh.service 2>/dev/null) || :
+        echo "active=$state"
+        [ "$state" = active ] || exit 0
+        start=$(systemctl show -p ExecMainStartTimestamp --timestamp=unix --value ssh.service 2>/dev/null) || start=
+        case "$start" in
+          @[0-9]*) start=${start#@} ;;
+          *) v=$(systemctl show -p ExecMainStartTimestamp --value ssh.service 2>/dev/null) || v=
+             start=$(date -d "$v" +%s 2>/dev/null) || start= ;;
+        esac
+        echo "start=$start"
+        hup=
+        if [ -n "$start" ]; then
+          hup=$(journalctl -u ssh.service -o short-unix --no-pager --since "@$start" 2>/dev/null \
+            | grep -F 'Received SIGHUP; restarting.' | tail -n 1 | cut -d' ' -f1 | cut -d. -f1)
+        fi
+        echo "hup=$hup"
+        {
+          echo /etc/ssh/sshd_config
+          if [ "$inc" = 1 ]; then
+            echo /etc/ssh/sshd_config.d
+            for f in /etc/ssh/sshd_config.d/*.conf; do echo "$f"; done
+          fi
+          # sshd -d lines end in CR LF. "f <path>": a file sshd read; "g
+          # <glob>": an Include that matched nothing (only its folder).
+          /usr/sbin/sshd -t -ddd 2>&1 >/dev/null | tr -d '\r' \
+            | sed -n -e 's/^.*load_server_config: filename \(\/.*\)$/f \1/p' \
+                     -e 's/^.* line [0-9]*: no match for \(\/.*\)$/g \1/p' \
+            | while IFS=' ' read -r k f; do
+                if [ "$k" = f ]; then printf '%s\n' "$f"; fi
+                d=${f%/*}
+                if [ "$f" != /etc/ssh/sshd_config ] && [ -n "$d" ] && [ "$d" != /etc/ssh ]; then printf '%s\n' "$d"; fi
+              done
+        } | sort -u | while IFS= read -r f; do
+          if [ -e "$f" ]; then stat -L -c 'ctime=%Z %n' -- "$f"; fi
+        done
+      - sh
+      - "{{ '1' if (_ssh_has_include | default(false) | bool) else '0' }}"
+  environment:
+    LC_ALL: C
+    TZ: UTC
+  register: _ssh_guard_times
+  changed_when: false
+  check_mode: false
+
+- name: "SSH guard: sshd must be running the SSH files that are on disk"
+  when: _ssh_guard_action == 'fresh'
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _ssh_t_active != 'active' or _ssh_t_start | length > 0
+      - _ssh_t_active != 'active' or _ssh_t_stale | length == 0
+    fail_msg: >-
+      {% if _ssh_t_start | length == 0 %}Could not read when ssh.service started on
+      {{ inventory_hostname }}, so auto_sec cannot tell whether sshd runs the files on disk.
+      {% else %}On {{ inventory_hostname }}, {{ _ssh_t_stale | join(', ') }} changed after
+      sshd last loaded its config at {{ '%Y-%m-%d %H:%M:%S UTC' | strftime(_ssh_t_loaded | int, utc=True) }}.
+      sshd still runs the older settings, so these edits are not live yet, and
+      auto_sec's undo would bring back files sshd never ran. Check the files, reload
+      them yourself with a second session open (`sudo sshd -t && sudo systemctl reload ssh`),
+      test a new login, then run again. If this is a host set up by auto_sec 0.3
+      whose sshd_config was written but never loaded: do not reload it unless the
+      deploy account can log in; copy /usr/share/openssh/sshd_config over it
+      instead, check `sshd -T`, reload, test, then run again.
+      {% endif %}Nothing has been changed.
+  vars:
+    _ssh_t: "{{ _ssh_guard_times.stdout_lines | default([]) }}"
+    _ssh_t_active: "{{ _ssh_t | select('match', '^active=') | first | default('active=') | regex_replace('^active=', '') }}"
+    _ssh_t_start: "{{ _ssh_t | select('match', '^start=[0-9]+$') | first | default('start=') | regex_replace('^start=', '') }}"
+    _ssh_t_hup: "{{ _ssh_t | select('match', '^hup=[0-9]+$') | first | default('hup=0') | regex_replace('^hup=', '') }}"
+    _ssh_t_loaded: "{{ [_ssh_t_start | int, _ssh_t_hup | int] | max }}"
+    _ssh_t_files: "{{ _ssh_t | select('match', '^ctime=[0-9]+ ') | list }}"
+    _ssh_t_stale: >-
+      {{ _ssh_t_files | map('regex_replace', '^ctime=([0-9]+) .*$', '\1') | map('int')
+         | zip(_ssh_t_files | map('regex_replace', '^ctime=[0-9]+ ', '') | map('regex_replace', '[{}]', '?'))
+         | selectattr(0, 'gt', _ssh_t_loaded | int) | map(attribute=1) | list
+         if _ssh_t_start | length > 0 else [] }}
+
+# --- install --------------------------------------------------------------
+
+- name: "SSH guard: install the undo script"
+  when: _ssh_guard_action == 'install'
+  ansible.builtin.copy:
+    src: auto-sec-ssh-guard
+    dest: "{{ _ssh_guard_bin }}"
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: "SSH guard: install the boot-time undo unit"
+  when: _ssh_guard_action == 'install'
+  ansible.builtin.copy:
+    src: "{{ _ssh_guard_unit }}"
+    dest: "/etc/systemd/system/{{ _ssh_guard_unit }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: "SSH guard: sysinit.target.wants exists"
+  when: _ssh_guard_action == 'install'
+  ansible.builtin.file:
+    path: /etc/systemd/system/sysinit.target.wants
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# Enabling by hand: `systemctl enable` would need a daemon-reload, which
+# auto_sec avoids. systemd reads the link at the next boot.
+- name: "SSH guard: start the boot-time undo unit at boot"
+  when: _ssh_guard_action == 'install'
+  ansible.builtin.file:
+    src: "/etc/systemd/system/{{ _ssh_guard_unit }}"
+    dest: "/etc/systemd/system/sysinit.target.wants/{{ _ssh_guard_unit }}"
+    state: link
+    owner: root
+    group: root
+
+# --- arm ------------------------------------------------------------------
+
+# The deadline is computed from the server's own clock, inside the command,
+# so no host value passes through Ansible. Prints "deadline=<epoch>".
+- name: "SSH guard: arm the automatic undo"
+  when: _ssh_guard_action == 'arm'
+  ansible.builtin.command:
+    argv: >-
+      {{ ['sh', '-c', 'set -eu; d=$(( $(date +%s) + $1 )); echo "deadline=$d"; b=$2; i=$3; shift 3; exec "$b" arm "$i" "$d" "$@"',
+          'sh', ssh_revert_seconds | int | string, _ssh_guard_bin, _ssh_guard_id]
+         + (['--f2b-ignore', _ssh_guard_f2b_ip] if (_ssh_guard_f2b_ip | default('') | length > 0) else [])
+         + ['--'] + _ssh_guard_paths }}
+  register: _ssh_guard_arm
+  changed_when: _ssh_guard_arm.rc == 0
+  failed_when: false
+
+- name: "SSH guard: arming must succeed"
+  when: _ssh_guard_action == 'arm'
+  ansible.builtin.assert:
+    quiet: true
+    that: _ssh_guard_arm.rc == 0
+    fail_msg: >-
+      Could not arm the automatic undo on {{ inventory_hostname }} (rc {{ _ssh_guard_arm.rc }}):
+      {{ {7: 'another auto_sec SSH change is still pending (sudo auto-sec-ssh-guard status)',
+          8: 'the current SSH config fails sshd -t, so it could not be restored safely',
+          9: 'the undo deadline is out of range (check the server clock)',
+          2: 'bad arguments (auto_sec bug)'}[_ssh_guard_arm.rc | int] | default('see the error output') }}.
+      {{ _ssh_guard_arm.stderr | default('') | trim }} Nothing has been changed.
+
+- name: "SSH guard: undo is armed"
+  when: _ssh_guard_action == 'arm'
+  ansible.builtin.debug:
+    msg: >-
+      Automatic undo armed: if this run stops, {{ inventory_hostname }} puts back the
+      previous SSH files at {{ '%Y-%m-%d %H:%M:%S UTC' | strftime(_ssh_guard_deadline | int, utc=True) }}
+      server time (in {{ ssh_revert_seconds }} s). Do not reboot or edit /etc/ssh before then.
+      Check with `sudo auto-sec-ssh-guard status`.
+  vars:
+    _ssh_guard_deadline: "{{ _ssh_guard_arm.stdout_lines | select('match', '^deadline=[0-9]+$') | first | default('deadline=0') | regex_replace('^deadline=', '') }}"
+
+# --- check ----------------------------------------------------------------
+
+- name: "SSH guard: is the undo still armed by this run?"
+  when: _ssh_guard_action == 'check'
+  ansible.builtin.command:
+    argv: ["{{ _ssh_guard_bin }}", check, "{{ _ssh_guard_id }}"]
+  register: _ssh_guard_check
+  changed_when: false
+  failed_when: _ssh_guard_check.rc != 0
+
+# --- disarm ---------------------------------------------------------------
+
+- name: "SSH guard: keep the change (disarm the undo)"
+  when: _ssh_guard_action == 'disarm'
+  ansible.builtin.command:
+    argv: ["{{ _ssh_guard_bin }}", disarm, "{{ _ssh_guard_id }}"]
+  register: _ssh_guard_disarm
+  changed_when: _ssh_guard_disarm.rc == 0
+  failed_when: false
+
+- name: "SSH guard: disarming must succeed"
+  when: _ssh_guard_action == 'disarm'
+  ansible.builtin.assert:
+    quiet: true
+    that: _ssh_guard_disarm.rc == 0
+    fail_msg: >-
+      {% if _ssh_guard_disarm.rc == 3 %}The automatic undo on {{ inventory_hostname }} already
+      ran (its timer fired before this run finished), so the SSH change is NOT in
+      place: the previous files are back.
+      {% else %}Could not disarm the automatic undo on {{ inventory_hostname }}
+      (rc {{ _ssh_guard_disarm.rc }}): {{ _ssh_guard_disarm.stderr | default('') | trim }}.
+      {% endif %}Check with `sudo auto-sec-ssh-guard status`.
+
+# --- revert ---------------------------------------------------------------
+
+- name: "SSH guard: put the previous SSH files back now"
+  when: _ssh_guard_action == 'revert'
+  ansible.builtin.command:
+    argv: ["{{ _ssh_guard_bin }}", revert, "{{ _ssh_guard_id }}"]
+  register: _ssh_guard_revert
+  changed_when: true
+  failed_when: false
+
+- name: "SSH guard: remember how the undo went"
+  when: _ssh_guard_action == 'revert'
+  ansible.builtin.set_fact:
+    _ssh_guard_revert_rc: "{{ _ssh_guard_revert.rc | default(-1) }}"
+    _ssh_guard_revert_err: "{{ _ssh_guard_revert.stderr | default('') | regex_replace('[{}]', '?') | trim }}"

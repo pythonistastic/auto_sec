@@ -3,3 +3,10 @@
 *.j2 text eol=lf
 *.yml text eol=lf
 *.md text eol=lf
+# Files without one of the extensions above that are installed or run
+# as-is on Linux: the SSH undo guard and its boot unit, test stubs,
+# the pinned package list and sshd test fixtures. A CRLF checkout would
+# break them (bash: /bin/bash^M).
+roles/*/files/** text eol=lf
+*.service text eol=lf
+tests/** text eol=lf

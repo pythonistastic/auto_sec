@@ -1,0 +1,5 @@
+---
+# Stage 2: root key-only, passwords off. ssh_admin_user is root here, so
+# "no" for root would be refused; prohibit-password is the stage-2 value.
+ssh_permit_root_login: prohibit-password
+ssh_password_authentication: "no"

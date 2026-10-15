@@ -1,0 +1,37 @@
+# Pinned OpenSSH packages for tests/sshd-semantics/run.sh.
+#
+# Format (whitespace separated, one file per line):
+#   <set> <pool file name> <sha256> <url> [<fallback url>...]
+# <set> is a distro codename (jammy bookworm noble trixie resolute) or
+# "common" (shared libraries the sets need). run.sh tries the URLs in order
+# and uses a file only if its SHA256 matches. The first URL is the official
+# archive pool; the second is the official snapshot service, which keeps the
+# exact file after the archive drops a superseded version.
+#
+# Every SHA256 below was checked against the signed archive index
+# (InRelease -> Packages.xz) of the suite named in the comment.
+# To bump a version: download the new .deb from the pool, check it the same
+# way, replace the file name, hash and both URLs, then run run.sh.
+
+# tcp-wrappers (libwrap.so.0): the jammy, bookworm and noble sshd link it. noble release pocket.
+common libwrap0_7.6.q-33_amd64.deb 36118b862539868408ee056411d6e470068d14c46e5296b29bfb744770f5d2ce https://archive.ubuntu.com/ubuntu/pool/main/t/tcp-wrappers/libwrap0_7.6.q-33_amd64.deb https://snapshot.ubuntu.com/ubuntu/20261014T200000Z/pool/main/t/tcp-wrappers/libwrap0_7.6.q-33_amd64.deb
+
+# Ubuntu 22.04 jammy, OpenSSH 8.9p1 (jammy-security)
+jammy openssh-server_8.9p1-3ubuntu0.18_amd64.deb c633f8518b4576680f45a1abfa5660c3c10d770fc625fda9c70f38cbb1c9519f https://archive.ubuntu.com/ubuntu/pool/main/o/openssh/openssh-server_8.9p1-3ubuntu0.18_amd64.deb https://snapshot.ubuntu.com/ubuntu/20261014T200000Z/pool/main/o/openssh/openssh-server_8.9p1-3ubuntu0.18_amd64.deb
+jammy openssh-client_8.9p1-3ubuntu0.18_amd64.deb 44d97148eb3fc911f6b6f3a61b271cc507f753e695a097b86ef2e1bc10d4da16 https://archive.ubuntu.com/ubuntu/pool/main/o/openssh/openssh-client_8.9p1-3ubuntu0.18_amd64.deb https://snapshot.ubuntu.com/ubuntu/20261014T200000Z/pool/main/o/openssh/openssh-client_8.9p1-3ubuntu0.18_amd64.deb
+
+# Debian 12 bookworm, OpenSSH 9.2p1 (bookworm point release)
+bookworm openssh-server_9.2p1-2+deb12u10_amd64.deb 933cd92a2329f9bf26d22660a834ae18ebdbe8df9c6127e4d9fcb098dac9cf72 https://deb.debian.org/debian/pool/main/o/openssh/openssh-server_9.2p1-2+deb12u10_amd64.deb https://snapshot.debian.org/archive/debian/20260601T000000Z/pool/main/o/openssh/openssh-server_9.2p1-2%2Bdeb12u10_amd64.deb
+bookworm openssh-client_9.2p1-2+deb12u10_amd64.deb 42c250b8b9110382488c53c066a960bc564ddac2cb9e449f47b6cdbb5fc1cb60 https://deb.debian.org/debian/pool/main/o/openssh/openssh-client_9.2p1-2+deb12u10_amd64.deb https://snapshot.debian.org/archive/debian/20260601T000000Z/pool/main/o/openssh/openssh-client_9.2p1-2%2Bdeb12u10_amd64.deb
+
+# Ubuntu 24.04 noble, OpenSSH 9.6p1 (noble-security)
+noble openssh-server_9.6p1-3ubuntu13.20_amd64.deb 5d0d5eb672ddc27601e2da4e8465c5736dc73375a21bc1cd1834fcb08fb155bf https://archive.ubuntu.com/ubuntu/pool/main/o/openssh/openssh-server_9.6p1-3ubuntu13.20_amd64.deb https://snapshot.ubuntu.com/ubuntu/20261014T200000Z/pool/main/o/openssh/openssh-server_9.6p1-3ubuntu13.20_amd64.deb
+noble openssh-client_9.6p1-3ubuntu13.20_amd64.deb 5fb4429e9eff60a5b4ddb68ccf0c46ee67066b445794ede5fe181e64c4a8b795 https://archive.ubuntu.com/ubuntu/pool/main/o/openssh/openssh-client_9.6p1-3ubuntu13.20_amd64.deb https://snapshot.ubuntu.com/ubuntu/20261014T200000Z/pool/main/o/openssh/openssh-client_9.6p1-3ubuntu13.20_amd64.deb
+
+# Debian 13 trixie, OpenSSH 10.0p1 (trixie point release)
+trixie openssh-server_10.0p1-7+deb13u4_amd64.deb b4a02524fd2be375624d917ee8102a16567e9e8dd786b41c35e22360cdd37f9d https://deb.debian.org/debian/pool/main/o/openssh/openssh-server_10.0p1-7+deb13u4_amd64.deb https://snapshot.debian.org/archive/debian/20260601T000000Z/pool/main/o/openssh/openssh-server_10.0p1-7%2Bdeb13u4_amd64.deb
+trixie openssh-client_10.0p1-7+deb13u4_amd64.deb 8fff343654f86c3b3266f94cd338c7b4da2e386da029327815118ea00bce03b9 https://deb.debian.org/debian/pool/main/o/openssh/openssh-client_10.0p1-7+deb13u4_amd64.deb https://snapshot.debian.org/archive/debian/20260601T000000Z/pool/main/o/openssh/openssh-client_10.0p1-7%2Bdeb13u4_amd64.deb
+
+# Ubuntu 26.04 resolute, OpenSSH 10.2p1 (resolute-security)
+resolute openssh-server_10.2p1-2ubuntu3.8_amd64.deb d14910ed045bd4a2a4c9a4eeb6b3edf08d527fb4cdee5cf527fe66b8bb364c31 https://archive.ubuntu.com/ubuntu/pool/main/o/openssh/openssh-server_10.2p1-2ubuntu3.8_amd64.deb https://snapshot.ubuntu.com/ubuntu/20261014T200000Z/pool/main/o/openssh/openssh-server_10.2p1-2ubuntu3.8_amd64.deb
+resolute openssh-client_10.2p1-2ubuntu3.8_amd64.deb 81770282e1e007b399aca7de4e4e9f72e39a10ad65abaf83ef727c28cadfb22f https://archive.ubuntu.com/ubuntu/pool/main/o/openssh/openssh-client_10.2p1-2ubuntu3.8_amd64.deb https://snapshot.ubuntu.com/ubuntu/20261014T200000Z/pool/main/o/openssh/openssh-client_10.2p1-2ubuntu3.8_amd64.deb

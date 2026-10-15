@@ -1,0 +1,5 @@
+#!/bin/sh
+# Test stub for fail2ban-client: logs the call and succeeds.
+d=$(dirname "$(dirname "$(readlink -f "$0")")")
+echo "$(date +%s) fail2ban-client $*" >> "$d/calls"
+exit 0

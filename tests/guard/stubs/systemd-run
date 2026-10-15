@@ -1,0 +1,11 @@
+#!/bin/sh
+# Test wrapper for systemd-run: logs the call, then starts a REAL transient
+# timer in the user or system manager (see ../scope). A nonzero code in
+# ../systemd_run_rc makes it fail instead, without starting anything.
+d=$(dirname "$(dirname "$(readlink -f "$0")")")
+echo "$(date +%s) systemd-run $*" >> "$d/calls"
+rc=$(cat "$d/systemd_run_rc" 2>/dev/null || echo 0)
+if [ "$rc" != 0 ]; then echo "stub: systemd-run fails (rc $rc)" >&2; exit "$rc"; fi
+real=$(cat "$d/real_systemd_run")
+if [ "$(cat "$d/scope")" = user ]; then exec "$real" --user "$@"; fi
+exec "$real" "$@"

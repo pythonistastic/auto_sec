@@ -1,0 +1,22 @@
+---
+# Renders roles/02-ssh-hardening/templates/00-autosec.conf.j2 for one test
+# case with ansible.builtin.template, exactly as role 02 does. run.sh calls:
+#   ansible-playbook render.yml -e @cases/<case>.yml -e render_dest=<file>
+# Implicit localhost only: no inventory, no host is contacted.
+- name: Render 00-autosec.conf for the sshd-semantics tests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _role_dir: "{{ playbook_dir }}/../../roles/02-ssh-hardening"
+  tasks:
+    - name: Load the role defaults the template may use
+      ansible.builtin.include_vars:
+        file: "{{ _role_dir }}/defaults/main.yml"
+      when: (_role_dir ~ '/defaults/main.yml') is file
+
+    - name: Render the drop-in for this case
+      ansible.builtin.template:
+        src: "{{ _role_dir }}/templates/00-autosec.conf.j2"
+        dest: "{{ render_dest }}"
+        mode: "0600"

@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   # Lint + syntax on a modern ansible-core (needed by ansible-lint).
   ansible:
@@ -23,8 +26,31 @@ jobs:
         run: >
           ansible-playbook restore-test/monthly-restore.yml
           -e client=example-client --syntax-check
+      - name: Syntax check the sshd-semantics render playbook
+        run: ansible-playbook tests/sshd-semantics/render.yml --syntax-check
       - name: Lint
         run: ansible-lint
+
+      # 0.4.0 invariants. Role 02 loads its one drop-in itself, at once and
+      # under the undo guard; a handler would load it late, by surprise
+      # (issue #9). The full sshd_config template replaced the server's own
+      # file (issue #1). Comment lines may still mention the old handler.
+      - name: "Role 02: no 'restart sshd' handler, no full sshd_config template"
+        run: |
+          bad=0
+          if grep -rnE --include='*.yml' --include='*.yaml' --include='*.j2' \
+               '^[^#]*restart sshd' roles site.yml restore-test; then
+            echo "::error::nothing may notify or define 'restart sshd' (role 02 loads its drop-in itself)"
+            bad=1
+          fi
+          for f in roles/02-ssh-hardening/templates/sshd_config.j2 \
+                   roles/02-ssh-hardening/handlers/main.yml; do
+            if [ -e "$f" ]; then
+              echo "::error file=$f::removed in 0.4.0, must not come back"
+              bad=1
+            fi
+          done
+          exit "$bad"
 
   # Representative of a real server: distro-packaged Ansible (Ubuntu
   # 24.04 -> ansible-core 2.16) with the PINNED collections. This is the
@@ -48,6 +74,8 @@ jobs:
         run: >
           ansible-playbook restore-test/monthly-restore.yml
           -e client=example-client --syntax-check
+      - name: Syntax check the sshd-semantics render playbook
+        run: ansible-playbook tests/sshd-semantics/render.yml --syntax-check
 
   python:
     runs-on: ubuntu-latest
@@ -97,10 +125,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: ShellCheck scripts
+      # Default severity, every shell file: scripts, all test suites (and the
+      # guard tests' stub commands) and the SSH undo guard, which is
+      # installed as a root-run script.
+      - name: ShellCheck scripts, tests and the SSH guard
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck scripts/*.sh tests/*.sh
+          shopt -s globstar nullglob
+          shellcheck scripts/*.sh tests/**/*.sh tests/guard/stubs/* \
+            roles/02-ssh-hardening/files/auto-sec-ssh-guard
+          bash -n roles/02-ssh-hardening/files/auto-sec-ssh-guard
 
       # The .sh.j2 templates become root-run scripts (cron, systemd). They
       # were never linted before, which is how unquoted interpolation reached
@@ -127,3 +161,87 @@ jobs:
             fi
           done
           exit "$bad"
+
+  # How real OpenSSH builds read role 02's drop-in: jammy, bookworm, noble,
+  # trixie and resolute sshd from SHA256-pinned .debs, unpacked with
+  # dpkg-deb -x and run unprivileged (sshd -t/-T on config copies).
+  # Pinned to 24.04: the unpacked binaries use this image's libraries.
+  sshd-semantics:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core (renders the role's template)
+        run: pip install ansible-core
+      - name: Cache the pinned OpenSSH packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/auto-sec-sshd-semantics
+          key: sshd-debs-${{ hashFiles('tests/sshd-semantics/debs.txt') }}
+      - name: sshd golden tests
+        run: bash tests/sshd-semantics/run.sh --cache ~/.cache/auto-sec-sshd-semantics
+
+  # Unit tests of the SSH undo guard with the runner's real systemd: real
+  # transient timers, an absolute deadline across a daemon-reload, flock,
+  # hash-checked revert. 22.04 also covers systemd 249.
+  guard:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guard unit tests (system manager)
+        run: sudo bash tests/guard/run.sh --system
+
+  # Live role 02 runs against the runner itself (root@127.0.0.1, site.yml
+  # --tags ssh,firewall): keep-everything, stage 2, refusals, the injected
+  # login failure and a killed run undone by the timer. Service mode on
+  # 22.04, ssh.socket mode on 24.04, and once more on ansible-core 2.16.
+  # UNVERIFIED until it has run green on GitHub: written and linted
+  # locally, never executed (it needs root on a throwaway VM).
+  role02-live:
+    name: role02-live (${{ matrix.os }}, ${{ matrix.ssh_mode }}, ${{ matrix.ansible_core }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            ssh_mode: service
+            ansible_core: ansible-core
+          - os: ubuntu-24.04
+            ssh_mode: socket
+            ansible_core: ansible-core
+          - os: ubuntu-24.04
+            ssh_mode: socket
+            ansible_core: ansible-core>=2.16,<2.17
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core and the pinned collections
+        env:
+          ANSIBLE_CORE_SPEC: ${{ matrix.ansible_core }}
+        run: |
+          pip install "$ANSIBLE_CORE_SPEC"
+          ansible --version
+          ansible-galaxy collection install -r requirements.yml
+      - name: Live role 02 tests against this runner
+        env:
+          SSH_MODE: ${{ matrix.ssh_mode }}
+        run: bash tests/role02-live/run.sh --ssh-mode "$SSH_MODE"
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: role02-live-${{ matrix.os }}-${{ matrix.ssh_mode }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/role02-live/logs
+          if-no-files-found: ignore

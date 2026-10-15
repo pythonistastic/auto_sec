@@ -59,12 +59,15 @@
     proto: tcp
   loop: ["80", "443"]
 
-- name: Allow SSH with rate limiting (standard mode, fwknop gates it in high mode)
+# Both paranoia levels. In 0.4.0 fwknop (high mode) never removes this
+# rule, so SSH stays reachable, rate-limited. ssh_port is the port sshd
+# already listens on (checked by role 02's preflight in pre_tasks).
+- name: Allow SSH with rate limiting
   community.general.ufw:
     rule: limit
     port: "{{ ssh_port | int }}"
     proto: tcp
-  when: paranoia_level == "standard"
+  register: _fw_ssh_rule
 
 - name: Break-glass, allow SSH from office static IP directly
   community.general.ufw:
@@ -74,9 +77,67 @@
     src: "{{ office_static_ip }}"
   when: office_static_ip | length > 0
 
-- name: Enable UFW
+# --- First enable ------------------------------------------------------
+# `ufw enable` runs only while ufw is inactive: on an active firewall the
+# rules above are already live, and re-enabling would only reload every
+# chain. Before the first enable, refuse unless the SSH rule for ssh_port
+# was added in this run or already exists - otherwise enabling ufw would
+# cut SSH. Read-only checks; they also run in --check.
+- name: Read UFW status
+  ansible.builtin.command: ufw status
+  environment:
+    LANG: C
+    LC_ALL: C
+  register: _fw_status
+  changed_when: false
+  check_mode: false
+
+- name: Read the UFW rules added so far
+  ansible.builtin.command: ufw show added
+  environment:
+    LANG: C
+    LC_ALL: C
+  register: _fw_added
+  changed_when: false
+  check_mode: false
+  when: "'Status: active' not in _fw_status.stdout"
+
+- name: Refuse to enable UFW without an SSH rule for ssh_port
+  vars:
+    _port: "{{ ssh_port | int }}"
+    # `ufw show added` prints the short form ("ufw limit 22/tcp") for a
+    # plain port rule; accept the long form from anywhere too.
+    _rule_re: "^ufw limit (in )?({{ _port }}/tcp|(proto tcp )?(from any )?(to any )?port {{ _port }}( proto tcp)?)( comment .*)?$"
+    _rule_listed: "{{ _fw_added.stdout_lines | default([]) | select('match', _rule_re) | list | length > 0 }}"
+    _rule_ok_this_run: "{{ _fw_ssh_rule is defined and _fw_ssh_rule is not skipped and _fw_ssh_rule is succeeded }}"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _rule_ok_this_run | bool or _rule_listed | bool
+    fail_msg: >-
+      Refusing to enable ufw: no SSH rule for ssh_port {{ ssh_port }} was
+      added in this run or found in `ufw show added`. Enabling ufw now
+      would cut SSH. ufw is still inactive.
+  when: "'Status: active' not in _fw_status.stdout"
+
+# Defence in depth: role 02's preflight already refused a connection that
+# reached sshd on another port. 0 = local mode, or the port is not known.
+- name: Refuse to enable UFW when Ansible reached sshd on another port
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (_ssh_server_port | default(0) | int) in [0, ssh_port | int]
+    fail_msg: >-
+      Refusing to enable ufw: Ansible is connected to sshd on port
+      {{ _ssh_server_port | default('?') }}, but ssh_port is {{ ssh_port }} and only that
+      port gets a firewall rule. Set ssh_port to the port sshd really uses.
+      ufw is still inactive.
+  when: "'Status: active' not in _fw_status.stdout"
+
+- name: Enable UFW (only while it is inactive)
   community.general.ufw:
     state: enabled
+  when: "'Status: active' not in _fw_status.stdout"
 
 - name: fail2ban jail config
   ansible.builtin.copy:
@@ -84,6 +145,7 @@
     mode: "0644"
     content: |
       [DEFAULT]
+      ignoreip = {{ (['127.0.0.1/8', '::1', office_static_ip | default('')] + (fail2ban_ignore_ips | default([]))) | select | join(' ') }}
       bantime  = 1h
       bantime.increment = true
       bantime.factor = 2

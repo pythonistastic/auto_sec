@@ -10,7 +10,235 @@ changes. Treat it as early-stage — see the
 
 ## [Unreleased]
 
-_Nothing yet._
+**SSH lockout fixes.** This release changes how auto_sec handles SSH,
+and it has breaking changes. Read **Upgrading** before you run it on a
+server that already exists.
+
+### Breaking
+
+- **Role 02 no longer writes `/etc/ssh/sshd_config` (#1).** It writes
+  only `/etc/ssh/sshd_config.d/00-autosec.conf` (mode 0600). The main
+  file and the other drop-ins are left alone. `templates/sshd_config.j2`
+  is removed.
+- **You choose the login rules (#6).** `ssh_permit_root_login` (`keep`,
+  `prohibit-password` or `"no"`) and `ssh_password_authentication`
+  (`keep` or `"no"`) have **no default**. The run stops until both are
+  set. `keep` leaves the server's current setting alone. auto_sec never
+  writes `yes`.
+- **Quote `"no"`.** Unquoted, YAML reads `no` as `false`, and the run
+  stops with "quote it".
+- **New `ssh_admin_user`** (default: `deploy_user`) and
+  **`ssh_admin_public_keys`**. This is the account you and Ansible log
+  in as. A stricter rule is applied only on a run where Ansible really
+  is logged in as this account. Otherwise it waits, and the run says
+  why.
+- **`AllowUsers deploy` is gone.** By default there is no AllowUsers
+  line. Set `ssh_allow_users` if you want one. It must contain
+  `ssh_admin_user`.
+- **`ssh_max_auth_tries` is removed.** The run stops if it is still set.
+  Use `ssh_extra_settings: {MaxAuthTries: 3}` instead.
+- **No more fixed extra settings.** These are no longer written by
+  default: `MaxAuthTries 3`, `LoginGraceTime 20`, `MaxSessions 5`,
+  `X11Forwarding no`, `AllowAgentForwarding no`, `AllowTcpForwarding no`,
+  `ClientAliveInterval 300`, `ClientAliveCountMax 2`, `LogLevel VERBOSE`
+  and `Subsystem sftp internal-sftp`. Set the ones you want in
+  `ssh_extra_settings`. `Subsystem` is never written.
+- **`ssh_port` no longer moves sshd (#5).** It must be the port sshd
+  already listens on. To move the port, follow `docs/ssh-port.md`.
+- **SSH keys are only added (#4).** They are never removed or rewritten.
+  `exclusive: true` is gone. A missing key is appended as a new line;
+  every other line of `authorized_keys` stays byte for byte. An
+  `authorized_keys` (or `~/.ssh`) that is a symlink is left alone, with
+  a warning.
+- **The `restart sshd` handler is removed (#9).** SSH changes now load
+  at once, under an undo timer.
+- **Role 02 refuses** hosts that are not Debian-family, and OpenSSH
+  older than 8.2. Set `ssh_hardening_enabled: false` to run the other
+  roles there.
+- **Local mode** (`ansible_connection: local`) only applies SSH settings
+  that change nothing in the effective config. A real change stops the
+  run before anything is written. Run it from your own computer instead.
+  An SSH login from the server to itself (`ansible_host: 127.0.0.1`)
+  counts as local mode too.
+- **No `-e ansible_ssh_args` or `-e ansible_become`.** Extra vars would
+  override the options of the login tests, so the run refuses them. Put
+  extra ssh options in `ansible_ssh_common_args` instead.
+- **Role 02 needs `ssh.service`.** Without `ssh.socket`, the sshd on
+  `ssh_port` must be the main process of `ssh.service`; an sshd started
+  another way is refused, because the reload would not reach it.
+- **High mode keeps SSH visible.** Role 03 now adds the rate-limited SSH
+  rule at both paranoia levels, and role 04 never deletes it. Hiding SSH
+  behind fwknop returns in a later release. A high-mode host set up by
+  0.1–0.3 has no SSH rule until role 03 runs or you add it: see
+  **Upgrading**.
+- `paranoia_level` must be `standard` or `high`.
+- `office_static_ip` must not be one of the server's own addresses.
+- At most `ssh_max_hosts_per_run` hosts (default 5) get an SSH change in
+  one run. Use `-l` for more.
+
+### Fixed
+
+- **#1:** the main `sshd_config` was replaced by a file without
+  `Include`. Provider settings and hand-made drop-ins silently stopped
+  working.
+- **#4:** every run deleted all other SSH keys of the deploy user.
+- **#5:** on Ubuntu 24.04, changing `ssh_port` could leave sshd on the
+  old port while the firewall opened only the new one. The next reboot
+  or SSH update then switched ports. auto_sec now refuses a wrong
+  `ssh_port`, and a hidden `ssh.socket` port switch, before it changes
+  anything.
+- **#6:** root login and passwords were always turned off, and the key
+  was never tested. Now it is your choice per host. A stricter rule is
+  applied only after a key login works on a brand-new connection.
+- **#9:** new SSH settings were written early, but loaded only at the
+  end of the run, or later by surprise (at a reboot or an update). Now
+  they load at once, a fresh login is tested, and a failure undoes the
+  change automatically.
+- The wizard's first-run command used `-u root`, but the inventory's
+  `ansible_user` wins over `-u`, so the first run could not connect. It
+  now uses `-e ansible_user=root`, and explains the second run.
+- In local mode, the wizard offered the server's own IP as the
+  break-glass IP. It no longer does, and the run refuses it.
+- A typo in `paranoia_level` silently skipped the SSH firewall rule.
+- High mode enabled ufw with no SSH rule, and deleted the rule before
+  checking fwknopd. Now the SSH rule exists at both levels, ufw is
+  enabled only while it is inactive and only when that rule exists, and
+  role 04 checks that fwknopd is active.
+- The report claimed SSH settings that were not active. It now prints
+  the effective `sshd -T` values, and says "SSH login NOT hardened" when
+  that is true.
+- The wizard said re-running is always safe, and suggested cron. Both
+  are removed (see Known limitations).
+
+### Added
+
+- **Checks before any change.** They run in `pre_tasks`, before role 01.
+  They only read, and they also run in `--check`. The run stops on: a
+  wrong `ssh_port`; a hidden `ssh.socket` port switch; SSH files changed
+  after sshd last loaded them (every file sshd reads, whichever
+  `Include` pulls it in); an undo that is still pending; an active ufw
+  with no rule that lets a new SSH connection reach `ssh_port`. Checks
+  that only protect role 02's own change (the trial run, the host cap,
+  local mode) are skipped when the tags leave role 02 out, for example
+  `--tags firewall`.
+- **A trial run on a copy** of the SSH config, with a before/after diff
+  of `sshd -T` (also in `--check`). A login setting you did not choose
+  may not change, unless you pass
+  `-e ssh_accept_unrequested_changes=true` for one run.
+- **Key tests on a brand-new connection**, before and after the change,
+  the way Ansible logs in.
+- **`auto-sec-ssh-guard`**, an automatic undo timer (`ssh_revert_seconds`,
+  default 300), and a boot unit that puts the old files back if the
+  server reboots inside the window.
+- **fail2ban ignores your IP during the run**, so failed tests cannot
+  get you banned. The exception is removed at the end. While it is in
+  place, the IP is kept only in `/run/auto-sec/f2b-ignore` and, once
+  the undo is armed, in the guard's undo state under
+  `/var/lib/auto-sec/ssh-guard`; both copies go when the change is kept
+  or undone. If a run is interrupted before it can remove the
+  exception, the next run removes it first (see SECURITY.md).
+- A WARNING, "SSH login NOT hardened", while root or password login is
+  still on.
+- New variables: `ssh_hardening_enabled`, `ssh_admin_user`,
+  `ssh_admin_public_keys`, `ssh_allow_users`, `ssh_extra_settings`,
+  `ssh_migrate_sshd_config`, `ssh_accept_unrequested_changes`,
+  `ssh_revert_seconds`, `ssh_max_hosts_per_run`, and
+  `fail2ban_ignore_ips` (written to `jail.local` `ignoreip`, together
+  with `office_static_ip`).
+- `docs/ssh-port.md`: how to move the SSH port by hand, safely.
+- The wizard asks for the admin login account and the two login
+  choices, and says what the login rules will be.
+- CI: sshd semantics on five OpenSSH builds (Ubuntu 22.04, 24.04 and
+  26.04; Debian 12 and 13), guard unit tests, and live role tests on
+  GitHub's Ubuntu 22.04 and 24.04 VMs.
+
+### Upgrading
+
+- Set `ssh_permit_root_login` and `ssh_password_authentication`. To
+  change nothing about logins, use `keep` for both.
+- Set `ssh_admin_user` to the account Ansible logs in as, and
+  `ansible_user` to the same name. If you log in as root, set both to
+  `root`.
+- Remove `ssh_max_auth_tries`. Use `ssh_extra_settings.MaxAuthTries` if
+  you want it.
+- **Hosts set up by 0.1–0.3** have a main `sshd_config` without
+  `Include`. The run refuses it, and prints today's effective values.
+  This block keeps what 0.3 did:
+
+  ```yaml
+  ssh_admin_user: deploy
+  ssh_permit_root_login: "no"
+  ssh_password_authentication: "no"
+  ssh_allow_users: [deploy]
+  ssh_extra_settings: {MaxAuthTries: 3, LoginGraceTime: 20, MaxSessions: 5,
+    X11Forwarding: "no", AllowAgentForwarding: "no", AllowTcpForwarding: "no",
+    ClientAliveInterval: 300, ClientAliveCountMax: 2, LogLevel: VERBOSE}
+  ```
+
+  If 0.3 moved the port to N, first create
+  `/etc/ssh/sshd_config.d/10-port.conf` with the line `Port N`. Then run
+  once:
+  `ansible-playbook -i inventory site.yml -l <host> --tags ssh -e ssh_migrate_sshd_config=true`.
+  The stock `sshd_config` comes back, under the trial run and the undo
+  timer. Small expected differences remain: `AcceptEnv`, `PrintMotd` and
+  the `Subsystem` path.
+- **A 0.3 `sshd_config` that was written but never loaded** is refused.
+  Do not load it unless `deploy` can log in. Copy the stock file over it
+  by hand, check `sshd -T`, reload with a second session open, test a
+  new login, then run again.
+- Keys deleted by older versions are gone. Add the ones you need to
+  `ssh_admin_public_keys`.
+- Keep private keys in WSL `~/.ssh`, not under `/mnt/c`.
+- **High-mode hosts set up by 0.1–0.3** have no ufw rule for SSH: 0.3's
+  fwknop role deleted it, so only a knock opens the port, for
+  `fwknop_open_seconds`. A `--tags ssh` run does not add the rule back,
+  and its login tests open new connections, so the run refuses with
+  "none of its rules lets a new connection ... reach ssh_port". Add the
+  rule first, from a session you opened after a knock:
+  `sudo ufw limit <ssh_port>/tcp`. (A `--tags firewall` run also adds
+  it, but it overwrites `jail.local`, #2.) Then do the migration run
+  above. From then on SSH stays visible and rate-limited.
+- On existing production hosts, use `--tags ssh` for now (see below).
+
+### Known limitations
+
+- **Full `site.yml` runs on existing production hosts are not yet
+  safe.** They still overwrite `jail.local` (#2), turn on automatic
+  reboots (#3), and change the hostname and timezone (#7). Use
+  `--tags ssh` until those are fixed. Do not run the playbook from cron.
+- Local mode cannot tighten SSH logins. Run from your own computer.
+- High mode does not hide SSH in 0.4.0.
+- The key test covers only the controller's path: its key and its IP.
+  VS Code and other clients can still break in stage 2. Test them
+  yourself first.
+- **Debian 12 and 13 are CI-tested only.** Their real OpenSSH packages
+  are checked, unprivileged, for how they read the config. There has
+  been no live run on Debian.
+- **Verified only in a lab** (OpenSSH builds unpacked from the distro
+  packages and run unprivileged in WSL, not on a real server):
+  - a keep-everything file changes no `sshd -T` value, on five builds,
+    with stock and cloud-image layouts;
+  - stage 2 changes exactly `permitrootlogin` and
+    `passwordauthentication`;
+  - `sshd -T` works for an account that does not exist yet;
+  - the undo timer's absolute deadline holds across a `daemon-reload`
+    (tested with the user manager, not the system one);
+  - open sessions survive a reload.
+- **Not yet verified on a real server:** the boot-time undo after a
+  reboot; migrating a real 0.1–0.3 host; the "files changed after the
+  last load" check on a real
+  `ssh.service` (Ubuntu 22.04's systemd 249 rejects
+  `systemctl show --timestamp=unix`, so there the check falls back to
+  parsing the plain timestamp, tested only with a stub); the fail2ban ignore; test retries
+  together with ufw's `limit` rule; the fwknop role end to end; the
+  ufw-rule and "sshd is ssh.service's main process" checks against real
+  `ufw show added` and `ss -p` output (lab stubs only).
+- `--check` of a **full** run fails on a fresh server at role 03, which
+  needs ufw and fail2ban already installed (older than 0.4.0). Preview
+  the SSH part with `--check --diff --tags ssh`.
+- The checks read data from the server (`sshd`, `systemctl`, `ss`, the
+  journal, `SSH_CONNECTION`). They guard against mistakes, not against
+  a server that is already compromised.
 
 ## [0.3.2] - 2026-10-14
 

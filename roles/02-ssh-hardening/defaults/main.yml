@@ -1,0 +1,113 @@
+---
+# Role 02 (SSH) defaults.
+#
+# The public SSH variables (ssh_hardening_enabled, ssh_admin_user,
+# ssh_admin_public_keys, ssh_allow_users, ssh_extra_settings, ...) live in
+# group_vars/all.yml. The two login choices, ssh_permit_root_login and
+# ssh_password_authentication, deliberately have NO default anywhere:
+# preflight stops until you choose them.
+
+# Seconds the automatic undo waits for this run to prove a fresh login
+# before it puts the previous SSH files back. Allowed range: 120-1800.
+ssh_revert_seconds: 300
+
+# --- Role-internal constants. These are not settings: do not override. ---
+
+# The one file role 02 owns. "00-autosec" sorts before the usual
+# 00-hardening, 10-*, 50-cloud-init and 60-cloudimg drop-ins, and sshd
+# keeps the FIRST value it reads for most keywords.
+_ssh_dropin: /etc/ssh/sshd_config.d/00-autosec.conf
+
+# Scratch copy of the config tree for the trial run (tmpfs, root only).
+_ssh_run_dir: /run/auto-sec
+_ssh_sim_dir: /run/auto-sec/ssh-sim
+
+# While this run's fail2ban exception is in place, the controller address
+# is recorded here (tmpfs, root only), so the next run can remove an
+# exception that an interrupted run left behind.
+_ssh_f2b_marker: /run/auto-sec/f2b-ignore
+
+# The undo guard (script and boot unit ship in files/).
+_ssh_guard_bin: /usr/local/sbin/auto-sec-ssh-guard
+_ssh_guard_pending: /var/lib/auto-sec/ssh-guard/pending
+_ssh_guard_unit: auto-sec-ssh-guard-boot.service
+
+# Address `sshd -T -C` evaluates Match Address blocks for when the
+# controller's address is unknown (local mode). TEST-NET-1: never real.
+_ssh_placeholder_addr: 192.0.2.1
+
+# The line sshd needs to read sshd_config.d at all (preflight P5).
+_ssh_include_re: '(?im)^[ \t]*Include[ \t]+(/etc/ssh/)?sshd_config\.d/\*\.conf[ \t]*$'
+
+# First line of the sshd_config that auto_sec 0.1-0.3 wrote (no Include).
+_ssh_legacy_header: "# Managed by Ansible. Manual edits will be overwritten."
+
+# `sshd -T` keys whose change can lock someone out (trial run, check b).
+# A change you did not choose to any of them stops the run unless
+# ssh_accept_unrequested_changes is set. Port and listenaddress always
+# stop it: auto_sec never moves sshd.
+_ssh_login_critical_keys:
+  - port
+  - listenaddress
+  - permitrootlogin
+  - passwordauthentication
+  - kbdinteractiveauthentication
+  - challengeresponseauthentication   # the same setting on OpenSSH 8.2-8.6
+  - pubkeyauthentication
+  - authenticationmethods
+  - usepam
+  - permitemptypasswords
+  - authorizedkeysfile
+  - authorizedkeyscommand
+  - authorizedkeyscommanduser
+  - allowusers
+  - denyusers
+  - allowgroups
+  - denygroups
+  - maxauthtries
+  - logingracetime
+  - maxsessions
+  - allowtcpforwarding
+_ssh_never_change_keys: [port, listenaddress]
+
+# Keywords ssh_extra_settings may set, with the value each accepts (a
+# whole-value regex, anchors added by preflight). Times and counts are
+# plain numbers so that `sshd -T` prints them back unchanged. LogLevel
+# stays at INFO or above VERBOSE: the run checks sshd's log for reloads.
+_ssh_extra_allowed:
+  MaxAuthTries: '[1-9][0-9]?'
+  LoginGraceTime: '[0-9]{1,4}'
+  MaxSessions: '[0-9]{1,3}'
+  X11Forwarding: '(yes|no)'
+  AllowAgentForwarding: '(yes|no)'
+  AllowTcpForwarding: '(yes|no|local|remote|all)'
+  ClientAliveInterval: '[0-9]{1,5}'
+  ClientAliveCountMax: '[0-9]{1,3}'
+  LogLevel: '(INFO|VERBOSE)'
+
+# Public key line, as written in authorized_keys but WITHOUT options:
+# type, base64 key, optional comment, one line.
+_ssh_key_re: '^(ssh-ed25519|ssh-rsa|ssh-dss|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[ \t]+[A-Za-z0-9+/]{16,}={0,3}([ \t]+[^\r\n]*)?$'
+
+_ssh_user_re: '^[a-z_][a-z0-9_-]{0,31}$'
+
+# Strict address patterns for the controller address read from
+# $SSH_CONNECTION, and for fail2ban_ignore_ips (CIDR allowed there).
+_ssh_ipv4_re: '^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
+_ssh_ipv6_re: '^(?=.*:)[0-9A-Fa-f:]{2,39}$'
+
+# Parse `sshd -T` output into {keyword: value}. Repeated keywords (port,
+# allowusers, subsystem, ...) are joined with one space, in output order.
+# Callers set _ssh_kv_admin_lines and _ssh_kv_root_lines as task vars.
+# Host output is untrusted: "{" and "}" become "?" so a value can never be
+# read as a Jinja template by older ansible-core (2.16 re-templates facts
+# whose strings are no longer marked unsafe after a filter).
+_ssh_kv_admin_g: >-
+  {{ _ssh_kv_admin_lines | map('regex_replace', '[{}]', '?') | map('regex_replace', '^(\S+)$', '\1 ')
+     | map('split', ' ', 1) | groupby(0) }}
+_ssh_kv_root_g: >-
+  {{ _ssh_kv_root_lines | map('regex_replace', '[{}]', '?') | map('regex_replace', '^(\S+)$', '\1 ')
+     | map('split', ' ', 1) | groupby(0) }}
+_ssh_kv_pair:
+  admin: "{{ dict(_ssh_kv_admin_g | map('first') | zip(_ssh_kv_admin_g | map('last') | map('map', attribute=1) | map('join', ' '))) }}"
+  root: "{{ dict(_ssh_kv_root_g | map('first') | zip(_ssh_kv_root_g | map('last') | map('map', attribute=1) | map('join', ' '))) }}"

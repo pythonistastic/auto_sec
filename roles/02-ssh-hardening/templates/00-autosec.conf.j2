@@ -1,0 +1,18 @@
+# Managed by auto_sec role 02-ssh-hardening. The next run overwrites this file.
+# Settings left as "keep" are not written here.
+{% if ssh_permit_root_login != 'keep' %}
+PermitRootLogin {{ ssh_permit_root_login }}
+{% endif %}
+{% if ssh_password_authentication != 'keep' %}
+PasswordAuthentication {{ ssh_password_authentication }}
+{% endif %}
+{% if ssh_allow_users | default([]) | length > 0 %}
+AllowUsers {{ ssh_allow_users | join(' ') }}
+{% endif %}
+{% for k, v in ssh_extra_settings | default({}) | dictsort %}
+{{ k }} {{ v }}
+{% endfor %}
+{% if _ssh_ci_deny_user | default('') | length > 0 %}
+# CI-only failure test (preflight allows it only in auto_sec's GitHub Actions tests).
+DenyUsers {{ _ssh_ci_deny_user }}
+{% endif %}

@@ -7,7 +7,42 @@ client_domain: "app.example.com"
 # run if this is left as the CHANGE_ME default.
 letsencrypt_email: "ops@example.com"
 
-paranoia_level: "high"        # standard | high
+# standard | high. high adds fwknop; in 0.4.0 SSH stays visible
+# (rate-limited) in both modes. Hiding SSH returns in a later release.
+paranoia_level: "high"
+
+# Break-glass: the fixed IP you connect FROM (office/home). It keeps
+# direct SSH access and is never banned by fail2ban. Never the server's
+# own IP (the run refuses that). "" = off.
+office_static_ip: ""
+# More fixed IPs/CIDRs fail2ban must never ban.
+# fail2ban_ignore_ips: ["198.51.100.7"]
+
+# --- SSH login (role 02) -----------------------------------------------
+# Quote every yes/no value: an unquoted no becomes false and the run
+# stops with "quote it".
+#
+# The account you and Ansible log in as (set ansible_user to the same
+# name in the inventory). Its keys are only ever added, never removed,
+# and are tested on a fresh connection before anything gets stricter.
+ssh_admin_user: "deploy"
+ssh_admin_public_keys:
+  - "ssh-ed25519 AAAA...REPLACE-WITH-YOUR-PUBLIC-KEY you@laptop"
+
+# Stage 1: change nothing about logins. Safe first run on any server.
+ssh_permit_root_login: keep
+ssh_password_authentication: keep
+
+# Stage 2, later, per host: once every client you use (VS Code included)
+# logs in with a key, replace the two lines above with:
+#   ssh_permit_root_login: prohibit-password    # or "no" (needs a non-root ssh_admin_user)
+#   ssh_password_authentication: "no"
+# The key test must pass first, or nothing is changed.
+
+# Optional (defaults shown in group_vars/all.yml):
+# ssh_allow_users: ["deploy"]         # must contain ssh_admin_user
+# ssh_extra_settings: { MaxAuthTries: 4, X11Forwarding: "no" }
+# ssh_port: 22                        # the port sshd ALREADY uses; never moved
 
 # App runtime: node | docker
 app_type: "node"

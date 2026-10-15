@@ -16,17 +16,20 @@
 
 One-command hardening for a Linux VPS: preventive lockdown, behavioral
 breach detection, and ransomware-proof encrypted backups — as an
-idempotent Ansible playbook you configure once and re-run forever.
+Ansible playbook you configure once.
 
 **Version 0.3.2** · what's new and what's fixed: [CHANGELOG.md](CHANGELOG.md).
 
 Takes a fresh Ubuntu/Debian server from zero to:
 
-- SSH locked to keys-only for a single deploy user, root login disabled
-- Default-deny firewall with fail2ban, optional *invisible* SSH port
-  (Single Packet Authorization via fwknop — the port doesn't exist
-  until you knock), and optional **egress lockdown** (default-deny
-  outbound) that kills most reverse-shell callbacks
+- SSH login rules **you choose** per server: keep them as they are, or
+  keys only and no root password. Nothing gets stricter until your key
+  works on a brand-new login, and an automatic undo timer covers every
+  SSH change (see [SSH access](#ssh-access))
+- Default-deny firewall with fail2ban, and optional **egress lockdown**
+  (default-deny outbound) that kills most reverse-shell callbacks.
+  High mode adds fwknop (Single Packet Authorization); hiding the SSH
+  port behind a knock returns in a later release
 - A **breach detection suite** (see below): a reverse-shell scanner and
   a recon-burst detector on by default (plus an experimental SSH login
   tripwire), sharing one alert/response pipeline that captures forensic
@@ -68,6 +71,11 @@ The wizard runs in "local" mode and prints the one `ssh-keygen` command
 to run on your laptop for future logins. This is the least-friction path
 for a first-timer.
 
+One limit: on the server itself, auto_sec cannot test a new login from
+your laptop. So in local mode it never makes SSH logins stricter; it
+keeps your current login rules. To tighten them later, use Option B
+(see [Local mode](#local-mode-running-on-the-server-itself)).
+
 ### Option B — run it *from your own computer* (to manage servers remotely)
 
 This needs **git** and **Ansible**, which only run in a Unix-like
@@ -106,8 +114,10 @@ interactive wizard that:
    (both gitignored), and
 4. prints — or runs — the exact hardening command.
 
-Re-running the playbook is always safe. It's idempotent and
-self-corrects drift; add it to cron for continuous enforcement.
+**Is the server already in production?** Read
+[Known limitations](#known-limitations) first. In short: for now, run
+only the SSH part there (`--tags ssh`), and do not put the playbook in
+cron.
 
 **New to SSH keys?** You don't need to prepare anything first. An SSH key
 is a pair — a **private** half that stays secret on your computer and a
@@ -119,7 +129,10 @@ you're running the wizard *on the server itself*, it prints the exact
 public half. Either way it walks you through it — no prior knowledge
 assumed.
 
-**Supported targets:** Ubuntu 22.04/24.04, Debian 12.
+**Supported targets:** Ubuntu 22.04 and 24.04. Debian 12 and 13 are
+tested in CI only (see [Known limitations](#known-limitations)). The SSH
+role needs a Debian-family system with OpenSSH 8.2 or newer; anywhere
+else, set `ssh_hardening_enabled: false`.
 
 ## Declarative / CI use (without the wizard)
 
@@ -131,12 +144,19 @@ The playbook **fails fast**: a `pre_tasks` assert validates every
 required variable *before* any change, so an incomplete config aborts the
 run instead of leaving a half-hardened box. That assert block (top of
 [site.yml](site.yml)) is the **source of truth** for what's required.
+The read-only SSH checks run there too, before role 01.
 
 Minimal `host_vars` by scope (only what each needs):
 
 ```yaml
-# Core hardening + detection only (no app/DB/backups):
-deploy_ssh_public_key: "ssh-ed25519 AAAA... you@host"   # required
+# Core hardening + detection only (no app/DB/backups).
+# SSH login choices (required, no default). Always quote "no".
+ssh_admin_user: "deploy"               # set ansible_user to the same name
+ssh_admin_public_keys: ["ssh-ed25519 AAAA... you@host"]
+ssh_permit_root_login: keep            # keep | prohibit-password | "no"
+ssh_password_authentication: keep      # keep | "no"
+# Still supported: also installed (add-only) for the deploy user.
+deploy_ssh_public_key: "ssh-ed25519 AAAA... you@host"
 
 # Add an app + TLS (enables role 05):
 app_type: "node"                 # or docker
@@ -167,45 +187,196 @@ telegram_chat_id: "..."
 Optional roles (04 fwknop, 05 app, 06 database, 07 backups) are loaded
 **only when their trigger var is set** (`paranoia_level: high`,
 `app_type`, `db_engine`, `b2_bucket`). Everything else defaults sanely in
-[group_vars/all.yml](group_vars/all.yml), so a keys-only-hardening run
-needs just `deploy_ssh_public_key`.
+[group_vars/all.yml](group_vars/all.yml), so a core run needs just a
+key and the two SSH login choices.
 
-## Connecting to the server after hardening
+## SSH access
 
-Role 02 disables password authentication **and** root login, and
-restricts SSH to the single `deploy` user. After the first run you can
-no longer `ssh root@host` with a password — connect as `deploy` with the
-private key whose public half you installed:
+This section explains what auto_sec does to SSH, and what you choose.
 
-```bash
-ssh -i /path/to/your_private_key deploy@your.server.ip
-# deploy has passwordless sudo:
-sudo whoami   # -> root
+### What auto_sec changes, and what it leaves alone
+
+- It writes one file: `/etc/ssh/sshd_config.d/00-autosec.conf`. It
+  never rewrites the main `/etc/ssh/sshd_config` or other drop-in files,
+  so your provider's settings keep working.
+- It writes only what you chose. A setting left as `keep` is not
+  written at all.
+- It only **adds** SSH keys. It never deletes or rewrites a key line.
+  You remove old keys yourself.
+- It never moves the SSH port, and never touches `ssh.socket`.
+
+### The login model
+
+You choose these per server in `host_vars/<server>.yml`. The wizard
+asks.
+
+| Variable | Values | Meaning |
+|---|---|---|
+| `ssh_admin_user` | an account, default `deploy` | The account you **and** Ansible log in as. Its keys (`ssh_admin_public_keys`) are added and tested. |
+| `ssh_permit_root_login` | `keep`, `prohibit-password`, `"no"` | Root login over SSH. `prohibit-password` means keys only. `"no"` needs a non-root admin account. |
+| `ssh_password_authentication` | `keep`, `"no"` | Password login, for every account. `"no"` means keys only. |
+
+- The two login choices have **no default**. The run stops until you
+  set both.
+- auto_sec never writes `yes`.
+- Always quote `"no"`. Unquoted, YAML reads it as `false`, and the run
+  stops with "quote it".
+- Set `ansible_user` in the inventory to the same name as
+  `ssh_admin_user`. A stricter rule is applied only on a run where
+  Ansible really is logged in as that account. Otherwise it waits, and
+  the run tells you why.
+
+Optional extras, all off by default: `ssh_allow_users` (an AllowUsers
+list; it must contain the admin account) and `ssh_extra_settings` (a
+fixed list of sshd settings, such as `MaxAuthTries`). The old
+`ssh_max_auth_tries` is gone: use `ssh_extra_settings.MaxAuthTries`.
+
+### Two stages: keep first, tighten later
+
+**Stage 1** changes nothing about how you log in:
+
+```yaml
+ssh_admin_user: root            # or deploy
+ssh_admin_public_keys:
+  - "ssh-ed25519 AAAA... you@laptop"
+ssh_permit_root_login: keep
+ssh_password_authentication: keep
 ```
 
-The private key stays on your machine; the server only ever holds the
-**public** key in `/home/deploy/.ssh/authorized_keys`. If you used the
-wizard, the connection details are written to `inventory/<server>.yml`,
-so later playbook runs are just:
+Run it. Then check, from a **new** terminal, that your key works
+(exit code 0 means yes):
+
+```bash
+ssh -o BatchMode=yes -o PreferredAuthentications=publickey \
+    -i ~/.ssh/your_key root@your.server.ip true
+```
+
+**Stage 2**, later, one server at a time. First move every tool that
+logs in with a password to a key: VS Code Remote-SSH, scripts,
+teammates. Then set:
+
+```yaml
+ssh_permit_root_login: prohibit-password
+ssh_password_authentication: "no"
+```
+
+Preview with `--check --diff --tags ssh` first, then run for real. Only these two
+settings change.
+
+While root login or password login is still on, every run prints a
+warning, "SSH login NOT hardened", and the report says so too. In
+stage 1 that is expected.
+
+### What a run does to SSH
+
+1. **Checks before anything changes.** They run before role 01, and in
+   `--check` too. They only read. The run stops if:
+   - `ssh_port` is not the port sshd listens on, or Ansible did not
+     arrive on it;
+   - a port change is waiting in the files but is not live yet (the
+     hidden `ssh.socket` switch);
+   - the SSH files changed after sshd last loaded them;
+   - an earlier undo is still pending;
+   - the run would change sshd, and ufw is active but no rule lets a
+     new SSH connection reach `ssh_port` (the login tests would fail);
+   - the command line has `-e ansible_ssh_args` or `-e ansible_become`
+     (they would replace the login tests' own options).
+2. **A trial run on a copy.** The new config is built in
+   `/run/auto-sec` and checked with `sshd -t`. The run shows the
+   before and after (`sshd -T`). If a login setting you did not choose
+   would change, it stops.
+3. **Keys are added**, then tested on a **brand-new** connection, the
+   way Ansible logs in. If a rule gets stricter and the test fails,
+   nothing is written.
+4. **An undo timer is armed.** The default is 5 minutes
+   (`ssh_revert_seconds`). The run prints the exact server time.
+5. The file is written, checked, and **loaded at once** with
+   `systemctl try-reload-or-restart ssh.service`. Open sessions
+   normally stay connected.
+6. **A second fresh login test.** Only when it works is the undo
+   cancelled.
+
+If something fails in between, the old files come back and sshd is
+reloaded. If the connection drops, the timer does it at the deadline.
+If the server reboots inside the window, a boot-time unit puts the old
+files back before sshd starts.
+
+While the timer is armed, do not reboot and do not edit `/etc/ssh`.
+Check it with `sudo auto-sec-ssh-guard status`.
+
+Two more safety rules:
+
+- At most `ssh_max_hosts_per_run` servers (default 5) get an SSH change
+  in one run. Use `-l` for the rest.
+- For the length of the run, your IP is added to fail2ban's ignore
+  list (remote mode, when fail2ban's `sshd` jail is active), so a failed
+  test cannot get you banned. It is removed at the end.
+
+### Local mode (running on the server itself)
+
+In local mode, auto_sec cannot test a new login from your laptop. So it
+only applies SSH settings that change nothing. If your choice would
+change a login rule, the run stops before any change, and tells you to
+run it from your own computer. Use `keep` in local mode. Tighten later,
+from your computer.
+
+An SSH login from the server to itself (`ansible_host: 127.0.0.1`)
+counts as local mode too: its login tests use a key stored on the
+server, so they prove nothing about your own computer.
+
+### The SSH port
+
+`ssh_port` must be the port sshd **already** listens on (default 22).
+auto_sec checks it and opens it in ufw, but never moves sshd. To move
+the port, follow [docs/ssh-port.md](docs/ssh-port.md).
+
+### High mode keeps SSH visible in 0.4.0
+
+With `paranoia_level: high`, auto_sec installs and starts fwknop, but
+the SSH port **stays visible** and rate-limited, as in standard mode.
+Hiding SSH behind a knock returns in a later release.
+
+A high-mode server set up by auto_sec 0.1–0.3 has **no** ufw rule for
+SSH (0.3's fwknop role deleted it). Before you run 0.4.0 there, knock,
+log in, and add it: `sudo ufw limit <ssh_port>/tcp`. Otherwise the
+run refuses, because its login tests need new connections. See
+CHANGELOG "Upgrading".
+
+### Connecting
+
+```bash
+ssh -i /path/to/your_private_key <admin account>@your.server.ip
+```
+
+The private key stays on your machine. The server only holds the
+public key. If you used the wizard, later runs are just:
 
 ```bash
 ansible-playbook -i inventory site.yml -l <server>
 ```
 
-**Don't lock yourself out.** Before the first run, make sure the public
-key you install matches a private key you actually hold. Keep a
-break-glass path until you've confirmed access:
+**Don't lock yourself out.** Keep a break-glass path until you have
+confirmed access:
 
-- set `office_static_ip` so your IP keeps direct SSH access, and/or
+- set `office_static_ip` to your office or home static IP (never the
+  server's own). It skips the SSH rate limit, and fail2ban never bans
+  it. `fail2ban_ignore_ips` adds more fixed IPs;
 - keep your provider's console/VNC (e.g. Contabo) reachable.
 
-With `paranoia_level: high`, the SSH port is also invisible until you
-send a valid fwknop knock — see
-[roles/04-fwknop/CLIENT-SIDE.md](roles/04-fwknop/CLIENT-SIDE.md):
+### Upgrading a server set up by 0.1–0.3
+
+Old versions replaced the main `sshd_config` with a file that has no
+`Include` line. auto_sec 0.4.0 refuses that file until you migrate it
+once. In short: set the login choices that match what you want (the
+[CHANGELOG](CHANGELOG.md) has a block that matches 0.3), then run once:
 
 ```bash
-fwknop -n <server> && ssh -i /path/to/key deploy@your.server.ip
+ansible-playbook -i inventory site.yml -l <server> --tags ssh \
+  -e ssh_migrate_sshd_config=true
 ```
+
+The stock `sshd_config` comes back, under the same trial run and undo
+timer. Keys that 0.1–0.3 deleted cannot be recovered.
 
 ## Tested on real hardware
 
@@ -227,14 +398,17 @@ socket — all fixed. Run `sudo tests/redteam.sh` on your own staging box
 to reproduce it. (The SSH login tripwire is off by default because live
 testing showed it false-positives on automation; see below.)
 
+That run predates 0.4.0. The new SSH handling in 0.4.0 is covered by CI
+and lab tests, but has not yet run on a real VPS.
+
 ## The layers
 
 | # | Role | Type | Purpose |
 |---|------|------|---------|
 | 01 | base | Preventive | Auto security updates, kernel hardening, deploy user |
-| 02 | ssh-hardening | Preventive | Keys only, no root, no passwords |
+| 02 | ssh-hardening | Preventive | Login rules you choose, key tested first, automatic undo |
 | 03 | firewall | Preventive | UFW default deny + fail2ban |
-| 04 | fwknop | Preventive | Single Packet Authorization, invisible SSH |
+| 04 | fwknop | Preventive | Single Packet Authorization (SSH stays visible in 0.4.0) |
 | 05 | app-runtime | Preventive | Node/PM2 or Docker + hardened Nginx + TLS |
 | 06 | database | Protective | Localhost only, least privilege |
 | 07 | backups | Recovery | Encrypted nightly backups to no-delete B2 bucket |
@@ -246,9 +420,13 @@ testing showed it false-positives on automation; see below.)
 Partial runs with tags:
 
 ```bash
+ansible-playbook -i inventory site.yml -l myserver --tags ssh
 ansible-playbook -i inventory site.yml -l myserver --tags backups
 ansible-playbook -i inventory site.yml -l myserver --tags "firewall,detection"
 ```
+
+The read-only SSH checks run with every tag, because they also protect
+the firewall role.
 
 ## The detection suite, honestly
 
@@ -410,13 +588,15 @@ once you know your app's outbound needs.
 
 Set `paranoia_level` in `host_vars/<server>.yml`:
 
-- `standard`: SSH port open (rate-limited, keys only), watcher alerts
-- `high`: fwknop gates SSH (port invisible until a valid knock),
-  watcher may run in `active` mode
+- `standard`: SSH port open and rate-limited, fail2ban, watcher alerts
+- `high`: also installs and starts fwknop (Single Packet
+  Authorization). **In 0.4.0 the SSH port stays visible**, exactly as in
+  standard mode. Hiding it behind a knock returns in a later release.
+  The watcher may run in `active` mode.
 
 **Before enabling `high`**, confirm you have provider console (VNC)
-access as break-glass, and keep `office_static_ip` allowed directly on
-the SSH port until you're comfortable. Client-side knock setup:
+access as break-glass. You do not need the knock client yet; to get
+ready for later, see
 [roles/04-fwknop/CLIENT-SIDE.md](roles/04-fwknop/CLIENT-SIDE.md).
 
 ## Backups you can trust
@@ -449,15 +629,43 @@ For team setups, use `ansible-vault` for the values in host_vars.
 ## Repo layout
 
 ```
-site.yml                 master playbook (roles 01→10 in order)
+site.yml                 master playbook (roles 01→11 in order)
 group_vars/all.yml       global defaults, override per server
 host_vars/<server>.yml   per-server config + secrets (gitignored)
 inventory/<server>.yml   connection details (gitignored)
 scripts/bootstrap.sh     installs deps, runs the wizard
 scripts/configure.sh     interactive config generator
 restore-test/            monthly backup restore verification
-roles/01..10-*           the layers
+roles/01..11-*           the layers
+docs/ssh-port.md         how to move the SSH port by hand
+tests/                   red-team, guard, sshd and live role tests
 ```
+
+## Known limitations
+
+- **A full `site.yml` run on a server that is already in production is
+  not safe yet.** It rewrites `/etc/fail2ban/jail.local` (#2), turns on
+  automatic reboots at 04:00 (#3), and changes the hostname and timezone
+  (#7). Until those are fixed, use `--tags ssh` on such servers, and do
+  not put the playbook in cron. A fresh server is fine.
+- The playbook targets every host in the inventory. Always pass
+  `-l <server>`.
+- In local mode, SSH login rules cannot be tightened (see
+  [Local mode](#local-mode-running-on-the-server-itself)).
+- High mode keeps the SSH port visible in 0.4.0.
+- The key test only proves the path Ansible uses: your key, from your
+  IP. Other tools, such as VS Code on Windows, can still break in
+  stage 2. Test them yourself before you tighten.
+- Debian 12 and 13 are tested in CI only: their real OpenSSH packages
+  are checked for how they read the config. There has been no live run
+  on Debian yet.
+- Some 0.4.0 safety parts are not yet proven on a real server, such as
+  the boot-time undo after a reboot. The [CHANGELOG](CHANGELOG.md) lists
+  them.
+- Keys deleted by versions 0.1–0.3 cannot be recovered.
+- The checks read data from the server (`sshd`, `systemctl`, `ss`, the
+  journal). They guard against mistakes, not against a server that is
+  already compromised.
 
 ## Disclaimer
 

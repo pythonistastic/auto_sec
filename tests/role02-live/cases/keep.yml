@@ -1,0 +1,4 @@
+---
+# Stage 1: change nothing about logins.
+ssh_permit_root_login: keep
+ssh_password_authentication: keep
