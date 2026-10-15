@@ -28,6 +28,27 @@
 {%- set _hard = _prl != 'yes' and _pwd == 'no' and _pwd_root == 'no' -%}
 {%- set _why = (['root can log in with a password'] if _prl == 'yes' else [])
              + (['password login is enabled'] if (_pwd != 'no' or _pwd_root != 'no') else []) -%}
+{#- Update lines show what apt uses, read during this run (never intent):
+    _base_uu_after   role 01's check after its change (role 01 ran);
+    _base_uu_before  role 01's preflight, at the start of the run;
+    neither          (preflight skipped): no claim is made.
+    Role 01's parser has already replaced every brace in these host values.
+    _base_tz_after is the timezone after role 01 (it matched a strict
+    pattern); '' when unknown. -#}
+{%- set _uu = _base_uu_after | default({}, true) -%}
+{%- set _uu = _uu if (_uu | length > 0) else (_base_uu_before | default({}, true)) -%}
+{%- set _uu_known = _base_uu_before is defined -%}
+{%- set _uu_inst = (_base_uu_installed | default(false) | bool)
+                   or ((_base_uu_after | default({}, true) | length > 0) and (_base_uu_install | default(false) | bool)) -%}
+{%- set _uu_on = _uu_inst
+                 and (_uu['APT::Periodic::Unattended-Upgrade'] | default(['']) | last) not in ['0', '']
+                 and (_uu['APT::Periodic::Update-Package-Lists'] | default(['']) | last) not in ['0', '']
+                 and (_uu['APT::Periodic::Enable'] | default(['1']) | last) != '0' -%}
+{%- set _uu_timer_off = (_base_uu_timer | default('')) not in ['', 'enabled', 'static', 'indirect', 'alias'] -%}
+{%- set _rb_on = (_uu['Unattended-Upgrade::Automatic-Reboot'] | default(['']) | last | lower) in ['1', 'yes', 'true', 'with', 'on', 'enable'] -%}
+{%- set _rb_time = _uu['Unattended-Upgrade::Automatic-Reboot-Time'] | default(['now']) | last -%}
+{%- set _tz = _base_tz_after | default('', true) -%}
+{%- set _tz_txt = (' ' ~ _tz) if (_tz | length > 0) else ' (server time)' -%}
 # Server Security Report
 
 **Client:** {{ client_name }}
@@ -40,8 +61,24 @@
 
 ## 1. Preventive measures
 
-- Operating system fully patched, automatic security updates enabled
-  (nightly, reboot window 04:00 {{ timezone }} when required)
+{% if _uu_known %}
+- Automatic security updates (unattended-upgrades, read from apt during
+  this run): {% if _uu_on and not _uu_timer_off %}on, nightly{% elif _uu_on %}configured on, but
+  apt-daily-upgrade.timer is {{ _base_uu_timer }}, so they do not run{% else %}off{% endif %}
+
+{% if _uu_on %}
+  - Sources: {{ 'security archives only' if ((_base_uu_after | default({}, true) | length > 0) and (_base_uu_origins | default('keep')) == 'security') else 'as configured on the server' }}
+  - Automatic reboot when an update needs one: {% if not _rb_on %}off{% elif _rb_time == 'now' %}on, right after the nightly update{% elif _rb_time is match('^([01][0-9]|2[0-3]):[0-5][0-9]$') %}on, at {{ _rb_time }}{{ _tz_txt }}{% else %}on, at a time set on the server{% endif %}
+
+{% endif %}
+  - Reboot pending at the start of this run: {{ 'yes' if (_base_reboot_pending | default(false) | bool) else 'no' }}
+{% if (_base_pending_upgrades | default(-1) | int) >= 0 %}
+  - Package updates waiting at the start of this run: {{ _base_pending_upgrades | int }}
+{% endif %}
+{% else %}
+- Automatic updates: not checked in this run, so this report makes no
+  claim about them
+{% endif %}
 {% if _ssh_known %}
 - SSH login (effective settings, read from the SSH server during this run):
   - Root login: {{ {'yes': 'allowed, with a password or a key', 'prohibit-password': 'key only', 'without-password': 'key only', 'forced-commands-only': 'key only, fixed commands', 'no': 'disabled'}[_prl] | default(_prl) }}
@@ -73,7 +110,7 @@
   (80/443){% if _ssh_fw_limit %} and SSH (port {{ ssh_port | int }}, rate-limited){% else %}. No rate-limited
   SSH rule for port {{ ssh_port | int }} was found (see the firewall status below){% endif %}
 
-- Intrusion throttling: fail2ban active with escalating ban times
+- Intrusion throttling (fail2ban, read during this run): {{ _f2b_report | default('not checked in this run') }}
 {% if paranoia_level == "high" %}
 - Single Packet Authorization (fwknop) is set up.{% if _ssh_fw_limit %} In this release SSH
   is not hidden behind it: the SSH port stays reachable, rate-limited by
@@ -99,7 +136,7 @@
 
 ## 3. Backup and recovery
 
-- Nightly encrypted backups at 0{{ backup_hour }}:{{ backup_minute }} {{ timezone }}
+- Nightly encrypted backups at {{ '%02d:%02d' | format(backup_hour | int, backup_minute | int) }}{{ _tz_txt }}
 - Encryption performed on the server before upload, decryption key is
   held offline by {{ report_prepared_by }}, never stored on the server
 - Destination: Backblaze B2 bucket with versioning, using an access key

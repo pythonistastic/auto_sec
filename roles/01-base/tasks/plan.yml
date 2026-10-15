@@ -1,0 +1,143 @@
+---
+# roles/01-base/tasks/plan.yml - preflight B1: check role 01's variables
+# and turn them into plan facts. No host access, so it also runs in the
+# tests (tests/base/semantics). Every refusal ends with "Nothing has been
+# changed.": preflight runs before any role changes the server.
+#
+# Facts set here:
+#   _base_uu_enabled_mode  auto | on | keep
+#   _base_uu_reboot        keep | on | off
+#   (on/off, not true/false: set_fact in ansible-core < 2.19 turns the
+#   strings "true" and "false" into booleans.)
+#   _base_uu_origins       keep | security
+#   _base_uu_blacklist     package names to exclude (Docker list + yours)
+#   _base_uu_blacklist_re  the same as unattended-upgrades patterns: "name$",
+#                          with "." and "+" escaped
+#   _base_full_upgrade     bool
+#   _base_migrate          bool  apt_migrate_unattended_upgrades
+# (_base_hostname_want and _base_tz_want are in defaults/main.yml.)
+
+- name: "Base B1: on/off switches are true or false"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (unattended_exclude_docker | default(false) | string | lower) in _base_bool_words
+      - (apt_full_upgrade | default(false) | string | lower) in _base_bool_words
+      - (apt_migrate_unattended_upgrades | default(false) | string | lower) in _base_bool_words
+    fail_msg: >-
+      unattended_exclude_docker ({{ unattended_exclude_docker | default(false) }}),
+      apt_full_upgrade ({{ apt_full_upgrade | default(false) }}) and
+      apt_migrate_unattended_upgrades ({{ apt_migrate_unattended_upgrades | default(false) }}) must
+      each be true or false. Nothing has been changed.
+
+- name: "Base B1: unattended_upgrades_enabled is auto, true or keep"
+  ansible.builtin.assert:
+    quiet: true
+    that: _base_en in ['auto', 'keep'] or _base_en in _base_yes_words
+    fail_msg: >-
+      {% if _base_en in ['false', 'no', '0', 'off'] %}unattended_upgrades_enabled is
+      {{ unattended_upgrades_enabled }}. auto_sec never turns automatic updates off; use
+      keep to leave them as they are on the server.
+      {% else %}unattended_upgrades_enabled is "{{ unattended_upgrades_enabled }}". Allowed:
+      auto (turn them on unless the server turned them off on purpose), true (turn them
+      on) or keep (leave them as they are).
+      {% endif %}Nothing has been changed.
+  vars:
+    _base_en: "{{ unattended_upgrades_enabled | default('auto') | string | lower }}"
+
+- name: "Base B1: unattended_automatic_reboot is keep, true or false"
+  ansible.builtin.assert:
+    quiet: true
+    that: (unattended_automatic_reboot | default('keep') | string | lower) in (['keep'] + _base_bool_words)
+    fail_msg: >-
+      unattended_automatic_reboot is "{{ unattended_automatic_reboot }}". Allowed: keep
+      (leave the server's setting alone), true (reboot at unattended_reboot_time) or
+      false (never reboot automatically). Nothing has been changed.
+
+- name: "Base B1: unattended_reboot_time is a quoted HH:MM time"
+  when: >-
+    (unattended_automatic_reboot | default('keep') | string | lower) in _base_yes_words
+    or (unattended_reboot_time | default(none)) is not none
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (unattended_reboot_time | default(none)) is not none
+      - unattended_reboot_time is string
+      - unattended_reboot_time is match(_base_time_re)
+    fail_msg: >-
+      {% if (unattended_reboot_time | default(none)) is none %}unattended_automatic_reboot is
+      true, so unattended_reboot_time is required: the time of day the server may
+      reboot, quoted, e.g. unattended_reboot_time: "03:30".
+      {% elif unattended_reboot_time is number %}unattended_reboot_time is {{ unattended_reboot_time }}:
+      YAML read an unquoted time as {{ unattended_reboot_time }} (minutes or seconds). Quote it,
+      e.g. unattended_reboot_time: "03:30".
+      {% else %}unattended_reboot_time is "{{ unattended_reboot_time }}". Use a 24-hour time
+      HH:MM with two-digit hours, quoted, e.g. "03:30" (00:00-23:59).
+      {% endif %}Nothing has been changed.
+
+- name: "Base B1: unattended_origins is keep or security"
+  ansible.builtin.assert:
+    quiet: true
+    that: (unattended_origins | default('keep') | string | lower) in ['keep', 'security']
+    fail_msg: >-
+      unattended_origins is "{{ unattended_origins }}". Allowed: keep (leave the origin
+      list alone) or security. Nothing has been changed.
+
+- name: "Base B1: unattended_upgrade_blacklist is a list of package names"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _base_bl is sequence
+      - _base_bl is not string
+      - _base_bl is not mapping
+      - _base_bl | reject('string') | list | length == 0
+      - _base_bl | reject('match', _base_pkg_re) | list | length == 0
+    fail_msg: >-
+      unattended_upgrade_blacklist must be a list of exact Debian package names
+      (lowercase letters, digits, + . -), e.g. ["nginx", "postgresql-16"]. Patterns
+      such as "docker-ce$" or "linux-image-.*" are not accepted: an invalid pattern stops every
+      automatic update. Got: {{ _base_bl if _base_bl is not sequence or _base_bl is string
+      else (_base_bl | map('string') | reject('match', _base_pkg_re) | list) }}. Nothing has been changed.
+  vars:
+    _base_bl: "{{ unattended_upgrade_blacklist | default([]) }}"
+
+- name: "Base B1: server_hostname is keep or a hostname"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - server_hostname | default('keep') is string
+      - server_hostname | default('keep') == 'keep' or server_hostname is match(_base_hostname_re)
+    fail_msg: >-
+      server_hostname is "{{ server_hostname }}". Use keep (leave the server's hostname
+      alone) or a lowercase hostname or FQDN of at most 64 characters, e.g.
+      mail.example.com. Nothing has been changed.
+
+- name: "Base B1: timezone is keep or a timezone name"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - timezone | default('keep') is string
+      - timezone | default('keep') == 'keep' or timezone is match(_base_tz_re)
+    fail_msg: >-
+      timezone is "{{ timezone }}". Use keep (leave the server's timezone alone) or an
+      IANA timezone name such as "UTC" or "Europe/Berlin". Nothing has been changed.
+
+- name: "Base B1: the plan"
+  ansible.builtin.set_fact:
+    _base_uu_enabled_mode: "{{ 'on' if _base_en in _base_yes_words else _base_en }}"
+    _base_uu_reboot: >-
+      {{ 'keep' if _base_rb == 'keep' else ('on' if _base_rb in _base_yes_words else 'off') }}
+    _base_uu_origins: "{{ unattended_origins | default('keep') | string | lower }}"
+    _base_uu_blacklist: "{{ _base_bl_all }}"
+    _base_uu_blacklist_re: >-
+      {{ _base_bl_all | map('replace', '.', '\.') | map('replace', '+', '\+')
+         | map('regex_replace', '^(.*)$', '\1$') | list }}
+    _base_uu_reboot_time: "{{ unattended_reboot_time | default('') | string }}"
+    _base_full_upgrade: "{{ (apt_full_upgrade | default(false) | string | lower) in _base_yes_words }}"
+    _base_migrate: "{{ (apt_migrate_unattended_upgrades | default(false) | string | lower) in _base_yes_words }}"
+  vars:
+    _base_en: "{{ unattended_upgrades_enabled | default('auto') | string | lower }}"
+    _base_rb: "{{ unattended_automatic_reboot | default('keep') | string | lower }}"
+    _base_bl_all: >-
+      {{ ((_base_docker_packages if ((unattended_exclude_docker | default(false) | string | lower) in _base_yes_words) else [])
+          + (unattended_upgrade_blacklist | default([]) | map('string') | list)) | unique | list }}

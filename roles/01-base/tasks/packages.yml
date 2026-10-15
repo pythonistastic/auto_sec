@@ -1,0 +1,102 @@
+---
+# roles/01-base/tasks/packages.yml - the packages role 01 installs, and
+# what apt would do to install them. Read-only. Imported twice:
+#   preflight B5b (_base_pkg_ctx: preflight): before any change, on the
+#     package lists as they are;
+#   main step 1 (_base_pkg_ctx: main): again, after the lists were
+#     refreshed, right before the install.
+#
+# Role 01 installs only missing packages, without their recommendations
+# (0.1-0.4's python3-pip pulled in a compiler through them). Installing a
+# package can still upgrade packages you have (it may need an exact newer
+# version of a library, e.g. libc6) or remove one (a conflict), and on a
+# production server that restarts services (needrestart). apt's own
+# simulation (`apt-get -s`) shows both, as "Inst <pkg> [<installed>]" and
+# "Remv" lines. The run stops on them, unless -e apt_full_upgrade=true says
+# this run may upgrade packages.
+#
+# Sets _base_pkgs_missing (list) and _base_pkg_side (list of
+# "<pkg> <installed> -> <new>" and "remove <pkg> <installed>").
+
+- name: "Base packages: which of role 01's packages are installed?"
+  ansible.builtin.command:
+    argv: "{{ ['dpkg-query', '-W', '-f=${db:Status-Abbrev} ${Package}\n'] + _base_pkg_want }}"
+  register: _base_pkgq
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  vars:
+    _base_pkg_want: "{{ _base_packages + (['unattended-upgrades'] if (_base_uu_install | bool) else []) }}"
+
+- name: "Base packages: the missing ones"
+  ansible.builtin.set_fact:
+    _base_pkgs_missing: "{{ _base_pkg_want | reject('in', _base_pkg_have) | list }}"
+    _base_pkg_side: []
+  vars:
+    _base_pkg_want: "{{ _base_packages + (['unattended-upgrades'] if (_base_uu_install | bool) else []) }}"
+    _base_pkg_have: >-
+      {{ _base_pkgq.stdout_lines | default([]) | select('match', '^.i. \S+$')
+         | map('regex_replace', '^.i. (\S+)$', '\1') | list }}
+
+# The package names are role constants (defaults/main.yml), never host data.
+- name: "Base packages: what apt would do to install them"
+  when: _base_pkgs_missing | length > 0
+  ansible.builtin.command:
+    argv: "{{ ['apt-get', '-s', '-o', 'Debug::NoLocking=true', '--no-install-recommends', 'install'] + _base_pkgs_missing }}"
+  environment:
+    LC_ALL: C
+  register: _base_pkgsim
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Base packages: upgrades and removals the install would cause"
+  when: _base_pkgs_missing | length > 0
+  ansible.builtin.set_fact:
+    _base_pkg_side: >-
+      {{ (_base_pkgsim.stdout_lines | default([]) | map('regex_replace', '[{}]', '?')
+          | select('match', '^Inst \S+ \[[^]]*\] \(\S+')
+          | map('regex_replace', '^Inst (\S+) \[([^]]*)\] \((\S+).*$', '\1 \2 -> \3') | list)
+         + (_base_pkgsim.stdout_lines | default([]) | map('regex_replace', '[{}]', '?')
+            | select('match', '^Remv \S+')
+            | map('regex_replace', '^Remv (\S+)( \[([^]]*)\])?.*$', 'remove \1 \3') | map('trim') | list) }}
+
+# Before the lists are refreshed, apt may not know a package yet (a new
+# server often has no lists at all): say so, and check again in main
+# (--check does not refresh the lists: the apt module skips that).
+- name: "Base packages: apt cannot plan the install with the current lists"
+  when:
+    - _base_pkg_ctx == 'preflight' or ansible_check_mode
+    - _base_pkgs_missing | length > 0
+    - _base_pkgsim.rc != 0
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: apt cannot plan the install of {{ _base_pkgs_missing | join(', ') }} on
+      {{ inventory_hostname }} with its current package lists
+      ({{ (_base_pkgsim.stderr_lines | default([]) + _base_pkgsim.stdout_lines | default([]))
+      | select('match', '^E:') | map('regex_replace', '[{}]', '?')
+      | list | join(' ') | truncate(300) }}). Role 01 refreshes the lists and checks again before
+      it installs anything.
+
+- name: "Base packages: installing them must not upgrade or remove packages you have"
+  when: _base_pkgs_missing | length > 0
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _base_pkg_ctx == 'preflight' or ansible_check_mode or _base_pkgsim.rc == 0
+      - _base_pkg_side | length == 0 or (_base_full_upgrade | bool)
+    fail_msg: >-
+      {% if _base_pkgsim.rc != 0 %}apt cannot install {{ _base_pkgs_missing | join(', ') }} on
+      {{ inventory_hostname }}: {{ (_base_pkgsim.stderr_lines | default([]) + _base_pkgsim.stdout_lines | default([]))
+      | select('match', '^E:')
+      | map('regex_replace', '[{}]', '?') | list | join(' ') | truncate(400) }}.
+      {% else %}Installing {{ _base_pkgs_missing | join(', ') }} on {{ inventory_hostname }} would also
+      change packages you have: {{ _base_pkg_side | join('; ') | truncate(800) }}. That can restart
+      services. Role 01 installs missing packages only; it upgrades or removes nothing unless you
+      ask. {% if _base_pkg_up | length > 0 %}Upgrade those packages yourself when it suits you
+      (apt-get install --only-upgrade {{ _base_pkg_up | join(' ') }}), or install
+      {% else %}Install {% endif %}{{ _base_pkgs_missing | join(' ') }} yourself, or run once with
+      -e apt_full_upgrade=true.
+      {% endif %}Nothing has been changed{{ ' (only the package lists were refreshed)' if _base_pkg_ctx == 'main' else '' }}.
+  vars:
+    _base_pkg_up: "{{ _base_pkg_side | reject('match', '^remove ') | map('split', ' ') | map('first') | list }}"

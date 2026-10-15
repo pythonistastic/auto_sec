@@ -1,0 +1,4 @@
+---
+# fail2ban_defaults: {} - auto_sec sets no [DEFAULT] value at all.
+ssh_port: 22
+fail2ban_defaults: {}

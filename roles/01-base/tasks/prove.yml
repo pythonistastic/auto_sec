@@ -1,0 +1,97 @@
+---
+# roles/01-base/tasks/prove.yml - role 01 main, step 4 (not in --check).
+#
+# Runs the trial-run script again, with auto_sec's real file as the
+# "candidate": its B records are apt's real configuration after the write,
+# its A records a copy of it. Then:
+#   - the copy must read exactly like the real configuration (the trial
+#     run reads apt the way apt does);
+#   - what you chose must be in effect (verify.yml, context prove);
+#   - when unattended-upgrades was already installed at preflight, the
+#     result must equal the trial run's (_base_uu_sim_after).
+# Sets _base_uu_after for role 10. A failure stops the run loudly and says
+# how to undo auto_sec's file. Like trial.yml it sets no owner on its
+# scratch folder (root creates it), so the unprivileged tests can run it.
+
+- name: "Base 4: scratch folder, root only"
+  ansible.builtin.file:
+    path: "{{ _base_run_dir }}"
+    state: directory
+    mode: "0700"
+  changed_when: false
+
+- name: "Base 4: prove what apt reads now"
+  block:
+    - name: "Base 4: read apt's configuration and a copy of it"
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - "{{ lookup('ansible.builtin.file', 'autosec-apt-sim') }}"
+          - sh
+          - "{{ _base_apt_parts }}"
+          - "{{ _base_sim_dir }}"
+          - "{{ '-' if (_base_uu_plan_empty | bool) else _base_uu_file }}"
+          - "{{ _base_uu_file | basename }}"
+          - "-"
+      environment:
+        LC_ALL: C
+      register: _base_m_sim
+      changed_when: false
+      failed_when: false
+
+    - name: "Base 4: apt reads its configuration"
+      ansible.builtin.assert:
+        quiet: true
+        that: _base_m_sim.rc == 0
+        fail_msg: >-
+          After this run's change, apt on {{ inventory_hostname }} cannot read its configuration
+          (exit {{ _base_m_sim.rc }}): {{ _base_m_sim.stdout_lines | default([]) | select('match', '^E ')
+          | map('regex_replace', '[{}]', '?') | list | join(' ') | truncate(600) }}. To undo auto_sec's
+          file, delete {{ _base_uu_file }}{{ (' and copy ' ~ _base_backup_file ~ ' back to ' ~ _base_uu_dist_file)
+          if (_base_uu_restore | bool) else '' }}.
+
+    - name: "Base 4: remember the real configuration"
+      ansible.builtin.set_fact:
+        _base_uu_after: "{{ _base_kv }}"
+        _base_m_s: >-
+          {{ _base_m_sim.stdout_lines | select('match', '^S ') | map('regex_replace', '^S ', '')
+             | map('regex_replace', '\$\{([a-z_]+)\}', '<\1>') | map('regex_replace', '[{}]', '?') | list }}
+      vars:
+        _base_kv_lines: "{{ _base_m_sim.stdout_lines | select('match', '^B ') | map('regex_replace', '^B ', '') | list }}"
+
+    - name: "Base 4: the copy as the trial run reads it"
+      ansible.builtin.set_fact:
+        _base_m_copy: "{{ _base_kv }}"
+      vars:
+        _base_kv_lines: "{{ _base_m_sim.stdout_lines | select('match', '^A ') | map('regex_replace', '^A ', '') | list }}"
+
+    - name: "Base 4: what you chose is in effect"
+      ansible.builtin.import_tasks: verify.yml
+      vars:
+        _base_chk: "{{ _base_uu_after }}"
+        _base_chk_s: "{{ _base_m_s }}"
+        _base_chk_ctx: prove
+
+    - name: "Base 4: the result equals the trial run"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _base_m_copy == _base_uu_after
+          - not (_base_uu_installed | bool) or _base_uu_after == _base_uu_sim_after
+        fail_msg: >-
+          {% if _base_m_copy != _base_uu_after %}auto_sec's trial run does not read apt's configuration
+          the way apt does on {{ inventory_hostname }} (real: {{ _base_uu_after | to_json | truncate(500) }};
+          copy: {{ _base_m_copy | to_json | truncate(500) }}). This is an auto_sec bug; please report it.
+          {% else %}apt on {{ inventory_hostname }} now uses a different configuration than the trial run
+          predicted. Keys that differ: {{ ((_base_uu_after | dict2items) | symmetric_difference(_base_uu_sim_after | dict2items))
+          | map(attribute='key') | unique | list }}. Something else changed apt's configuration during
+          this run.{% endif %} auto_sec's file is in place; to undo it, delete {{ _base_uu_file }}{{
+          (' and copy ' ~ _base_backup_file ~ ' back to ' ~ _base_uu_dist_file) if (_base_uu_restore | bool) else '' }}.
+
+  always:
+    - name: "Base 4: remove the copy"
+      ansible.builtin.file:
+        path: "{{ _base_sim_dir }}"
+        state: absent
+      changed_when: false

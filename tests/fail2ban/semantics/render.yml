@@ -1,0 +1,22 @@
+---
+# Renders role 03's fail2ban templates for one test case with
+# ansible.builtin.template, exactly as role 03 does. run.sh calls:
+#   ansible-playbook render.yml -e @cases/<case>.yml -e render_dest=<file>
+# Implicit localhost only: no inventory, no host is contacted.
+- name: Render 00-autosec.conf for the fail2ban-semantics tests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _role_dir: "{{ playbook_dir }}/../../../roles/03-firewall"
+    ssh_port: 22
+  tasks:
+    - name: Load the role defaults the template uses
+      ansible.builtin.include_vars:
+        file: "{{ _role_dir }}/defaults/main.yml"
+
+    - name: Render the file for this case
+      ansible.builtin.template:
+        src: "{{ _role_dir }}/templates/{{ render_template | default('00-autosec.conf.j2') }}"
+        dest: "{{ render_dest }}"
+        mode: "0644"

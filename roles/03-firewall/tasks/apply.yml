@@ -1,0 +1,275 @@
+---
+# roles/03-firewall/tasks/apply.yml - write, check, load and verify (F4-F10).
+#
+# Included by fail2ban.yml (_f2b_kind: main) and fail2ban-nginx.yml
+# (_f2b_kind: nginx) right after trial.yml and decide.yml have passed.
+#
+# - Writes only auto_sec's own file (and, with the migration switch, moves an
+#   auto_sec 0.1-0.4 jail.local to the backup folder). Never jail.local.
+# - Reloads fail2ban only when the trial showed an effective change; restarts
+#   only the sshd jail, and only when its actions change (a plain reload
+#   keeps the old port in the nftables/iptables rule). Never restarts,
+#   starts or stops fail2ban itself.
+# - On any failure, puts the previous files back (and loads them again if
+#   this run had reloaded), then stops the run.
+# In --check: the template shows its diff; nothing else is written.
+
+# What this include has done so far, for the rollback in `rescue`.
+- name: "fail2ban: nothing done yet"
+  ansible.builtin.set_fact:
+    _f2b_done_write: false
+    _f2b_done_remove: false
+    _f2b_done_reload: false
+    _f2b_done_restart: false
+    _f2b_backup_file: "{{ _f2b_backup_dir }}/jail.local.auto_sec-0.x.{{ now(utc=true, fmt='%Y%m%dT%H%M%SZ') }}"
+
+- name: "fail2ban: write, check, load and verify {{ _f2b_kinds[_f2b_kind].name }}"
+  block:
+    # F4. tmpfs, root only; removed in `always` below.
+    - name: "fail2ban F4: keep a copy of the current file for a rollback"
+      when: not ansible_check_mode
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - |
+            set -eu
+            umask 077
+            rm -rf -- "$2"
+            mkdir -p -- "$2"
+            if [ -f "$1" ] && [ ! -L "$1" ]; then cp -p -- "$1" "$2/prev"; fi
+          - sh
+          - "{{ _f2b_kinds[_f2b_kind].dest }}"
+          - "{{ _f2b_prev_dir }}"
+      changed_when: false
+
+    # F5. Migration (main only, only with -e fail2ban_migrate_jail_local=true
+    # and only for the exact file auto_sec 0.1-0.4 wrote; preflight R4).
+    - name: "fail2ban F5: backup folder for the old jail.local"
+      when:
+        - _f2b_will_migrate | bool
+        - not ansible_check_mode
+      ansible.builtin.file:
+        path: "{{ _f2b_backup_dir }}"
+        state: directory
+        owner: "{{ _f2b_file_owner }}"
+        mode: "0700"
+
+    - name: "fail2ban F5: copy the old jail.local to the backup folder"
+      when:
+        - _f2b_will_migrate | bool
+        - not ansible_check_mode
+      ansible.builtin.copy:
+        src: "{{ _f2b_jail_local }}"
+        dest: "{{ _f2b_backup_file }}"
+        remote_src: true
+        owner: "{{ _f2b_file_owner }}"
+        mode: "0600"
+        force: false
+
+    - name: "fail2ban F5: read both copies"
+      when:
+        - _f2b_will_migrate | bool
+        - not ansible_check_mode
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      loop:
+        - "{{ _f2b_jail_local }}"
+        - "{{ _f2b_backup_file }}"
+      register: _f2b_backup_stat
+
+    - name: "fail2ban F5: the backup must be identical before jail.local is moved"
+      when:
+        - _f2b_will_migrate | bool
+        - not ansible_check_mode
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _f2b_backup_stat.results[0].stat.checksum | default('a') == _f2b_backup_stat.results[1].stat.checksum | default('b')
+        fail_msg: >-
+          The backup {{ _f2b_backup_file }} is not identical to {{ _f2b_jail_local }}, so
+          jail.local was not moved.
+
+    - name: "fail2ban F5: what migration would do (check mode)"
+      when:
+        - _f2b_will_migrate | bool
+        - ansible_check_mode
+      ansible.builtin.debug:
+        msg: >-
+          Check mode: would move {{ _f2b_jail_local }} (written by auto_sec 0.1-0.4) to
+          {{ _f2b_backup_dir }}/ and write {{ _f2b_kinds[_f2b_kind].name }}.
+
+    # F6. Rendered from your variables only.
+    - name: "fail2ban F6: write {{ _f2b_kinds[_f2b_kind].name }}"
+      ansible.builtin.template:
+        src: "{{ _f2b_kinds[_f2b_kind].template }}"
+        dest: "{{ _f2b_kinds[_f2b_kind].dest }}"
+        owner: "{{ _f2b_file_owner }}"
+        mode: "0644"
+      register: _f2b_write
+
+    - name: "fail2ban F6: remember whether the file changed"
+      ansible.builtin.set_fact:
+        _f2b_done_write: "{{ _f2b_write is changed and not ansible_check_mode }}"
+
+    # F7. Only after auto_sec's file is in place.
+    - name: "fail2ban F7: move the old jail.local out of fail2ban's way"
+      when:
+        - _f2b_will_migrate | bool
+        - not ansible_check_mode
+      ansible.builtin.file:
+        path: "{{ _f2b_jail_local }}"
+        state: absent
+      register: _f2b_removed
+
+    - name: "fail2ban F7: remember the move"
+      when: _f2b_removed is not skipped
+      ansible.builtin.set_fact:
+        _f2b_done_remove: "{{ _f2b_removed is changed }}"
+
+    # F8. The trial already proved this on a copy; this checks the real
+    # files, in case something changed in between.
+    - name: "fail2ban F8: fail2ban-client -t on the real config"
+      when:
+        - not ansible_check_mode
+        - (_f2b_done_write | bool) or (_f2b_done_remove | bool)
+      ansible.builtin.command:
+        argv: "{{ _f2b_client.split() + ['-c', _f2b_conf_dir, '-t'] }}"
+      register: _f2b_t
+      changed_when: false
+
+    # F9. Reload keeps every jail and ban and runs no actions; the sshd jail
+    # restart restores its bans from fail2ban's database.
+    # Recorded before the command: a failed reload leaves fail2ban on its old
+    # config, and loading the restored files again changes nothing.
+    - name: "fail2ban F9: reload follows"
+      when:
+        - not ansible_check_mode
+        - _f2b_will_reload | bool
+      ansible.builtin.set_fact:
+        _f2b_done_reload: true
+        _f2b_done_restart: "{{ _f2b_will_restart_sshd | bool }}"
+
+    - name: "fail2ban F9: reload fail2ban (the effective config changes)"
+      when:
+        - not ansible_check_mode
+        - _f2b_will_reload | bool
+      ansible.builtin.command:
+        argv: "{{ _f2b_client.split() + ['-c', _f2b_conf_dir, 'reload'] }}"
+      changed_when: true
+
+    - name: "fail2ban F9: restart the sshd jail (its port or action changes)"
+      when:
+        - not ansible_check_mode
+        - _f2b_will_restart_sshd | bool
+      ansible.builtin.command:
+        argv: "{{ _f2b_client.split() + ['-c', _f2b_conf_dir, 'reload', '--restart', 'sshd'] }}"
+      changed_when: true
+
+    - name: "fail2ban F9: what would be loaded (check mode)"
+      when:
+        - ansible_check_mode
+        - _f2b_change_lines | length > 0
+      ansible.builtin.debug:
+        msg: >-
+          Check mode: {{ _f2b_plan }}.
+
+    # F10. The running server must now match the files: same jails, and the
+    # same maxretry, findtime, bantime and ignoreip in every jail.
+    - name: "fail2ban F10: the running fail2ban must match the files"
+      when:
+        - not ansible_check_mode
+        - _f2b_will_reload | bool
+      ansible.builtin.command:
+        argv:
+          - "{{ _f2b_python }}"
+          - -I
+          - -c
+          - "{{ lookup('ansible.builtin.file', 'auto-sec-f2b-check') }}"
+          - --verify
+          - --conf
+          - "{{ _f2b_conf_dir }}"
+          - --client
+          - "{{ _f2b_client }}"
+      register: _f2b_verify
+      changed_when: false
+      failed_when: false
+      until: >-
+        _f2b_verify.rc == 0 and (_f2b_verify.stdout | default('') is match('^\{'))
+        and ((_f2b_verify.stdout | from_json).running.same_jails_as_disk | default(false))
+        and ((_f2b_verify.stdout | from_json).running.drift | default(['?']) | length == 0)
+      retries: 5
+      delay: 2
+
+    - name: "fail2ban F10: verified"
+      when:
+        - not ansible_check_mode
+        - _f2b_will_reload | bool
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _f2b_verify.rc == 0
+          - _f2b_v.running.same_jails_as_disk | default(false)
+          - _f2b_v.running.drift | default(['?']) | length == 0
+        fail_msg: >-
+          After the reload, fail2ban on {{ inventory_hostname }} does not run what its files
+          say: running jails {{ _f2b_v.running.jails | default('?') }}, jails in the files
+          {{ _f2b_v.files.jails | default('?') }}, differences {{ _f2b_v.running.drift | default('?') }}
+          {{ _f2b_verify.stderr | default('') | regex_replace('[{}]', '?') }}.
+      vars:
+        _f2b_v: "{{ (_f2b_verify.stdout | from_json) if (_f2b_verify.stdout | default('') is match('^\\{')) else {} }}"
+
+  rescue:
+    - name: "fail2ban rollback: put back the previous {{ _f2b_kinds[_f2b_kind].name }}"
+      when: _f2b_done_write | bool
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - |
+            if [ -f "$2/prev" ]; then cp -p -- "$2/prev" "$1"; else rm -f -- "$1"; fi
+          - sh
+          - "{{ _f2b_kinds[_f2b_kind].dest }}"
+          - "{{ _f2b_prev_dir }}"
+      register: _f2b_rb_file
+      failed_when: false
+
+    - name: "fail2ban rollback: put jail.local back"
+      when: _f2b_done_remove | bool
+      ansible.builtin.copy:
+        src: "{{ _f2b_backup_file }}"
+        dest: "{{ _f2b_jail_local }}"
+        remote_src: true
+        owner: "{{ _f2b_file_owner }}"
+        mode: "0644"
+      register: _f2b_rb_local
+      failed_when: false
+
+    - name: "fail2ban rollback: load the previous config again"
+      when: _f2b_done_reload | bool
+      ansible.builtin.command:
+        argv: "{{ _f2b_client.split() + ['-c', _f2b_conf_dir, 'reload'] + (['--restart', 'sshd'] if (_f2b_done_restart | bool) else []) }}"
+      register: _f2b_rb_reload
+      failed_when: false
+
+    - name: "fail2ban rollback: stop the run"
+      ansible.builtin.fail:
+        msg: >-
+          fail2ban change on {{ inventory_hostname }} failed at "{{ ansible_failed_task.name | default('?') }}":
+          {{ ((ansible_failed_result.msg | default('')) ~ ' ' ~ (ansible_failed_result.stderr | default('')))
+             | string | regex_replace('[{}]', '?') | regex_replace('\s+', ' ') | trim | truncate(600) }}.
+          {% if _f2b_done_write | bool %}{{ 'Put the previous file back.' if (_f2b_rb_file.rc | default(1)) == 0
+          else 'Could not put the previous file back: check ' ~ _f2b_kinds[_f2b_kind].dest ~ ' by hand.' }} {% endif %}{% if _f2b_done_remove | bool %}{{ 'Put jail.local back from ' ~ _f2b_backup_file ~ '.'
+          if not (_f2b_rb_local is failed) else 'Could not put jail.local back: copy ' ~ _f2b_backup_file ~ ' to ' ~ _f2b_jail_local ~ ' by hand.' }} {% endif %}{% if _f2b_done_reload | bool %}{{ 'Loaded the previous config again.'
+          if (_f2b_rb_reload.rc | default(1)) == 0 else 'Could not reload fail2ban: run `sudo fail2ban-client -t` and `sudo fail2ban-client reload` by hand.' }}
+          {% else %}fail2ban was not reloaded, so it still runs the config it had.{% endif %}
+
+  always:
+    - name: "fail2ban: remove the rollback copy"
+      ansible.builtin.file:
+        path: "{{ _f2b_prev_dir }}"
+        state: absent
+      changed_when: false
+      check_mode: false
+      diff: false

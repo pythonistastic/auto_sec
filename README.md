@@ -107,7 +107,8 @@ cd auto_sec
 The bootstrap installs Ansible and dependencies, then runs an
 interactive wizard that:
 
-1. asks plain-language questions (domain, app type, database, alerts),
+1. asks plain-language questions (domain, app type, database, alerts,
+   reboots, hostname and timezone),
 2. generates every secret it can (age backup keypair, fwknop keys,
    database password),
 3. writes `host_vars/<server>.yml` + `inventory/<server>.yml`
@@ -115,9 +116,11 @@ interactive wizard that:
 4. prints — or runs — the exact hardening command.
 
 **Is the server already in production?** Read
-[Known limitations](#known-limitations) first. In short: for now, run
-only the SSH part there (`--tags ssh`), and do not put the playbook in
-cron.
+[Known limitations](#known-limitations) first. In short: a full run no
+longer touches your fail2ban files, update settings, reboots, hostname
+or timezone, but it still turns ufw on and changes other settings. On
+such a server, run only the parts you want (for example
+`--tags ssh,fail2ban`), and do not put the playbook in cron.
 
 **New to SSH keys?** You don't need to prepare anything first. An SSH key
 is a pair — a **private** half that stays secret on your computer and a
@@ -144,7 +147,8 @@ The playbook **fails fast**: a `pre_tasks` assert validates every
 required variable *before* any change, so an incomplete config aborts the
 run instead of leaving a half-hardened box. That assert block (top of
 [site.yml](site.yml)) is the **source of truth** for what's required.
-The read-only SSH checks run there too, before role 01.
+The read-only SSH, update and fail2ban checks run there too, before
+role 01.
 
 Minimal `host_vars` by scope (only what each needs):
 
@@ -360,7 +364,9 @@ confirmed access:
 
 - set `office_static_ip` to your office or home static IP (never the
   server's own). It skips the SSH rate limit, and fail2ban never bans
-  it. `fail2ban_ignore_ips` adds more fixed IPs;
+  it. `fail2ban_ignore_ips` adds more fixed IPs. (If your own
+  `jail.local` sets `ignoreip`, that list replaces auto_sec's. The run
+  warns when your IP is then missing from it.);
 - keep your provider's console/VNC (e.g. Contabo) reachable.
 
 ### Upgrading a server set up by 0.1–0.3
@@ -377,6 +383,125 @@ ansible-playbook -i inventory site.yml -l <server> --tags ssh \
 
 The stock `sshd_config` comes back, under the same trial run and undo
 timer. Keys that 0.1–0.3 deleted cannot be recovered.
+
+## Updates, reboots, hostname and timezone
+
+Role 01 handles automatic security updates (`unattended-upgrades`).
+
+### What auto_sec changes, and what it leaves alone
+
+- It writes at most one apt file,
+  `/etc/apt/apt.conf.d/51autosec-unattended-upgrades`, and only for a
+  setting you chose (reboots, origins, excluded packages, or
+  `unattended_upgrades_enabled: true`). With the defaults it writes no
+  apt file at all. It never edits the distro's `20auto-upgrades` or
+  `50unattended-upgrades`. One exception, only when you ask for it: on
+  a server set up by auto_sec 0.1–0.4, see
+  **Upgrading from 0.1–0.4** below.
+- Your own settings go in a file that sorts after auto_sec's, for
+  example `52unattended-upgrades-local`. Yours win. If yours would
+  cancel a choice you made for auto_sec, the run stops and names your
+  file and line.
+- By default (`auto`) it installs `unattended-upgrades` if it is
+  missing. The package's own setup turns the updates on (the Debian and
+  Ubuntu default). auto_sec writes no update switch of its own, so the
+  distro's way to turn them off (`dpkg-reconfigure unattended-upgrades`)
+  keeps working, and an interval of yours (for example weekly) stays.
+  If the updates are off, or the package was removed, they stay off and
+  the run warns. `true` turns them on with auto_sec's own file and keeps
+  them on.
+- It never turns on automatic reboots unless you choose them.
+- It leaves the hostname and the timezone alone unless you set them.
+- It no longer upgrades every package on every run. It installs only
+  missing packages (`curl`, and `unattended-upgrades`), without their
+  recommended extras, and stops instead if that would upgrade or remove
+  a package you have. On a brand-new server, add
+  `-e apt_full_upgrade=true` to the first run.
+
+Before anything changes, a read-only check (also in `--check`) runs apt
+itself on a copy of the configuration with auto_sec's file added, and
+shows which update settings would change.
+
+| Variable | Default | Values |
+|---|---|---|
+| `unattended_upgrades_enabled` | `auto` | `auto`, `true` or `keep`. auto_sec never turns updates off. |
+| `unattended_automatic_reboot` | `keep` | `keep`, `true` or `false` |
+| `unattended_reboot_time` | none | `"HH:MM"`, quoted. Required with `true`. |
+| `unattended_origins` | `keep` | `keep` or `security` |
+| `unattended_exclude_docker` | `false` | `true`: Docker is never updated automatically |
+| `unattended_upgrade_blacklist` | `[]` | exact package names, never updated automatically |
+| `server_hostname` | `keep` | `keep` or a hostname |
+| `timezone` | `keep` | `keep` or a name such as `"UTC"` |
+| `apt_full_upgrade` | `false` | one run only, with `-e` |
+| `apt_migrate_unattended_upgrades` | `false` | one run only, with `-e` (0.1–0.4 servers) |
+
+To allow reboots at a time you choose:
+
+```yaml
+unattended_automatic_reboot: true
+unattended_reboot_time: "03:30"   # quoted; in the server's own timezone
+```
+
+Updates run at about 06:00–07:00 server time. A reboot time that has
+already passed that day means the next day.
+
+A Docker update restarts the Docker service and every container. With
+`unattended_exclude_docker: true`, Docker is never updated
+automatically, and you update it yourself.
+
+A hostname change is refused while a mail server listens on port 25,
+465 or 587. A timezone change first lists the cron jobs and timers it
+moves.
+
+### Upgrading from 0.1–0.4
+
+auto_sec 0.1–0.4 replaced `50unattended-upgrades` with its own file,
+which turns on automatic reboots at 04:00 (and on Debian matched no
+archive, so nothing was updated). When that file is still exactly
+0.1–0.4's, the run stops and shows what putting the distro's file back
+changes. Then run once with:
+
+```bash
+ansible-playbook -i inventory site.yml -l <server> --tags base \
+  -e apt_migrate_unattended_upgrades=true
+```
+
+The old file is kept in `/var/lib/auto-sec/backup/`. On Debian the
+next nightly run may then install many waiting updates (point releases
+too) and restart services; set `unattended_origins: security` first to
+allow security updates only. To keep the old file as your own instead,
+add a comment line to it.
+
+## fail2ban
+
+- auto_sec writes one file: `/etc/fail2ban/jail.d/00-autosec.conf`. It
+  never writes `jail.local`.
+- fail2ban reads that file first, right after `jail.conf`. So every
+  value that your own files set wins (`jail.local`, other `jail.d`
+  files).
+- auto_sec's values are fail2ban `[DEFAULT]` values
+  (`fail2ban_defaults`), plus `enabled` and `port` for the `sshd` jail.
+  `fail2ban_defaults: {}` sets no values at all.
+- Before anything changes, fail2ban's own config reader runs on a copy
+  of `/etc/fail2ban` (also in `--check`). The run shows what would
+  change, and stops if auto_sec's values would change a jail of yours
+  (for example a `recidive` jail without its own `maxretry`), or if
+  your config does not load.
+- fail2ban is reloaded only when its effective config changes. A reload
+  keeps the bans. When nothing changes, there is no reload.
+- Role 03 adds no nginx jails. Role 05 (only when `app_type` is set)
+  adds `nginx-http-auth` and `nginx-botsearch` in
+  `/etc/fail2ban/jail.d/00-autosec-nginx.conf` after it has installed
+  nginx, with the same checks (`fail2ban_nginx_jails: false` turns them
+  off). A server whose nginx is yours gets none.
+- A `jail.local` written by auto_sec 0.1–0.4 is refused. The run shows
+  what migrating it changes. Then run once with
+  `-e fail2ban_migrate_jail_local=true`: the file moves to
+  `/var/lib/auto-sec/fail2ban/`. To keep it as your own file instead,
+  add a comment line to it. The migration also stops if a jail would
+  stop ignoring an address that the old file's `ignoreip` line holds
+  (add it to `fail2ban_ignore_ips` first).
+- `fail2ban_hardening_enabled: false` leaves fail2ban alone.
 
 ## Tested on real hardware
 
@@ -405,9 +530,9 @@ and lab tests, but has not yet run on a real VPS.
 
 | # | Role | Type | Purpose |
 |---|------|------|---------|
-| 01 | base | Preventive | Auto security updates, kernel hardening, deploy user |
+| 01 | base | Preventive | Automatic security updates (reboots only if you choose), kernel hardening, deploy user |
 | 02 | ssh-hardening | Preventive | Login rules you choose, key tested first, automatic undo |
-| 03 | firewall | Preventive | UFW default deny + fail2ban |
+| 03 | firewall | Preventive | UFW default deny + fail2ban (its own `jail.d` file; your `jail.local` wins) |
 | 04 | fwknop | Preventive | Single Packet Authorization (SSH stays visible in 0.4.0) |
 | 05 | app-runtime | Preventive | Node/PM2 or Docker + hardened Nginx + TLS |
 | 06 | database | Protective | Localhost only, least privilege |
@@ -421,12 +546,20 @@ Partial runs with tags:
 
 ```bash
 ansible-playbook -i inventory site.yml -l myserver --tags ssh
+ansible-playbook -i inventory site.yml -l myserver --tags fail2ban
 ansible-playbook -i inventory site.yml -l myserver --tags backups
 ansible-playbook -i inventory site.yml -l myserver --tags "firewall,detection"
 ```
 
+`fail2ban` is the fail2ban part of role 03 alone, without the ufw part
+(`firewall` runs both). Role 05's nginx jails are updated by runs that
+include `app`; `--skip-tags fail2ban` leaves them alone too.
+
 The read-only SSH checks run with every tag, because they also protect
-the firewall role.
+the firewall role. The update and fail2ban checks run with every tag
+too. A wrong value in their variables stops any run; their checks of
+the server stop a run only when it includes their role (`base`;
+`firewall` or `fail2ban`).
 
 ## The detection suite, honestly
 
@@ -638,16 +771,35 @@ scripts/configure.sh     interactive config generator
 restore-test/            monthly backup restore verification
 roles/01..11-*           the layers
 docs/ssh-port.md         how to move the SSH port by hand
-tests/                   red-team, guard, sshd and live role tests
+tests/                   red-team, guard, sshd, fail2ban, base and live role tests
 ```
 
 ## Known limitations
 
-- **A full `site.yml` run on a server that is already in production is
-  not safe yet.** It rewrites `/etc/fail2ban/jail.local` (#2), turns on
-  automatic reboots at 04:00 (#3), and changes the hostname and timezone
-  (#7). Until those are fixed, use `--tags ssh` on such servers, and do
-  not put the playbook in cron. A fresh server is fine.
+- **A full `site.yml` run on a server that is already in production
+  still changes it.** It no longer touches your fail2ban files, update
+  settings, reboots, hostname or timezone (#2, #3 and #7 are fixed).
+  But a full run still:
+  - turns ufw on if it is off, with incoming traffic denied by default.
+    Only SSH, 80 and 443 stay open; any other public service is cut.
+    On an active ufw it also sets the default policies and adds the
+    rate-limited SSH rule;
+  - creates the `deploy` user (or adds an existing one to `sudo`) and
+    gives it passwordless sudo in `/etc/sudoers.d/deploy`;
+  - writes kernel network settings into `/etc/sysctl.conf` and applies
+    them at once (for example, ICMP redirects are no longer accepted
+    or sent);
+  - installs `curl` and `unattended-upgrades` if they are missing (it
+    stops instead if that would upgrade or remove a package you have);
+  - adds auditd rules, a root cron job, detector services and a daily
+    CVE scan (roles 08, 09 and 11), and the app, database and backup
+    layers you configured;
+  - stops at the report (role 10) when `client_name` or
+    `client_domain` is not set, after the other roles have run.
+
+  So on such a server, run only the parts you want, for example
+  `--tags ssh,fail2ban`, preview with `--check --diff` first, and do not
+  put the playbook in cron. A fresh server is fine.
 - The playbook targets every host in the inventory. Always pass
   `-l <server>`.
 - In local mode, SSH login rules cannot be tightened (see
@@ -662,6 +814,14 @@ tests/                   red-team, guard, sshd and live role tests
 - Some 0.4.0 safety parts are not yet proven on a real server, such as
   the boot-time undo after a reboot. The [CHANGELOG](CHANGELOG.md) lists
   them.
+- The fail2ban and update checks are tested in a lab only: the real
+  fail2ban and unattended-upgrades packages of five Ubuntu and Debian
+  releases, run without root. Their live tests on GitHub's VMs have not
+  run yet, and fail2ban's reload behaviour was tested on fail2ban 1.0.2
+  only.
+- A fail2ban jail you add later without its own `maxretry`, `findtime`
+  or `bantime` uses auto_sec's `[DEFAULT]` values (`fail2ban_defaults`).
+  The run checks your jails only while it runs.
 - Keys deleted by versions 0.1–0.3 cannot be recovered.
 - The checks read data from the server (`sshd`, `systemctl`, `ss`, the
   journal). They guard against mistakes, not against a server that is

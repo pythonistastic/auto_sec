@@ -1,0 +1,250 @@
+---
+# roles/03-firewall/tasks/decide.yml - refuse, warn, or plan (R1-R7, W1-W4).
+#
+# Included right after trial.yml with the same _f2b_kind and _f2b_stage.
+# Reads _f2b_trial (host data; the helper has replaced every "{" and "}"
+# with "?"). Sets:
+#   _f2b_change_lines   list  "jail.key: before -> after" for each change
+#   _f2b_will_migrate   bool  move an auto_sec 0.1-0.4 jail.local (main only)
+#   _f2b_will_reload    bool  the effective config changes and fail2ban runs
+#   _f2b_will_restart_sshd bool  the sshd jail's actions change (port...)
+#   _f2b_plan           str
+
+- name: "fail2ban decide: what the trial found"
+  ansible.builtin.set_fact:
+    _f2b_change_lines: "{{ _f2b_trial.change_lines | default([]) }}"
+    _f2b_leak_lines: "{{ _f2b_trial.leak_lines | default([]) }}"
+    # Warnings are shown once: by the preflight, or by the apply stage on a
+    # host where fail2ban was installed in this run (no preflight trial).
+    _f2b_warn_now: "{{ _f2b_stage == 'preflight' or not (_f2b_installed_before | bool) }}"
+    _f2b_nothing: >-
+      {{ 'Nothing has been changed.' if _f2b_stage == 'preflight'
+         else ('fail2ban has not been changed' ~ ('' if (_f2b_kind == 'nginx' or (_f2b_installed_before | bool))
+               else ' (role 03 installed it in this run, with its stock config)')
+               ~ '. Roles that ran before role 03 may have changed other things.') }}
+
+# R1. A broken config is never touched. On a host where role 03 has just
+# installed fail2ban, the config is the distro's stock one: R2 decides.
+- name: "fail2ban decide R1: fail2ban's own config must load now"
+  when: _f2b_kind == 'nginx' or (_f2b_installed_before | bool)
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _f2b_trial.installed | default(false)
+      - _f2b_trial.live.ok | default(false)
+      - _f2b_trial.live_test.ok | default(false)
+    fail_msg: >-
+      fail2ban's own configuration on {{ inventory_hostname }} does not load
+      (`fail2ban-client -d` / `-t`): {{ (_f2b_trial.live.error | default('') or _f2b_trial.live_test.error | default(''))
+      if (_f2b_trial.installed | default(false)) else 'fail2ban is installed, but ' ~ _f2b_conf_dir ~ '/jail.conf is missing' }}.
+      auto_sec changes nothing in fail2ban until it does. Fix it, check with
+      `sudo fail2ban-client -t`, and run again. {{ _f2b_nothing }}
+
+- name: "fail2ban decide R2: auto_sec's file must not break fail2ban"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _f2b_trial.installed | default(false)
+      - _f2b_trial.without.ok | default(false)
+      - _f2b_trial.new.ok | default(false)
+      - _f2b_trial.new_test.ok | default(false)
+    fail_msg: >-
+      With auto_sec's {{ _f2b_kinds[_f2b_kind].name }}{{ ' (and the migrated jail.local)' if (_f2b_trial.migrate | default(false)) else '' }},
+      fail2ban's config would not load on {{ inventory_hostname }}:
+      {{ (_f2b_trial.new.error | default('') or _f2b_trial.without.error | default('') or _f2b_trial.new_test.error | default(''))
+         if (_f2b_trial.installed | default(false)) else _f2b_conf_dir ~ '/jail.conf is missing' }}.
+      {% if (_f2b_trial.new_test.error | default('')) is search('found any log file for sshd') %}This
+      host has no SSH log file (Debian 12 logs to the journal only unless rsyslog is
+      installed). Add `backend: systemd` to fail2ban_defaults, or install rsyslog.
+      {% endif %}{{ _f2b_nothing }}
+
+- name: "fail2ban decide R3: auto_sec's values must not change jails of yours"
+  ansible.builtin.assert:
+    quiet: true
+    that: _f2b_trial.leaks | default([]) | length == 0
+    fail_msg: >-
+      auto_sec's fail2ban defaults would change jails of yours on {{ inventory_hostname }}:
+      {{ _f2b_leak_lines | join('; ') }}. These jails set no value of their own, so
+      they would take auto_sec's [DEFAULT] values. Set the values you want in those
+      jails (or in [DEFAULT]) of your jail.local, or set `fail2ban_defaults: {}`.
+      {{ _f2b_nothing }}
+
+- name: "fail2ban decide R4: a jail.local written by auto_sec 0.1-0.4 is migrated only on request"
+  when:
+    - _f2b_kind == 'main'
+    - _f2b_trial.installed | default(false)
+  ansible.builtin.assert:
+    quiet: true
+    that: (_f2b_migrate | bool) == (_f2b_trial.legacy_jail_local | default('absent') in ['a', 'b'])
+    fail_msg: >-
+      {% if not (_f2b_migrate | bool) %}{{ _f2b_jail_local }} on {{ inventory_hostname }} was
+      written by auto_sec 0.1-0.4 (it matches that file exactly). auto_sec no longer
+      writes jail.local. Migration moves it to {{ _f2b_backup_dir }}/ and lets
+      00-autosec.conf carry your settings; for fail2ban this changes:
+      {{ _f2b_change_lines | join('; ') if (_f2b_change_lines | length > 0) else 'nothing' }}.
+      {% if _f2b_change_lines | select('search', '^sshd\.backend: systemd -> ') | list | length > 0 %}To keep
+      the sshd jail on the journal (as 0.1-0.4 did), add `backend: systemd` to
+      fail2ban_defaults first. {% endif %}Run once with -e fail2ban_migrate_jail_local=true.
+      To keep the file as your own instead, add a comment line to it (changing only the
+      port or ignoreip line does not count) and run again.
+      {% else %}fail2ban_migrate_jail_local is set, but {{ _f2b_jail_local }} on
+      {{ inventory_hostname }} is {{ 'missing' if (_f2b_trial.legacy_jail_local | default('absent')) == 'absent'
+      else 'not the file auto_sec 0.1-0.4 wrote (it is yours, and auto_sec never touches it)' }}:
+      there is nothing to migrate. Run again without -e fail2ban_migrate_jail_local=true.
+      {% endif %}{{ _f2b_nothing }}
+
+# R4b. The old jail.local may hold an ignoreip line you added (the shape of
+# 0.4's file has one). Migrating must never make fail2ban ban an address it
+# ignores now.
+- name: "fail2ban decide R4b: the migration must not drop an address fail2ban ignores now"
+  when:
+    - _f2b_kind == 'main'
+    - _f2b_migrate | bool
+    - _f2b_trial.migrate | default(false)
+  ansible.builtin.assert:
+    quiet: true
+    that: _f2b_trial.ignore_dropped | default([]) | length == 0
+    fail_msg: >-
+      Migrating {{ _f2b_jail_local }} on {{ inventory_hostname }} would make fail2ban stop
+      ignoring {% for d in _f2b_trial.ignore_dropped | default([]) %}{{ d.addresses | join(', ') }}
+      (jail {{ d.jail }}){{ '; ' if not loop.last else '' }}{% endfor %}: those addresses are in
+      the old file's ignoreip line, not in office_static_ip or fail2ban_ignore_ips. Add them to
+      fail2ban_ignore_ips (or office_static_ip) and run again with
+      -e fail2ban_migrate_jail_local=true. {{ _f2b_nothing }}
+
+- name: "fail2ban decide R5: no file read before auto_sec's may set the same value"
+  ansible.builtin.assert:
+    quiet: true
+    that: _f2b_trial.read_before_overrides | default([]) | length == 0
+    fail_msg: >-
+      {% for o in _f2b_trial.read_before_overrides | default([]) %}{{ o.file }} sets
+      {{ o.key }} = {{ o.value }} in [{{ o.section }}] (auto_sec's value: {{ o.ours }}). {% endfor %}fail2ban
+      reads {{ 'that file' if (_f2b_trial.read_before_overrides | default([]) | length == 1) else 'these files' }}
+      BEFORE auto_sec's {{ _f2b_kinds[_f2b_kind].name }} on {{ inventory_hostname }}, so auto_sec's value
+      would silently win. Move your settings to jail.local or a *.local file in jail.d
+      (jail.conf says "YOU SHOULD NOT MODIFY THIS FILE"; dpkg replaces it on updates),
+      or give the jail.d file a name that sorts after 00-autosec. {{ _f2b_nothing }}
+
+- name: "fail2ban decide R7: a reload must not also load edits you have not loaded"
+  when:
+    - _f2b_trial.changes | default([]) | length > 0
+    - _f2b_trial.running.ok | default(false)
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _f2b_trial.running.same_jails_as_disk | default(true)
+      - _f2b_trial.running.drift | default([]) | length == 0
+    fail_msg: >-
+      fail2ban on {{ inventory_hostname }} is running a different config than its files:
+      {% if not (_f2b_trial.running.same_jails_as_disk | default(true)) %}running jails
+      {{ _f2b_trial.running.jails }}, jails in the files {{ _f2b_trial.live.jails }}. {% endif %}{% for d in _f2b_trial.running.drift | default([]) %}{{ d.jail }}
+      {{ d.key }} running {{ d.running }}, files {{ d.files }}. {% endfor %}auto_sec's change needs a
+      reload, and a reload would also load those edits of yours. Load or undo them
+      first (`sudo fail2ban-client reload` after checking `sudo fail2ban-client -t`),
+      then run again. (auto_sec compares only the jail list and each jail's maxretry,
+      findtime, bantime and ignoreip with the running server.) {{ _f2b_nothing }}
+
+# --- Warnings (do not stop the run) -----------------------------------------
+
+- name: "fail2ban decide W1: an ignoreip of yours replaces auto_sec's addresses"
+  when:
+    - _f2b_kind == 'main'
+    - _f2b_warn_now | bool
+    - _f2b_trial.ignore_missing | default([]) | length > 0
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ _f2b_trial.ignore_missing | join(', ') }} (office_static_ip /
+      fail2ban_ignore_ips) {{ 'is' if (_f2b_trial.ignore_missing | length == 1) else 'are' }} not in the sshd
+      jail's ignore list on {{ inventory_hostname }}: your
+      {{ _f2b_trial.sshd.set_in.ignoreip | default('ignoreip') }} replaces auto_sec's list
+      (fail2ban does not merge them). Add {{ 'it' if (_f2b_trial.ignore_missing | length == 1) else 'them' }}
+      there if fail2ban must never ban {{ 'it' if (_f2b_trial.ignore_missing | length == 1) else 'them' }}.
+      If one is banned now: sudo fail2ban-client unban <address>.
+
+- name: "fail2ban decide W2: the sshd jail bans the port sshd listens on"
+  when:
+    - _f2b_kind == 'main'
+    - _f2b_warn_now | bool
+    - _f2b_trial.sshd.enabled | default(false)
+    - not (_f2b_trial.sshd.port_ok | default(true))
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: the sshd jail on {{ inventory_hostname }} bans port(s)
+      {{ _f2b_trial.sshd.action_ports | default([]) }} ({{ _f2b_trial.sshd.set_in.port | default('jail.conf') }}),
+      but sshd listens on ssh_port {{ ssh_port }}: its bans would not block SSH. Fix the
+      port in that file, or remove it there so auto_sec's port applies.
+
+- name: "fail2ban decide W3: the sshd jail is off"
+  when:
+    - _f2b_kind == 'main'
+    - _f2b_warn_now | bool
+    - _f2b_trial.new.ok | default(false)
+    - not (_f2b_trial.sshd.enabled | default(false))
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: the sshd jail stays OFF on {{ inventory_hostname }}: a file of yours
+      ({{ _f2b_trial.sshd.set_in.enabled | default('?') }}) sets enabled = false, and it
+      wins over auto_sec's file. SSH logins are not throttled by fail2ban.
+
+- name: "fail2ban decide W4: fail2ban is installed but not running"
+  when:
+    - _f2b_kind == 'main'
+    - _f2b_warn_now | bool
+    - _f2b_installed_before | bool
+    - not ((_f2b_active_before | bool) and (_f2b_unit_enabled_before | bool))
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: fail2ban on {{ inventory_hostname }} is {{ 'active' if (_f2b_active_before | bool) else 'NOT active' }}
+      and {{ 'enabled' if (_f2b_unit_enabled_before | bool) else 'NOT enabled' }} at boot. auto_sec writes
+      its file but never starts, stops or enables a fail2ban that was already
+      installed. {{ 'Start it with: sudo systemctl enable --now fail2ban' if not (_f2b_active_before | bool) else
+      'Enable it with: sudo systemctl enable fail2ban' }}
+
+# --- Plan ---------------------------------------------------------------------
+
+- name: "fail2ban decide: plan"
+  ansible.builtin.set_fact:
+    _f2b_will_migrate: "{{ _f2b_kind == 'main' and (_f2b_migrate | bool) and (_f2b_trial.migrate | default(false)) }}"
+    _f2b_will_reload: "{{ (_f2b_trial.changes | default([]) | length > 0) and (_f2b_trial.running.ok | default(false)) }}"
+    _f2b_will_restart_sshd: >-
+      {{ (_f2b_trial.changes | default([]) | length > 0) and (_f2b_trial.running.ok | default(false))
+         and (_f2b_trial.sshd_action_restart_needed | default(false)) }}
+    _f2b_plan: >-
+      {{ ('migrate the auto_sec 0.x jail.local to ' ~ _f2b_backup_dir ~ '/, '
+          if (_f2b_kind == 'main' and (_f2b_migrate | bool) and (_f2b_trial.migrate | default(false))) else '')
+         ~ ('write ' ~ _f2b_kinds[_f2b_kind].name ~ '; ')
+         ~ ('no effective change, no reload' if (_f2b_trial.changes | default([]) | length == 0)
+            else (('reload fail2ban' ~ (' and restart its sshd jail (its port changes)'
+                                        if (_f2b_trial.sshd_action_restart_needed | default(false)) else ''))
+                  if (_f2b_trial.running.ok | default(false))
+                  else 'fail2ban is not running: the change loads when it starts')) }}
+
+- name: "fail2ban decide: changes to the effective fail2ban config"
+  when: _f2b_change_lines | length > 0
+  ansible.builtin.debug:
+    msg: "{{ _f2b_change_lines }}"
+
+# R7 compares only some values with the running server: say what a reload
+# also does.
+- name: "fail2ban decide: a reload loads every unloaded edit"
+  when:
+    - _f2b_warn_now | bool
+    - _f2b_will_reload | bool
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: this run reloads fail2ban on {{ inventory_hostname }}. A reload also loads any other
+      edit under /etc/fail2ban that has not been loaded yet (a filter, an action, another value).
+      auto_sec compares only the jail list and each jail's maxretry, findtime, bantime and
+      ignoreip with the running server. A reload keeps the bans.
+
+# W5. Without fail2ban's database a jail restart cannot restore its bans.
+- name: "fail2ban decide W5: restarting the sshd jail drops its bans without the database"
+  when:
+    - _f2b_will_restart_sshd | bool
+    - _f2b_trial.running.db_disabled | default(false)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: this run restarts the sshd jail on {{ inventory_hostname }} (its port changes), and
+      fail2ban's database is off (dbfile = None). Without it fail2ban cannot restore the bans:
+      every address the sshd jail bans now is released. Ban them again by hand afterwards
+      (sudo fail2ban-client set sshd banip <address>) if you need to.

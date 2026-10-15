@@ -1,0 +1,4 @@
+Origin: Ubuntu
+Label: Ubuntu
+Suite: noble-security
+Codename: noble

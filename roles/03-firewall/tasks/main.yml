@@ -1,7 +1,15 @@
 ---
-- name: Install UFW and fail2ban
+# roles/03-firewall/tasks/main.yml - ufw, then fail2ban (fail2ban.yml).
+#
+# fail2ban: role 03 writes only /etc/fail2ban/jail.d/00-autosec.conf and
+# never jail.local (issue #2). Its preflight (tasks/preflight.yml, imported
+# by site.yml pre_tasks) has already run the same checks read-only. There
+# is no handler: fail2ban is reloaded in fail2ban.yml, and only when its
+# effective config changes.
+
+- name: Install UFW
   ansible.builtin.apt:
-    name: [ufw, fail2ban]
+    name: [ufw]
     state: present
 
 - name: UFW default deny incoming
@@ -139,27 +147,11 @@
     state: enabled
   when: "'Status: active' not in _fw_status.stdout"
 
-- name: fail2ban jail config
-  ansible.builtin.copy:
-    dest: /etc/fail2ban/jail.local
-    mode: "0644"
-    content: |
-      [DEFAULT]
-      ignoreip = {{ (['127.0.0.1/8', '::1', office_static_ip | default('')] + (fail2ban_ignore_ips | default([]))) | select | join(' ') }}
-      bantime  = 1h
-      bantime.increment = true
-      bantime.factor = 2
-      findtime = 10m
-      maxretry = 4
-      backend = systemd
-
-      [sshd]
-      enabled = true
-      port = {{ ssh_port | int }}
-
-      [nginx-http-auth]
-      enabled = true
-
-      [nginx-botsearch]
-      enabled = true
-  notify: restart fail2ban
+# --- fail2ban ---------------------------------------------------------
+- name: fail2ban (jail.d/00-autosec.conf; never jail.local)
+  when: _f2b_enabled | default(true) | bool
+  ansible.builtin.include_tasks:
+    file: fail2ban.yml
+    apply:
+      tags: [fail2ban]
+  tags: [fail2ban]

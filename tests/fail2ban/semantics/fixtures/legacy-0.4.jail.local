@@ -1,0 +1,18 @@
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1 203.0.113.7 198.51.100.0/24 2001:db8::1
+bantime  = 1h
+bantime.increment = true
+bantime.factor = 2
+findtime = 10m
+maxretry = 4
+backend = systemd
+
+[sshd]
+enabled = true
+port = 2222
+
+[nginx-http-auth]
+enabled = true
+
+[nginx-botsearch]
+enabled = true

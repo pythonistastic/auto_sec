@@ -94,8 +94,8 @@ variable value, a file's content, or part of a command, with **one documented ex
   - the guard's pending state (`/var/lib/auto-sec/ssh-guard/`), from the moment the
     undo is armed, so that a revert can remove the ignore. It is deleted when the
     change is kept or undone.
-- It is never written to `jail.local`, host_vars or the report, and it is never used
-  to unban anyone. Like any SSH client address, it does appear in logs on the host:
+- It is never written to fail2ban's config files, host_vars or the report, and it is
+  never used to unban anyone. Like any SSH client address, it does appear in logs on the host:
   sshd's auth log, and the "Invoked with" lines that Ansible modules write to the
   journal (the `fail2ban-client`, guard `arm` and `sshd -T` arguments).
 - Worst case: a host that is already compromised can lie in `$SSH_CONNECTION`. Then
@@ -110,6 +110,86 @@ preflight check "were the SSH files changed after sshd last loaded them?" runs `
 on every file that sshd's own trace (`sshd -t -ddd`) says it reads. Those names are
 only printed back and compared; they never become an Ansible value, a file's
 content, or an argument that Ansible builds.
+
+### What role 01 reads from the host (0.5.0)
+
+Before it changes the update settings, role 01 reads `apt-config dump`, the files in
+`/etc/apt/apt.conf.d` (through apt itself, on a copy), `dpkg-query`, dpkg's and ucf's
+checksums of `50unattended-upgrades`, `/var/run/reboot-required`, `hostnamectl`,
+`timedatectl`, `ss` (ports 25, 465 and 587), the names in `/etc/cron.d`,
+`/var/spool/cron/crontabs` and `systemctl list-timers`, `/etc/hosts`, cloud-init's
+`preserve_hostname`, and apt's simulation of the package install
+(`apt-get -s --no-install-recommends install <missing packages>`). All of it is
+**only compared, displayed, or used to refuse a run**, with these documented uses:
+
+- **Whether unattended-upgrades is installed.** With
+  `unattended_upgrades_enabled: auto`, a package that was removed on purpose (dpkg
+  state `rc`) is not installed again. auto_sec never writes an `APT::Periodic` line in
+  this mode: the package's own `20auto-upgrades` holds the switch. Only
+  `unattended_upgrades_enabled: true` writes the two lines, as fixed text (`"1"`); no
+  value read from the host is written.
+- **Which packages to install, and whether to refuse.** The package names are role
+  constants. apt's simulation is only parsed for `Inst <package> [<installed version>]`
+  (an upgrade) and `Remv` lines; any of them refuses the run unless
+  `-e apt_full_upgrade=true` is given. Their names and versions are shown after a
+  strict pattern, with braces replaced.
+- **The one exception for file content: the 0.1–0.4 restore, only with
+  `-e apt_migrate_unattended_upgrades=true`.** When
+  `/etc/apt/apt.conf.d/50unattended-upgrades` is byte for byte the file auto_sec
+  0.1–0.4 wrote (a SHA-256 fixed in the role), role 01 copies the distro's own
+  `/usr/share/unattended-upgrades/50unattended-upgrades` over it, and only after that
+  copy's MD5 matched dpkg's record (`/var/lib/dpkg/info/unattended-upgrades.md5sums`).
+  Without the switch the run refuses and shows what the restore would change. The
+  content is the package's own file, checked against the package's own record;
+  role 02's migration back to the stock `sshd_config` is the precedent. The old file
+  is kept in `/var/lib/auto-sec/backup/` (directory 0700, file 0600).
+- **The current timezone as a command argument.** To show how a timezone change moves
+  the clock, the host's current timezone (from `timedatectl`, after it matched a
+  strict pattern) is passed as one argv item to `TZ=$1 date +%z` on the host. The
+  output is only displayed.
+- Names shown in messages (cron files, timers, packages, the hostname, the timezone)
+  must match a strict pattern first, or they are not shown. In apt values, `${macro}`
+  becomes `<macro>` and any other brace becomes `?` before Ansible uses them, so a
+  value can never be read as a Jinja template.
+- The trial run copies `/etc/apt/apt.conf.d` to `/run/auto-sec/apt-sim` (tmpfs, root
+  only) and removes it again.
+
+### What role 03 reads from fail2ban (0.5.0)
+
+Role 03 runs its helper `auto-sec-f2b-check` (Python standard library) as root with
+`python3 -I`, as one argv list without a shell. The helper copies `/etc/fail2ban` to
+`/run/auto-sec/f2b-sim` (tmpfs, root only, removed at the end of every trial) and asks
+fail2ban's own config reader (`fail2ban-client -d`, `-t`, `-vvv`) and the running
+server (`fail2ban-client status` and `get`) what the files and the server mean. On the
+host it passes the jail names that the server reports to `fail2ban-client get`; like
+the SSH file names above, they never become an argument that Ansible builds. Role 03
+also reads `dpkg-query` and `systemctl`.
+
+`00-autosec.conf` is rendered from the operator's variables only: **nothing read from
+the host becomes part of it.** The helper's findings are used only:
+
+- to refuse a run (fail2ban's config does not load; auto_sec's values would change a
+  jail of the operator's; a file read before auto_sec's sets the same value; the
+  running server differs from its files; a file with auto_sec's name that auto_sec
+  did not write; a migration would make a jail stop ignoring an address), or to warn
+  (for example: the database is off, so restarting the `sshd` jail releases its
+  bans);
+- to be shown: in the run's output, and as one line of the client report (role 10):
+  the `sshd` jail's effective `maxretry`, `findtime` and `bantime` and the names of
+  the files they come from;
+- to decide whether fail2ban is reloaded (only when its effective config changes) and
+  whether its `sshd` jail is restarted with `fail2ban-client reload --restart sshd`
+  (only when that jail's port or action changes);
+- with `-e fail2ban_migrate_jail_local=true` only: to decide whether `jail.local` is
+  exactly the file auto_sec 0.1–0.4 wrote (fixed text; only the port number and the
+  ignore list may differ). Only then is it moved to `/var/lib/auto-sec/fail2ban/`
+  (directory 0700, file 0600), after the copy's checksum matched. If the change then
+  fails, the rollback copies that backup back to `jail.local`: the operator's previous
+  file, unchanged.
+
+Every string in the helper's output has `{` and `}` replaced by `?`, so host text can
+never be read as a Jinja template. During a run, `/run/auto-sec/f2b-prev` (root only)
+keeps the previous `00-autosec.conf` for the rollback, and is removed at the end.
 
 A new use of host data as an argument, a value or file content needs the same kind of
 written exception here, and a review. Treat anything else that crosses this line as a

@@ -1,0 +1,543 @@
+---
+# roles/01-base/tasks/preflight.yml
+#
+# Read-only role 01 checks B1-B9. site.yml imports this file in pre_tasks
+# with tags [always], after the SSH preflight, so a refusal happens BEFORE
+# role 01 changes anything. It also runs in --check. It writes only below
+# /run/auto-sec (the trial run's copy, removed again).
+#
+# Trust boundary (SECURITY.md): what is read from the host is shown to you,
+# compared with values you typed, or used to refuse. It never becomes part
+# of a file auto_sec writes. The one exception is the 0.1-0.4 migration
+# (only with -e apt_migrate_unattended_upgrades=true): the distro's own
+# /usr/share/unattended-upgrades/50unattended-upgrades is copied into
+# place, and only after its md5 matched dpkg's record.
+# Host names shown in messages (cron files, timers, packages) must match a
+# strict pattern first; ${macro} and braces in apt values are neutralised
+# (_base_kv in defaults/main.yml).
+#
+# Facts for role 01 main and role 10 (set on every host, also when the tags
+# leave role 01 out):
+#   _base_role_runs        bool  the tags select role 01 ("base")
+#   _base_uu_installed     bool  unattended-upgrades is installed now
+#   _base_uu_removed       bool  it was removed, its config kept (dpkg "rc")
+#   _base_uu_version       str
+#   _base_uu_before        dict  effective apt keys now ({key: [values]})
+#   _base_uu_sim_after     dict  the same after the change (trial run)
+#   _base_uu_after         dict  start value {}; role 01 main sets it from
+#                                the real configuration after the write
+#   _base_uu_diff          list  keys that change
+#   _base_uu_timer         str   `systemctl is-enabled apt-daily-upgrade.timer`
+#   _base_reboot_pending   bool  /var/run/reboot-required exists
+#   _base_reboot_pkgs      list  packages that asked for it
+#   _base_pending_upgrades int   `apt-get -s dist-upgrade` Inst lines (-1 unknown)
+#   _base_pending_kernel   bool  a linux-image package is among them
+#   _base_pkgs_missing     list  packages role 01 would install (packages.yml)
+#   _base_hostname_now     str   static hostname now ('' unknown)
+#   _base_tz_now           str   timezone now ('' unknown)
+#   _base_tz_after         str   start value _base_tz_now; main updates it
+#   plus the plan facts of plan.yml and decide.yml.
+#
+# The variable checks (B1) run, and refuse, with every tag. Host checks and
+# refusals (B3, B5-B8) run only when the tags select role 01 (tag "base"),
+# so that for example `--tags ssh` is not refused because of a role 01
+# change that would not happen in that run.
+
+- name: "Base preflight: start every base fact from a safe value"
+  ansible.builtin.set_fact:
+    _base_role_runs: >-
+      {{ (('all' in ansible_run_tags) or ('tagged' in ansible_run_tags) or ('base' in ansible_run_tags))
+         and ('base' not in ansible_skip_tags) and ('tagged' not in ansible_skip_tags) and ('all' not in ansible_skip_tags) }}
+    _base_uu_installed: false
+    _base_uu_removed: false
+    _base_uu_version: ""
+    _base_uu_before: {}
+    _base_uu_sim_after: {}
+    _base_uu_sim_s: []
+    _base_uu_after: {}
+    _base_uu_diff: []
+    _base_uu_diff_lines: []
+    _base_uu_timer: ""
+    _base_uu_dist_sha256: ""
+    _base_uu_pristine_md5: ""
+    _base_uu_dpkg_md5: ""
+    _base_uu_ucf_md5: ""
+    _base_uu_file_state: absent
+    _base_reboot_pending: false
+    _base_reboot_pkgs: []
+    _base_pending_upgrades: -1
+    _base_pending_kernel: false
+    _base_docker_installed: []
+    _base_pkgs_missing: []
+    _base_hostname_static: ""
+    _base_hostname_transient: ""
+    _base_hostname_now: ""
+    _base_tz_now: ""
+    _base_tz_after: ""
+
+# --- B1. Variable checks and the plan (no host access) ----------------------
+
+- name: "Base B1: variables"
+  ansible.builtin.import_tasks: plan.yml
+
+# --- B2. Read the host (always; check_mode false; nothing is changed) -------
+
+- name: "Base B2: is unattended-upgrades installed?"
+  ansible.builtin.command:
+    argv: [dpkg-query, -W, "-f=${db:Status-Abbrev}${Version}", unattended-upgrades]
+  register: _base_pf_pkg
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Base B2: apt's configuration now"
+  ansible.builtin.command:
+    argv: [apt-config, dump]
+  environment:
+    LC_ALL: C
+  register: _base_pf_dump
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Base B2: 50unattended-upgrades"
+  ansible.builtin.stat:
+    path: "{{ _base_uu_dist_file }}"
+    follow: false
+    checksum_algorithm: sha256
+  register: _base_pf_dist
+
+- name: "Base B2: the distro's copy of 50unattended-upgrades"
+  ansible.builtin.stat:
+    path: "{{ _base_uu_pristine }}"
+    follow: false
+    checksum_algorithm: md5
+  register: _base_pf_pristine
+
+# D: dpkg's md5 of the copy in /usr/share (unattended-upgrades.md5sums).
+# U: the md5 ucf recorded for the installed file (ucf's hashfile).
+- name: "Base B2: dpkg's and ucf's records of 50unattended-upgrades"
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - |
+        awk -v p="${1#/}" '$2 == p { print "D " $1 }' "$2" 2>/dev/null
+        awk -v p="$3" '$2 == p { print "U " $1 }' "$4" 2>/dev/null
+        exit 0
+      - sh
+      - "{{ _base_uu_pristine }}"
+      - "{{ _base_dpkg_md5sums }}"
+      - "{{ _base_uu_dist_file }}"
+      - "{{ _base_ucf_hashfile }}"
+  register: _base_pf_md5
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Base B2: auto_sec's own apt file"
+  ansible.builtin.stat:
+    path: "{{ _base_uu_file }}"
+    follow: false
+    get_checksum: false
+  register: _base_pf_own
+
+- name: "Base B2: first line of auto_sec's own apt file"
+  when: _base_pf_own.stat.exists and _base_pf_own.stat.isreg
+  ansible.builtin.command:
+    argv: [head, -n, "1", --, "{{ _base_uu_file }}"]
+  register: _base_pf_own_head
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Base B2: is a reboot pending?"
+  ansible.builtin.stat:
+    path: "{{ _base_reboot_required }}"
+    get_checksum: false
+  register: _base_pf_rr
+
+- name: "Base B2: packages that asked for the reboot"
+  when: _base_pf_rr.stat.exists
+  ansible.builtin.command:
+    argv: [cat, --, "{{ _base_reboot_required }}.pkgs"]
+  register: _base_pf_rr_pkgs
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# dpkg-query exits 1 when a package is unknown; the known ones are printed.
+- name: "Base B2: installed Docker packages"
+  ansible.builtin.command:
+    argv: "{{ ['dpkg-query', '-W', '-f=${db:Status-Abbrev} ${Package}\n'] + _base_docker_packages }}"
+  register: _base_pf_docker
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# The hostname module compares both names (hostnamectl --static/--transient
+# status) and the timezone module timedatectl's zone; so does B4.
+- name: "Base B2: hostname, timezone and the update timer now"
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - |
+        printf 'S %s\n' "$(hostnamectl --static status 2>/dev/null || cat /etc/hostname 2>/dev/null)"
+        printf 'T %s\n' "$(hostnamectl --transient status 2>/dev/null || uname -n)"
+        printf 'Z %s\n' "$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null)"
+        printf 'I %s\n' "$(systemctl is-enabled apt-daily-upgrade.timer 2>/dev/null)"
+  register: _base_pf_id
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Shown only (and given to the report). Debug::NoLocking: a nightly
+# unattended-upgrades run holding the lock must not fail this read.
+- name: "Base B2: updates waiting now"
+  ansible.builtin.command:
+    argv: [apt-get, -s, -o, Debug::NoLocking=true, dist-upgrade]
+  environment:
+    LC_ALL: C
+  register: _base_pf_sim_upgrade
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Base B2: remember what was read"
+  ansible.builtin.set_fact:
+    _base_uu_installed: "{{ _base_pkg_out is match('^.i') }}"
+    # "rc": removed (apt remove), its configuration kept. In auto mode
+    # that counts as turned off on purpose: auto_sec does not reinstall it.
+    _base_uu_removed: "{{ _base_pkg_out is match('^.c') }}"
+    _base_uu_version: "{{ (_base_pkg_out[3:] | trim) if _base_pkg_out is match('^.i [0-9A-Za-z.+~:-]{1,64}$') else '' }}"
+    _base_uu_before: "{{ _base_kv }}"
+    _base_uu_dist_sha256: "{{ (_base_pf_dist.stat.checksum | default('')) if (_base_pf_dist.stat.isreg | default(false)) else '' }}"
+    _base_uu_pristine_md5: "{{ (_base_pf_pristine.stat.checksum | default('')) if (_base_pf_pristine.stat.isreg | default(false)) else '' }}"
+    _base_uu_dpkg_md5: >-
+      {{ _base_md5_lines | select('match', '^D [0-9a-f]{32}$') | map('regex_replace', '^D ', '') | first | default('') }}
+    _base_uu_ucf_md5: >-
+      {{ _base_md5_lines | select('match', '^U [0-9a-f]{32}$') | map('regex_replace', '^U ', '') | first | default('') }}
+    _base_uu_file_state: >-
+      {{ 'absent' if not _base_pf_own.stat.exists
+         else ('other' if not _base_pf_own.stat.isreg
+               else ('ours' if (_base_pf_own_head.stdout | default('')).startswith(_base_uu_header) else 'foreign')) }}
+    _base_uu_timer: "{{ _base_id.I if _base_id.I is match('^[a-z-]{1,20}$') else '' }}"
+    _base_reboot_pending: "{{ _base_pf_rr.stat.exists }}"
+    _base_reboot_pkgs: >-
+      {{ (_base_pf_rr_pkgs.stdout_lines | default([])) | map('trim') | select('match', _base_pkg_re) | unique | list }}
+    _base_pending_upgrades: >-
+      {{ (_base_pf_sim_upgrade.stdout_lines | select('match', '^Inst ') | list | length)
+         if (_base_pf_sim_upgrade.rc | default(1)) == 0 else -1 }}
+    _base_pending_kernel: "{{ _base_pf_sim_upgrade.stdout_lines | default([]) | select('match', '^Inst linux-image-') | list | length > 0 }}"
+    _base_docker_installed: >-
+      {{ _base_pf_docker.stdout_lines | default([]) | select('match', '^.i. \S+$')
+         | map('regex_replace', '^.i. (\S+)$', '\1') | select('in', _base_docker_packages) | list }}
+    _base_hostname_static: "{{ _base_id.S }}"
+    _base_hostname_transient: "{{ _base_id.T }}"
+    _base_hostname_now: "{{ _base_id.S if _base_id.S is match(_base_show_re) else '' }}"
+    _base_tz_now: "{{ _base_id.Z if _base_id.Z is match(_base_tz_re) else '' }}"
+    _base_tz_after: "{{ _base_id.Z if _base_id.Z is match(_base_tz_re) else '' }}"
+  vars:
+    _base_pkg_out: "{{ (_base_pf_pkg.stdout | default('')) if (_base_pf_pkg.rc | default(1)) == 0 else '' }}"
+    _base_kv_lines: "{{ (_base_pf_dump.stdout_lines | default([])) if (_base_pf_dump.rc | default(1)) == 0 else [] }}"
+    _base_md5_lines: "{{ _base_pf_md5.stdout_lines | default([]) }}"
+    _base_id: >-
+      {{ dict(['S', 'T', 'Z', 'I'] | zip(['', '', '', '']))
+         | combine(dict(_base_pf_id.stdout_lines | default([]) | map('regex_replace', '[{}]', '?')
+                        | select('match', '^[STZI] ') | map('split', ' ', 1))) }}
+
+# --- B3. Refusals about the host (only when role 01 runs) -------------------
+
+- name: "Base B3: is this a Debian-family host?"
+  when: _base_role_runs | bool
+  ansible.builtin.stat:
+    path: /etc/debian_version
+    get_checksum: false
+  register: _base_pf_debian
+
+- name: "Base B3: Debian or Ubuntu, and apt can read its configuration"
+  when: _base_role_runs | bool
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _base_pf_debian.stat.exists
+      - (_base_pf_dump.rc | default(1)) == 0
+    fail_msg: >-
+      {% if not _base_pf_debian.stat.exists %}Role 01 supports Debian and Ubuntu only. This host:
+      {{ ansible_facts['distribution'] | default('unknown OS') }}.
+      {% else %}apt cannot read its configuration on {{ inventory_hostname }} now:
+      {{ (_base_pf_dump.stderr_lines | default([]) + _base_pf_dump.stdout_lines | default([]))
+         | select('match', '^[EW]:') | map('regex_replace', '[{}]', '?') | list | join(' ') | truncate(600) }}.
+      Every apt command fails like this; fix that file first.
+      {% endif %}Nothing has been changed.
+
+- name: "Base B3: auto_sec never replaces an apt file it did not write"
+  when: _base_role_runs | bool
+  ansible.builtin.assert:
+    quiet: true
+    that: _base_uu_file_state in ['absent', 'ours']
+    fail_msg: >-
+      {{ _base_uu_file }} on {{ inventory_hostname }} exists but {{ 'is not a regular file'
+      if _base_uu_file_state == 'other' else 'was not written by auto_sec (its first line is not "'
+      ~ _base_uu_header ~ '...")' }}. auto_sec never replaces a file it did not write. Rename
+      it (keep the digits and a name apt reads, e.g. 52unattended-upgrades-local) and run
+      again. Nothing has been changed.
+
+# --- B4. Finish the plan (no host access) -----------------------------------
+
+- name: "Base B4: plan"
+  ansible.builtin.import_tasks: decide.yml
+
+# --- B5, B6. Trial run on a copy (only when role 01 runs) -------------------
+
+- name: "Base B5: trial run"
+  when: _base_role_runs | bool
+  ansible.builtin.import_tasks: trial.yml
+
+# --- B5b. Packages: install only, never upgrade (only when role 01 runs) ----
+
+- name: "Base B5b: packages"
+  when: _base_role_runs | bool
+  ansible.builtin.import_tasks: packages.yml
+  vars:
+    _base_pkg_ctx: preflight
+
+# --- B7. Hostname and timezone (only when a change is planned) ---------------
+
+- name: "Base B7: timezones this server knows"
+  when: (_base_role_runs | bool) and (_base_tz_change | bool)
+  ansible.builtin.command:
+    argv: [timedatectl, list-timezones]
+  register: _base_pf_tzlist
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Base B7: the timezone exists on this server"
+  when: (_base_role_runs | bool) and (_base_tz_change | bool)
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _base_pf_tzlist.rc == 0
+      - _base_tz_want in _base_pf_tzlist.stdout_lines
+    fail_msg: >-
+      {% if _base_pf_tzlist.rc != 0 %}`timedatectl list-timezones` fails on {{ inventory_hostname }},
+      so auto_sec cannot check timezone "{{ _base_tz_want }}". Set timezone: keep.
+      {% else %}timezone is "{{ _base_tz_want }}", but {{ inventory_hostname }} does not know that
+      zone (`timedatectl list-timezones`). A wrong name would silently mean UTC. Use a name
+      from that list, or keep.
+      {% endif %}Nothing has been changed.
+
+- name: "Base B7: offsets and the jobs that run at a local time"
+  when: (_base_role_runs | bool) and (_base_tz_change | bool)
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - |
+        if [ -n "$1" ]; then printf 'F %s\n' "$(TZ=$1 date +%z)"; fi
+        printf 'O %s\n' "$(TZ=$2 date +%z)"
+        ls -1 /etc/cron.d 2>/dev/null | sed 's/^/C /'
+        ls -1 /var/spool/cron/crontabs 2>/dev/null | sed 's/^/U /'
+        systemctl list-timers --all --no-legend --plain 2>/dev/null | grep -oE '[^ ]+\.timer' | sed 's/^/T /'
+        exit 0
+      - sh
+      - "{{ _base_tz_now }}"
+      - "{{ _base_tz_want }}"
+  register: _base_pf_tzjobs
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Base B7: what the timezone change moves"
+  when: (_base_role_runs | bool) and (_base_tz_change | bool)
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: the timezone of {{ inventory_hostname }} changes from {{ _base_tz_now | default('unknown', true) }}
+      (UTC{{ _base_tzj_f }}) to {{ _base_tz_want }} (UTC{{ _base_tzj_o }}). Every job that runs at a
+      wall-clock time moves with it, and log timestamps change. Cron files in /etc/cron.d:
+      {{ _base_tzj_c }}; user crontabs: {{ _base_tzj_u }}; systemd timers (those with OnCalendar=
+      move): {{ _base_tzj_t }}; /etc/crontab (cron.daily, weekly,
+      monthly){{ (', auto_sec backups at %02d:%02d' | format(backup_hour | int, backup_minute | int))
+      if (b2_bucket is defined) else '' }}{{ (', the CVE scan at %02d:00' | format(cve_watch_hour | default(6) | int))
+      if (cve_watch_enabled | default(true) | bool) else '' }}{{ (', automatic reboots at ' ~ _base_uu_reboot_time)
+      if _base_uu_reboot == 'on' else '' }}.
+  vars:
+    _base_tzj_lines: "{{ _base_pf_tzjobs.stdout_lines | default([]) }}"
+    _base_tzj_f: "{{ _base_tzj_lines | select('match', '^F [+-][0-9]{4}$') | map('regex_replace', '^F ', '') | first | default('?') }}"
+    _base_tzj_o: "{{ _base_tzj_lines | select('match', '^O [+-][0-9]{4}$') | map('regex_replace', '^O ', '') | first | default('?') }}"
+    _base_tzj_c: "{{ _base_tzj_lines | select('match', '^C ') | map('regex_replace', '^C ', '') | select('match', _base_show_re) | list }}"
+    _base_tzj_u: "{{ _base_tzj_lines | select('match', '^U ') | map('regex_replace', '^U ', '') | select('match', _base_show_re) | list }}"
+    _base_tzj_t: "{{ _base_tzj_lines | select('match', '^T ') | map('regex_replace', '^T ', '') | select('match', _base_show_re) | unique | list }}"
+
+# A mail server announces the hostname (HELO/EHLO). Receivers compare it
+# with the reverse DNS of the address and with the TLS certificate.
+- name: "Base B7: does a mail server listen on 25, 465 or 587?"
+  when: (_base_role_runs | bool) and (_base_hostname_change | bool)
+  ansible.builtin.command:
+    argv: [ss, -Htln, "(", sport, "=", ":25", or, sport, "=", ":465", or, sport, "=", ":587", ")"]
+  register: _base_pf_mta
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Base B7: no hostname change under a mail server"
+  when: (_base_role_runs | bool) and (_base_hostname_change | bool)
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _base_pf_mta.rc == 0
+      - _base_pf_mta.stdout | trim | length == 0
+    fail_msg: >-
+      {% if _base_pf_mta.rc != 0 %}`ss` failed on {{ inventory_hostname }}, so auto_sec cannot check
+      for a mail server before it changes the hostname. Set server_hostname: keep.
+      {% else %}server_hostname would change the hostname of {{ inventory_hostname }} from
+      "{{ _base_hostname_now | default('?', true) }}" to "{{ _base_hostname_want }}", but something listens on
+      port 25, 465 or 587 (a mail server). A mail server announces this name to every server
+      it talks to; they compare it with the reverse DNS (PTR) of your IP and with the TLS
+      certificate, and a mismatch quietly sends your mail to spam. Set server_hostname: keep,
+      or change the name by hand together with the PTR record, the certificate and the mail
+      server's own setting.
+      {% endif %}Nothing has been changed.
+
+- name: "Base B7: /etc/hosts and cloud-init"
+  when: (_base_role_runs | bool) and (_base_hostname_change | bool)
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - |
+        if grep -qwF -- "$1" /etc/hosts 2>/dev/null; then echo 'H yes'; else echo 'H no'; fi
+        if dpkg-query -W -f='${db:Status-Abbrev}' cloud-init 2>/dev/null | grep -q '^.i'; then echo 'C yes'; else echo 'C no'; fi
+        v=$(cat /etc/cloud/cloud.cfg /etc/cloud/cloud.cfg.d/*.cfg 2>/dev/null \
+          | sed -n 's/^preserve_hostname:[[:space:]]*\([A-Za-z]*\).*/\1/p' | tail -n 1)
+        echo "P $v"
+      - sh
+      - "{{ _base_hostname_want }}"
+  register: _base_pf_hosts
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Base B7: notes about the new hostname"
+  when:
+    - _base_role_runs | bool
+    - _base_hostname_change | bool
+    - _base_hosts_notes | length > 0
+  ansible.builtin.debug:
+    msg: "{{ _base_hosts_notes }}"
+  vars:
+    _base_hosts_lines: "{{ _base_pf_hosts.stdout_lines | default([]) }}"
+    _base_hosts_notes: >-
+      {{ (['NOTE: "' ~ _base_hostname_want ~ '" is not in /etc/hosts on ' ~ inventory_hostname
+           ~ '. auto_sec does not edit /etc/hosts. If sudo then says "unable to resolve host", add a line'
+           ~ ' "127.0.1.1 ' ~ _base_hostname_want ~ '" (Debian/Ubuntu convention).'] if 'H no' in _base_hosts_lines else [])
+         + (['WARNING: cloud-init is installed on ' ~ inventory_hostname ~ ' and preserve_hostname is not true,'
+             ~ ' so cloud-init may set the old name again at the next boot. Set preserve_hostname: true in'
+             ~ ' /etc/cloud/cloud.cfg.d/99-hostname.cfg if the new name must stay.']
+            if ('C yes' in _base_hosts_lines and 'P true' not in (_base_hosts_lines | map('lower') | list)) else []) }}
+
+# --- B8. Warnings and notes (only when role 01 runs) -------------------------
+
+- name: "Base B8: warnings and notes"
+  when:
+    - _base_role_runs | bool
+    - _base_notes | length > 0
+  ansible.builtin.debug:
+    msg: "{{ _base_notes }}"
+  vars:
+    _base_eff: "{{ _base_uu_sim_after }}"
+    _base_eff_uu: "{{ _base_eff['APT::Periodic::Unattended-Upgrade'] | default(['']) | last }}"
+    _base_eff_upl: "{{ _base_eff['APT::Periodic::Update-Package-Lists'] | default(['']) | last }}"
+    _base_eff_ena: "{{ _base_eff['APT::Periodic::Enable'] | default(['1']) | last }}"
+    _base_eff_on: >-
+      {{ ((_base_uu_installed | bool) or (_base_uu_install | bool))
+         and _base_eff_uu not in ['0', ''] and _base_eff_upl not in ['0', ''] and _base_eff_ena != '0' }}
+    _base_eff_rb_on: "{{ (_base_eff['Unattended-Upgrade::Automatic-Reboot'] | default(['']) | last | lower) in _base_true_words }}"
+    _base_eff_rt: "{{ _base_eff['Unattended-Upgrade::Automatic-Reboot-Time'] | default(['now']) | last }}"
+    _base_eff_bl: "{{ _base_eff['Unattended-Upgrade::Package-Blacklist::'] | default([]) }}"
+    _base_s_periodic: >-
+      {{ _base_uu_sim_s | select('search', '(Periodic::(Unattended-Upgrade|Enable)|^\S+ [0-9]+:\s*(Unattended-Upgrade|Enable)\s+")') | list }}
+    _base_s_reboot: "{{ _base_uu_sim_s | select('search', 'Automatic-Reboot') | list }}"
+    _base_docker_open: >-
+      {{ _base_docker_installed | reject('in', _base_uu_blacklist)
+         | reject('in', _base_eff_bl | map('regex_replace', '\\(.)', '\1') | map('regex_replace', '\$$', '') | list) | list }}
+    _base_rr_days: >-
+      {{ (((ansible_facts['date_time']['epoch'] | default(0) | int) - (_base_pf_rr.stat.mtime | default(0) | int)) / 86400) | int }}
+    _base_notes: >-
+      {{ (['WARNING: automatic updates are OFF on ' ~ inventory_hostname ~ ': '
+           ~ (('unattended-upgrades was removed (dpkg state rc), so auto_sec does not install it again.')
+              if (_base_uu_removed | bool) else
+              ('set by: ' ~ (_base_s_periodic | join(' | ') | default('no file turns them on', true)) ~ '.'))
+           ~ ' auto_sec leaves them off because unattended_upgrades_enabled is auto. Set'
+           ~ ' unattended_upgrades_enabled: true to turn them on.']
+          if (_base_uu_enabled_mode == 'auto' and (_base_uu_off_on_purpose | bool)) else [])
+         + (['INFO: unattended-upgrades is not installed on ' ~ inventory_hostname ~ '. This run installs it, and'
+             ~ ' its own setup turns automatic updates on (the Debian and Ubuntu default; a preseeded "false"'
+             ~ ' keeps them off, and the run then warns). auto_sec writes no update switch of its own.']
+            if (_base_uu_enabled_mode == 'auto' and (_base_uu_install | bool) and not (_base_uu_installed | bool)) else [])
+         + (['WARNING: automatic reboots are ON on ' ~ inventory_hostname ~ ': unattended-upgrades reboots at "'
+             ~ _base_eff_rt ~ '" (now = right after the nightly update) whenever an update needs it. Set by: '
+             ~ (_base_s_reboot | join(' | ')) ~ '. auto_sec leaves this alone (unattended_automatic_reboot: keep).'
+             ~ ' Set it to false to stop them, or true with unattended_reboot_time to choose the time.']
+            if (_base_uu_reboot == 'keep' and (_base_eff_rb_on | bool) and (_base_eff_on | bool)) else [])
+         + (['INFO: a reboot is pending on ' ~ inventory_hostname ~ ' (for ' ~ _base_rr_days ~ ' days; packages: '
+             ~ (_base_reboot_pkgs | join(', ') | default('unknown', true)) ~ '). '
+             ~ (('unattended-upgrades will reboot it after its next nightly run (apt-daily-upgrade.timer, about'
+                 ~ ' 06:00-07:00), at ' ~ _base_eff_rt ~ ' (a time already past that day means the next day).')
+                if ((_base_eff_rb_on | bool) and (_base_eff_on | bool))
+                else 'Automatic reboot is off: reboot by hand when it suits you.')]
+            if (_base_reboot_pending | bool) else [])
+         + (['INFO: 50unattended-upgrades is the file auto_sec 0.1-0.4 wrote, and you asked to migrate it'
+             ~ ' (apt_migrate_unattended_upgrades). This run keeps a copy in ' ~ _base_backup_file
+             ~ ' and puts the distro file back: automatic reboots at 04:00 stop unless you choose them,'
+             ~ ' Remove-Unused-Dependencies goes back to its default, and the distro origins apply'
+             ~ ' (unless unattended_origins is security).'] if (_base_uu_restore | bool) else [])
+         + (['WARNING: on this Debian host the origins of auto_sec 0.1-0.4 matched no Debian archive, so'
+             ~ ' unattended-upgrades installed NOTHING since auto_sec set it up. With the distro file back,'
+             ~ ' the next nightly run may install ' ~ ((_base_pending_upgrades ~ ' or more') if (_base_pending_upgrades | int) >= 0
+             else 'an unknown number of') ~ ' waiting updates and restart services.']
+            if ((_base_uu_restore | bool) and (ansible_facts['distribution'] | default('')) == 'Debian') else [])
+         + (['NOTE: Docker packages are installed (' ~ (_base_docker_open | join(', ')) ~ ') and automatic updates'
+             ~ ' may update them; that restarts the Docker daemon and every container. Set'
+             ~ ' unattended_exclude_docker: true to exclude them. (docker-ce from download.docker.com is only'
+             ~ ' updated if you added that origin; docker.io and containerd from the distro are.)']
+            if (_base_docker_open | length > 0 and (_base_eff_on | bool)) else [])
+         + (['WARNING: apt-daily-upgrade.timer is ' ~ _base_uu_timer ~ ' on ' ~ inventory_hostname
+             ~ ', so automatic updates never run although the configuration turns them on. auto_sec leaves'
+             ~ ' the timer alone; `systemctl enable --now apt-daily-upgrade.timer` turns it on.']
+            if ((_base_eff_on | bool) and _base_uu_installed and _base_uu_timer not in ['', 'enabled', 'static', 'indirect', 'alias'])
+            else [])
+         + (['INFO: apt_full_upgrade is on: this run runs `apt-get dist-upgrade` with '
+             ~ (_base_pending_upgrades if (_base_pending_upgrades | int) >= 0 else 'an unknown number of') ~ ' updates'
+             ~ (' including a new kernel, which takes effect after a reboot' if (_base_pending_kernel | bool) else '')
+             ~ '. It can restart services. unattended_exclude_docker and unattended_upgrade_blacklist do not'
+             ~ ' apply to it.'] if (_base_full_upgrade | bool) else []) }}
+
+# --- B9. Summary ---------------------------------------------------------------
+
+- name: "Base preflight: summary"
+  when: _base_role_runs | bool
+  ansible.builtin.debug:
+    msg:
+      unattended_upgrades: "{{ _base_uu_version | default('not installed', true) }}"
+      updates: >-
+        {{ 'turned on by auto_sec (unattended_upgrades_enabled: true)' if (_base_uu_write_periodic | bool)
+           else ('left off (off on purpose)' if (_base_uu_off_on_purpose | bool)
+           else ('unattended-upgrades is installed by this run; its own setup turns them on'
+                 if ((_base_uu_install | bool) and not (_base_uu_installed | bool))
+           else 'left as they are')) }}
+      reboot: "{{ _base_uu_reboot ~ (' at ' ~ _base_uu_reboot_time if _base_uu_reboot == 'on' else '') }}"
+      reboot_pending: "{{ _base_reboot_pending }}"
+      origins: "{{ _base_uu_origins }}"
+      blacklist_added: "{{ _base_uu_blacklist }}"
+      legacy_file: "{{ 'restored to the distro file' if (_base_uu_restore | bool) else ('yes, not migrated' if (_base_uu_legacy | bool) else 'no') }}"
+      packages_to_install: "{{ _base_pkgs_missing }}"
+      apt_file: >-
+        {{ ('remove ' if _base_uu_file_state == 'ours' else 'none') if (_base_uu_plan_empty | bool)
+           else ('write ' ~ (_base_uu_file | basename)) }}
+      full_upgrade: "{{ _base_full_upgrade }}"
+      hostname: "{{ (_base_hostname_now | default('?', true)) ~ ((' -> ' ~ _base_hostname_want) if (_base_hostname_change | bool) else ' (kept)') }}"
+      timezone: "{{ (_base_tz_now | default('?', true)) ~ ((' -> ' ~ _base_tz_want) if (_base_tz_change | bool) else ' (kept)') }}"
+      keys_that_change: "{{ _base_uu_diff_lines if (_base_uu_diff | length > 0) else 'no change' }}"

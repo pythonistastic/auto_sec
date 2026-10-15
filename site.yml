@@ -14,8 +14,9 @@
   # --- Preflight: fail BEFORE any change if required vars are missing, so
   #     the server is never left half-hardened (SSH locked, run aborted).
   #     This block is also the single source of truth for "required vars".
-  #     SSH variables (login choices, keys, ssh_extra_settings) and the live
-  #     SSH setup are checked by role 02's preflight, imported at the end.
+  #     Three read-only role preflights are imported at the end: role 02
+  #     (SSH variables and the live SSH setup), role 01 (updates, reboots,
+  #     hostname, timezone) and role 03 (fail2ban).
   pre_tasks:
     - name: "Preflight: variables required by the features you enabled"
       tags: [always]
@@ -80,15 +81,16 @@
       ansible.builtin.assert:
         quiet: true
         that:
-          # Used as a path component (report file, backup prefix) and inside
-          # the hostname module, so it must be a plain hostname-like label.
+          # Used as a path component (report file, backup prefix) and in
+          # alerts, so it must be a plain hostname-like label. (The system
+          # hostname is server_hostname, checked by role 01's preflight.)
           - inventory_hostname is match('^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$')
           - inventory_hostname is not search('\.\.')
           # Reaches sudoers, audit rules and /home/<user> paths.
           - deploy_user is match('^[a-z_][a-z0-9_-]{0,31}$')
-          # Reaches ufw, jail.local and fwknop access.conf. It must be the
-          # port sshd already listens on (role 02's preflight checks that);
-          # auto_sec never moves sshd.
+          # Reaches ufw, fail2ban's jail.d/00-autosec.conf and fwknop
+          # access.conf. It must be the port sshd already listens on (role
+          # 02's preflight checks that); auto_sec never moves sshd.
           - ssh_port | string is match('^[0-9]{1,5}$')
           - (ssh_port | int) > 0 and (ssh_port | int) < 65536
           # Reaches `tar -C`, pm2 --hp, the file module and the canary.
@@ -100,7 +102,17 @@
           # command into field 6.
           - backup_hour | string is match('^([0-9]|1[0-9]|2[0-3])$')
           - backup_minute | string is match('^[0-5]?[0-9]$')
-          - timezone is not search('[\r\n]')
+          # Role 01's preflight (below) checks the shape of these. Its
+          # patterns end in $, which also accepts one trailing newline, so
+          # newlines are refused here: the reboot time and the package
+          # names reach an apt config file, and timezone is printed in the
+          # client report.
+          - timezone | default('keep') | string is not search('[\r\n]')
+          - server_hostname | default('keep') | string is not search('[\r\n]')
+          - (unattended_reboot_time is not defined) or (unattended_reboot_time | string is not search('[\r\n]'))
+          - >-
+            (unattended_upgrade_blacklist | default([])) is not sequence
+            or (unattended_upgrade_blacklist | default([]) | map('string') | select('search', '[\r\n]') | list | length == 0)
         fail_msg: >-
           A variable has an unsafe shape. These values are interpolated into
           shell commands, file paths and newline-delimited config files, so a
@@ -192,8 +204,9 @@
           "high" (lowercase) in host_vars. Nothing has been changed on the
           server.
 
-    # Lands in jail.local (an INI file) next to office_static_ip, so every
-    # entry must be a plain IPv4/IPv6 address or CIDR range. Hostnames are
+    # Lands in fail2ban's jail.d/00-autosec.conf (an INI file) next to
+    # office_static_ip, so every entry must be a plain IPv4/IPv6 address or
+    # CIDR range (role 03's preflight checks the same). Hostnames are
     # refused: fail2ban would resolve them through DNS on every check.
     # Same pattern as role 02's preflight (_ssh_cidr_re); keep them equal.
     - name: "Preflight: fail2ban_ignore_ips must be a list of IP addresses"
@@ -244,6 +257,30 @@
     - name: "Preflight: SSH checks (read-only)"
       ansible.builtin.import_role:
         name: 02-ssh-hardening
+        tasks_from: preflight
+      tags: [always]
+
+    # --- Updates, reboots, hostname and timezone preflight (role 01) -------
+    # Checks every role 01 variable, reads the apt configuration and runs
+    # role 01's apt file on a copy of it (trial run), before role 01 changes
+    # anything. A wrong variable stops every run, whatever the tags; the
+    # checks of the server stop a run only when the tags select role 01
+    # ("base"). Read-only; also runs in --check.
+    - name: "Preflight: update, reboot, hostname and timezone checks (read-only)"
+      ansible.builtin.import_role:
+        name: 01-base
+        tasks_from: preflight
+      tags: [always]
+
+    # --- fail2ban preflight (role 03) ----------------------------------------
+    # Checks the fail2ban variables and asks fail2ban's own config reader,
+    # on a copy of /etc/fail2ban, what auto_sec's file would change. A wrong
+    # variable stops every run, whatever the tags; the checks of the server
+    # stop a run only when the tags select role 03's fail2ban part
+    # ("firewall" or "fail2ban"). Read-only; also runs in --check.
+    - name: "Preflight: fail2ban checks (read-only)"
+      ansible.builtin.import_role:
+        name: 03-firewall
         tasks_from: preflight
       tags: [always]
 

@@ -1,0 +1,3 @@
+---
+# Defaults: updates auto, reboot keep, origins keep, nothing excluded.
+unattended_upgrades_enabled: auto

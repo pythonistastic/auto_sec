@@ -1,0 +1,86 @@
+#!/bin/sh
+# autosec-apt-sim - role 01's trial run of the apt configuration (preflight
+# B5). It reads the real configuration and writes only below <sim_dir>.
+# Role 01 runs it as `sh -c "<this file>" sh <args>`; the tests run it the
+# same way, with APT_CONFIG pointing at a lab configuration.
+#
+# Usage: autosec-apt-sim <parts_dir> <sim_dir> <candidate|-> <name> <pristine|->
+#   parts_dir  the apt.conf.d directory auto_sec writes into
+#   sim_dir    scratch directory (removed and re-created, mode 0700)
+#   candidate  auto_sec's file as this run would write it, or - for none
+#              (the copy then has no <name> file)
+#   name       that file's name inside parts_dir
+#   pristine   the distro's 50unattended-upgrades to put back, or - for none
+#
+# The copy is read by apt itself: APT_CONFIG names a file that only sets
+# Dir::Etc::Parts to the copy. apt reads APT_CONFIG before the parts
+# directory, so the copy is read in the real order, with apt's own rules
+# for which file names count. (`apt-config -c <file>` cannot be used: it
+# reads <file> after every part, so a later file of yours would seem to
+# lose.) If APT_CONFIG is already set (tests), it is included first.
+#
+# Output, one record per line:
+#   B <Key> "<value>";     apt-config dump now (managed keys only)
+#   A <Key> "<value>";     the same with auto_sec's change applied to the copy
+#   S <file> <line>:<text> lines of the copy (and of the main apt.conf) that
+#                          set a managed key, in the order apt reads them
+#   E <text>               apt-config failed
+# Exit: 0 done, 2 usage, 90 scratch directory, 91 apt fails now,
+#       92 apt fails after the change.
+set -u
+umask 077
+LC_ALL=C
+export LC_ALL
+if [ $# -ne 5 ]; then
+  echo "E usage: autosec-apt-sim <parts_dir> <sim_dir> <candidate|-> <name> <pristine|->"
+  exit 2
+fi
+parts=$1 sim=$2 cand=$3 name=$4 pristine=$5
+keys='^(APT::Periodic::(Enable|Unattended-Upgrade|Update-Package-Lists)|Unattended-Upgrade::[^ ]+) '
+sets='(#clear|Periodic|Unattended-Upgrade|Update-Package-Lists|Enable|Automatic-Reboot|Package-Blacklist|Allowed-Origins|Origins-Pattern)'
+
+if ! out=$(apt-config dump 2>&1); then
+  printf '%s\n' "$out" | sed 's/^/E /'
+  exit 91
+fi
+printf '%s\n' "$out" | grep -E "$keys" | sed 's/^/B /'
+
+if ! { rm -rf -- "$sim" && mkdir -p -- "$sim/parts" && chmod 700 -- "$sim"; }; then
+  echo "E cannot create $sim"
+  exit 90
+fi
+for f in "$parts"/*; do
+  if [ -f "$f" ]; then cp -pL -- "$f" "$sim/parts/" || { echo "E cannot copy $f"; exit 90; }; fi
+done
+rm -f -- "$sim/parts/$name"
+if [ "$cand" != - ]; then cp -- "$cand" "$sim/parts/$name" || { echo "E cannot copy $cand"; exit 90; }; fi
+if [ "$pristine" != - ]; then
+  cp -- "$pristine" "$sim/parts/50unattended-upgrades" || { echo "E cannot copy $pristine"; exit 90; }
+fi
+{
+  if [ -n "${APT_CONFIG:-}" ]; then printf '#include "%s";\n' "$APT_CONFIG"; fi
+  printf 'Dir::Etc::Parts "%s/parts";\n' "$sim"
+} >"$sim/apt.conf"
+
+if ! out=$(APT_CONFIG="$sim/apt.conf" apt-config dump 2>&1); then
+  printf '%s\n' "$out" | sed 's/^/E /'
+  exit 92
+fi
+printf '%s\n' "$out" | grep -E "$keys" | sed 's/^/A /'
+
+# Lines that set a managed key, for the refusal messages. Only file names
+# apt reads (apt-pkg/contrib/fileutl.cc GetListOfFilesInDir: no leading
+# dot; letters, digits, _ - : and, with a .conf extension, dots).
+main=$(apt-config dump 2>/dev/null | sed -n 's/^Dir::Etc::main "\(.*\)";$/\1/p' | tail -n 1)
+case $main in /*) ;; ?*) main=/etc/apt/$main ;; *) main=/etc/apt/apt.conf ;; esac
+for f in "$sim/parts"/* "$main"; do
+  [ -f "$f" ] || continue
+  n=${f##*/}
+  case $n in
+    *.conf) printf '%s\n' "${n%.conf}" | grep -Eq '^[A-Za-z0-9_:-][A-Za-z0-9_:.-]*$' || continue ;;
+    *) printf '%s\n' "$n" | grep -Eq '^[A-Za-z0-9_:-]+$' || continue ;;
+  esac
+  [ "$f" = "$main" ] && label=$main || label=$n
+  grep -nE "$sets" -- "$f" | grep -vE '^[0-9]+:[[:space:]]*//' | sed "s|^|S $label |"
+done
+exit 0

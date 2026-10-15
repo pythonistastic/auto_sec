@@ -10,6 +10,216 @@ changes. Treat it as early-stage — see the
 
 ## [Unreleased]
 
+<!-- v0.5.0 work: #2 #3 #7 -->
+<!-- Everything from here to "end of v0.5.0 work" belongs to the fail2ban,
+     update, hostname and timezone fixes. The SSH entries below it are the
+     v0.4.0 work. If both ship in ONE release, also remove "#2", "#3" and
+     "#7" from the SSH block's Known limitations ("Full site.yml runs ...
+     not yet safe") and its Upgrading note "(A --tags firewall run also
+     adds it, but it overwrites jail.local, #2.)", and change its note
+     "`--check` of a full run fails ... needs ufw and fail2ban already
+     installed" to ufw only. -->
+
+**fail2ban, automatic updates, hostname and timezone (#2, #3, #7).** A
+full run no longer replaces your fail2ban or update files, no longer
+turns on automatic reboots, and leaves the hostname and timezone alone.
+Read **Upgrading (fail2ban, updates, hostname, timezone)** before you run
+it on a server that auto_sec 0.1–0.4 set up.
+
+### Breaking (fail2ban, updates, hostname, timezone)
+
+- **Role 03 no longer writes `/etc/fail2ban/jail.local` (#2).** It
+  writes only `/etc/fail2ban/jail.d/00-autosec.conf`. fail2ban reads
+  that file before `jail.local` and the other `jail.d` files, so your
+  values win.
+- auto_sec's fail2ban values are now the variable `fail2ban_defaults`,
+  with the same values as before (`bantime` 1h, escalating with factor
+  2, `findtime` 10m, `maxretry` 4). They are fail2ban `[DEFAULT]`
+  values. `fail2ban_defaults: {}` sets none. `backend = systemd` is no
+  longer written.
+- **No nginx jails from role 03.** The old `nginx-http-auth` and
+  `nginx-botsearch` jails read the journal and never matched anything.
+  Role 05 (only when `app_type` is set) now adds working ones
+  (`backend = auto`) in `/etc/fail2ban/jail.d/00-autosec-nginx.conf`,
+  after it has installed nginx (`fail2ban_nginx_jails: false` turns
+  them off). A host where nginx is yours gets none.
+- **The `restart fail2ban` handler is removed.** fail2ban is reloaded
+  only when its effective config changes, and a reload keeps the bans.
+  Only the `sshd` jail is restarted, and only when its port or action
+  changes. A fail2ban that was installed before the run keeps its
+  state: auto_sec no longer restarts or enables it.
+- **Role 01 writes at most
+  `/etc/apt/apt.conf.d/51autosec-unattended-upgrades` (#3)**, and only
+  for a setting you chose; with the defaults it writes no apt file. It
+  no longer replaces `50unattended-upgrades` (except the one-time
+  restore in **Upgrading**, on request) and no longer writes
+  `20auto-upgrades`.
+- **`unattended_upgrades_enabled: auto` (the default) writes no update
+  switch.** It installs `unattended-upgrades` if it is missing, and the
+  package's own setup turns the updates on. So
+  `dpkg-reconfigure unattended-upgrades` and your own interval keep
+  working. A package you removed (dpkg state `rc`) is not installed
+  again. `true` writes `"1"` (daily) into auto_sec's file and keeps the
+  updates on.
+- **Automatic reboots are no longer turned on (#3).** New
+  `unattended_automatic_reboot`: `keep` (default), `true` or `false`.
+  `true` needs `unattended_reboot_time`, quoted, for example `"03:30"`.
+- `Unattended-Upgrade::Remove-Unused-Dependencies "true"` is no longer
+  set.
+- **The hostname and the timezone are left alone by default (#7).**
+  `server_hostname` and `timezone` default to `keep`. Before, the
+  timezone was set to `"UTC"` and the hostname to the inventory name on
+  every run.
+- **No `apt-get dist-upgrade` on every run.** Role 01 only installs
+  missing packages; the nightly automatic updates do the rest. For a
+  full upgrade, pass `-e apt_full_upgrade=true` for one run (the wizard
+  adds it to the first run of a brand-new server).
+- **Role 01 installs only `curl` (and `unattended-upgrades`), without
+  their recommended packages.** It no longer installs git, htop, ncdu,
+  age, apt-listchanges, python3-pip (which pulled in a compiler) or jq:
+  no role uses them (role 07 installs age itself). It stops, before it
+  changes anything, if installing a missing package would upgrade or
+  remove a package you have (that can restart services), unless
+  `apt_full_upgrade` is set.
+
+### Fixed (fail2ban, updates, hostname, timezone)
+
+- **#2:** a full run replaced `jail.local`. Your other jails (for
+  example `recidive` and `nginx-bad-request`) disappeared and released
+  their bans, and your stricter values were loosened.
+- **#2:** nginx jails were turned on, also on hosts without nginx.
+- **#3:** automatic reboots at 04:00 were turned on, with no way out. A
+  server with a pending reboot rebooted the first night.
+- **#3:** the origin list had no `#clear`, so another file's origins
+  were added to it.
+- **#7:** the hostname and timezone were changed on every run. A
+  timezone change moved every cron job.
+- **Debian hosts got no automatic updates at all.** The origins that
+  0.1–0.4 wrote matched no Debian archive, while the report said
+  updates were on.
+- On Ubuntu, 0.1–0.4's file dropped the release pocket (which security
+  fixes need for new dependencies) and the ESM infra updates.
+- Installing the base packages could upgrade installed libraries (for
+  example `libc6` through python3-pip's recommended compiler) and
+  restart services.
+- A full `--check` on a new server no longer fails in the fail2ban part.
+- The client report claimed "fully patched", automatic updates "enabled"
+  with a 04:00 reboot window, and "fail2ban active with escalating ban
+  times", whatever the server did. It now prints what the run read:
+  automatic updates on or off (and whether their timer runs), automatic
+  reboot off or its time, a pending reboot, waiting updates, the sshd
+  jail's values and the file they come from. The backup time printed
+  `015:15` for hour 15; it is now `15:15`, with the server's timezone.
+
+### Added (fail2ban, updates, hostname, timezone)
+
+- **Read-only checks before any change**, in `pre_tasks` and also in
+  `--check`:
+  - fail2ban: fail2ban's own config reader runs on a copy of
+    `/etc/fail2ban`, with and without auto_sec's file. The run shows
+    what would change, the values the `sshd` jail uses, and the file
+    each value comes from.
+  - updates: apt itself reads a copy of `/etc/apt/apt.conf.d` with
+    auto_sec's file added. The run shows which update settings would
+    change.
+- **Refusals:** auto_sec's fail2ban values would change a jail of
+  yours; your fail2ban config does not load; a `jail.local` written by
+  0.1–0.4; migrating it would make a jail stop ignoring an address;
+  fail2ban runs a different config than its files; a file read before
+  auto_sec's sets the same value; a file with auto_sec's name that
+  auto_sec did not write (fail2ban and apt); a `50unattended-upgrades`
+  written by 0.1–0.4; a file of yours read after auto_sec's apt file
+  would cancel a choice; apt cannot read its configuration; installing
+  a missing package would upgrade or remove one you have; an unknown
+  timezone; a hostname change while a mail server listens on port 25,
+  465 or 587.
+- **Warnings and notes:** your own `ignoreip` hides `office_static_ip`;
+  the `sshd` jail bans on another port than `ssh_port`; restarting the
+  `sshd` jail releases its bans because fail2ban's database is off; a
+  reload also loads your other unloaded fail2ban edits; automatic
+  reboots are on (with the file and line that turns them on); a reboot
+  is pending; automatic updates are off on purpose; Docker packages may
+  be updated; the update timer is off; the cron jobs and timers a
+  timezone change moves.
+- New variables: `fail2ban_hardening_enabled`, `fail2ban_defaults`,
+  `fail2ban_migrate_jail_local`, `fail2ban_nginx_jails`,
+  `server_hostname`, `unattended_upgrades_enabled`,
+  `unattended_automatic_reboot`, `unattended_reboot_time`,
+  `unattended_origins` (`security`: security archives only),
+  `unattended_exclude_docker`, `unattended_upgrade_blacklist`,
+  `apt_full_upgrade`, `apt_migrate_unattended_upgrades`.
+- `--tags fail2ban` runs the fail2ban part of role 03 alone.
+- The wizard asks about automatic reboots and their time, Docker
+  updates (Docker apps), the hostname, the timezone, and whether the
+  server is brand-new.
+- CI: `fail2ban-semantics` (five fail2ban builds, plus a real fail2ban
+  1.0.2 server), `base-semantics` (five unattended-upgrades builds),
+  live tests on GitHub's Ubuntu 22.04 and 24.04 VMs (`fail2ban-live`,
+  `base-live`), and checks that no role writes `jail.local` or restarts
+  fail2ban, and that `group_vars/all.yml` and the role defaults hold
+  the same values.
+
+### Upgrading (fail2ban, updates, hostname, timezone)
+
+- **fail2ban on a host that 0.1–0.4 set up:** the run refuses its
+  `jail.local` and shows what migrating changes. Then run once with
+  `-e fail2ban_migrate_jail_local=true`: the file moves to
+  `/var/lib/auto-sec/fail2ban/`. To keep the file as your own instead,
+  add a comment line to it.
+- On Ubuntu 22.04 and Debian 12, 0.1–0.4's fail2ban read the journal
+  for the `sshd` jail. To keep that, add `backend: systemd` to
+  `fail2ban_defaults`.
+- If your office IP is banned now: `fail2ban-client unban <ip>`.
+- **Update settings on a host that 0.1–0.4 set up:** when
+  `50unattended-upgrades` is exactly 0.1–0.4's file, the run refuses
+  and shows what putting the distro's file back changes. Then run once
+  with `-e apt_migrate_unattended_upgrades=true`: the run keeps a copy
+  in `/var/lib/auto-sec/backup/` and puts the distro's file back.
+  Automatic reboots stop (unless you choose them), and on Ubuntu the
+  release pocket and ESM infra updates come back. To keep the old file
+  as your own instead, add a comment line to it (its 04:00 reboots then
+  stay on unless you set `unattended_automatic_reboot: false`; the run
+  warns). To put the distro's file back by hand:
+  `cp /usr/share/unattended-upgrades/50unattended-upgrades /etc/apt/apt.conf.d/50unattended-upgrades`.
+- **On Debian**, the first night after that migration may install many
+  waiting updates (point releases too) and restart services, because
+  0.1–0.4's file installed none. Set `unattended_origins: security`
+  first to allow security updates only.
+- Role 01 no longer installs git, htop, ncdu, age, apt-listchanges,
+  python3-pip or jq. Those that 0.1–0.4 installed stay installed.
+- To keep 0.4's behaviour: `unattended_automatic_reboot: true`,
+  `unattended_reboot_time: "04:00"`, `server_hostname: <the inventory
+  name>`, `timezone: "UTC"`.
+
+### Known limitations (fail2ban, updates, hostname, timezone)
+
+- A full run no longer replaces your fail2ban or update files, and no
+  longer changes reboots, the hostname or the timezone. It adds its own
+  `jail.d/00-autosec.conf` (and `51autosec-unattended-upgrades` only
+  for an update setting you chose); the read-only checks show which
+  effective values they change before anything is written. It still
+  turns ufw on if it is off (only SSH, 80 and 443 stay open), creates
+  the `deploy` user with passwordless sudo, writes kernel settings into
+  `/etc/sysctl.conf`, installs `curl` and `unattended-upgrades` when
+  they are missing, adds the detection roles, and stops at the report
+  when `client_name` or `client_domain` is missing. See the README's
+  Known limitations.
+- Before a fail2ban reload, auto_sec compares only the jail list and
+  each jail's `maxretry`, `findtime`, `bantime` and `ignoreip` with the
+  running server. A reload also loads any other edit of yours that is
+  not loaded yet (the run says so).
+- `--tags fail2ban` does not update role 05's nginx jails (a run with
+  `app` does).
+- A fail2ban jail you add later without its own values uses
+  `fail2ban_defaults`. The run checks your jails only while it runs.
+- Lab-tested only: fail2ban's reload and restart on 1.0.2 (not 0.11.2
+  or 1.1.x), and the update settings on five unattended-upgrades
+  builds. The new live tests have not run yet.
+- A full `--check` on a new server still fails at role 03's ufw part,
+  because ufw is not installed yet.
+
+<!-- end of v0.5.0 work -->
+
 **SSH lockout fixes.** This release changes how auto_sec handles SSH,
 and it has breaking changes. Read **Upgrading** before you run it on a
 server that already exists.

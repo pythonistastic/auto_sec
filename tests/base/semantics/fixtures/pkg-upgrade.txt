@@ -1,0 +1,22 @@
+Reading package lists...
+Building dependency tree...
+Reading state information...
+The following packages were automatically installed and are no longer required:
+  libdrm-nouveau2 libdrm-radeon1 libgl1-amber-dri libglapi-mesa libllvm17t64
+  libllvm19 libwayland-server0 libxcb-dri2-0
+Use 'apt autoremove' to remove them.
+The following additional packages will be installed:
+  apparmor libapparmor1
+Suggested packages:
+  apparmor-profiles-extra apparmor-utils
+The following NEW packages will be installed:
+  libapparmor-dev
+The following packages will be upgraded:
+  apparmor libapparmor1
+2 upgraded, 1 newly installed, 0 to remove and 80 not upgraded.
+Inst libapparmor1 [4.0.1really4.0.1-0ubuntu0.24.04.3] (4.0.1really4.0.1-0ubuntu0.24.04.7 Ubuntu:24.04/noble-updates [amd64])
+Inst apparmor [4.0.1really4.0.1-0ubuntu0.24.04.3] (4.0.1really4.0.1-0ubuntu0.24.04.7 Ubuntu:24.04/noble-updates [amd64])
+Inst libapparmor-dev (4.0.1really4.0.1-0ubuntu0.24.04.7 Ubuntu:24.04/noble-updates [amd64])
+Conf libapparmor1 (4.0.1really4.0.1-0ubuntu0.24.04.7 Ubuntu:24.04/noble-updates [amd64])
+Conf apparmor (4.0.1really4.0.1-0ubuntu0.24.04.7 Ubuntu:24.04/noble-updates [amd64])
+Conf libapparmor-dev (4.0.1really4.0.1-0ubuntu0.24.04.7 Ubuntu:24.04/noble-updates [amd64])

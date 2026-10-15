@@ -1,0 +1,3 @@
+---
+# Role 05's nginx jails (tasks/fail2ban-nginx.yml).
+render_template: 00-autosec-nginx.conf.j2

@@ -1,0 +1,3 @@
+---
+# Role defaults: fail2ban_defaults as shipped, no addresses, ssh_port 22.
+ssh_port: 22

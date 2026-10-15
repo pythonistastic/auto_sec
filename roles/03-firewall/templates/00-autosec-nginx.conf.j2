@@ -1,0 +1,19 @@
+{# roles/03-firewall/templates/00-autosec-nginx.conf.j2
+   Written by tasks/fail2ban-nginx.yml, which role 05 includes after it has
+   installed nginx (its logs exist then). No variables besides the marker. #}
+{{ _f2b_nginx_marker }}
+# Turn it off with fail2ban_nginx_jails: false.
+#
+# fail2ban reads this file right after jail.conf, before every other file in
+# jail.d and before jail.local: a value one of YOUR files sets for these
+# jails wins. backend = auto reads nginx's log files; without it a
+# [DEFAULT] backend = systemd (Ubuntu 24.04's defaults-debian.conf) would
+# make these jails read the journal, where nginx does not log.
+
+[nginx-http-auth]
+enabled = true
+backend = auto
+
+[nginx-botsearch]
+enabled = true
+backend = auto

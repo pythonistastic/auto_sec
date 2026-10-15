@@ -1,0 +1,46 @@
+# The canary's /etc/fail2ban/jail.local (Ubuntu 24.04, fail2ban 1.0.2), rebuilt
+# from a read-only, comment-stripped dump. The operator's two addresses are
+# replaced by documentation addresses (RFC 5737). lab.py points the log paths
+# at empty files in its work directory.
+[DEFAULT]
+bantime.increment = true
+bantime.factor    = 1
+bantime.formula   = ban.Time * (1 << (ban.Count if ban.Count < 20 else 20))
+bantime.maxtime   = 8w
+bantime.rndtime   = 10m
+bantime  = 1h
+findtime = 10m
+maxretry = 3
+ignoreip = 127.0.0.1/8 ::1 198.51.100.1 203.0.113.2
+backend = systemd
+[sshd]
+enabled  = true
+port     = ssh
+maxretry = 3
+findtime = 10m
+bantime  = 1h
+[nginx-http-auth]
+backend  = auto
+enabled  = true
+port     = http,https
+logpath  = /var/log/nginx/*error.log
+maxretry = 3
+[nginx-botsearch]
+backend  = auto
+enabled  = true
+port     = http,https
+logpath  = /var/log/nginx/*access.log
+maxretry = 3
+[nginx-bad-request]
+backend  = auto
+enabled  = true
+port     = http,https
+logpath  = /var/log/nginx/*access.log
+maxretry = 5
+[recidive]
+backend  = auto
+enabled  = true
+logpath  = /var/log/fail2ban.log
+bantime  = 4w
+findtime = 1d
+maxretry = 3

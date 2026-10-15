@@ -1,0 +1,58 @@
+---
+# LAB ONLY (tests/fail2ban/semantics/lab.py, S16). Never run this against a
+# server. It runs role 03's own fail2ban task files, unchanged, as the
+# current user against a lab copy of /etc/fail2ban and an unprivileged
+# fail2ban 1.0.2 server: lab.py passes -e with _f2b_conf_dir, _f2b_client,
+# _f2b_run_dir ... pointing into its work directory, and puts stubs for
+# dpkg-query and systemctl first in PATH (fail2ban "installed, active,
+# enabled"). The steps that need root are left out: F1 (apt) and F11
+# (systemd). Everything else is what fail2ban.yml runs.
+- name: Role 03 fail2ban lab (unprivileged)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  pre_tasks:
+    - name: "Preflight: fail2ban checks (read-only), as site.yml runs them"
+      ansible.builtin.import_role:
+        name: 03-firewall
+        tasks_from: preflight
+      tags: [always]
+
+  tasks:
+    - name: "Apply: fail2ban.yml F3-F10 and F12"
+      tags: [fail2ban]
+      block:
+        - name: "F3 trial run (after the other roles)"
+          ansible.builtin.include_role:
+            name: 03-firewall
+            tasks_from: trial
+          vars:
+            _f2b_kind: main
+            _f2b_stage: apply
+
+        - name: "F3 refuse or go on"
+          ansible.builtin.include_role:
+            name: 03-firewall
+            tasks_from: decide
+          vars:
+            _f2b_kind: main
+            _f2b_stage: apply
+
+        - name: "F4-F10 write, check, load and verify"
+          ansible.builtin.include_role:
+            name: 03-firewall
+            tasks_from: apply
+          vars:
+            _f2b_kind: main
+
+        - name: "F12 report line"
+          ansible.builtin.include_role:
+            name: 03-firewall
+            tasks_from: report
+
+    # What role 05 includes after it has installed nginx (lab_nginx: true).
+    - name: "Role 05: auto_sec's nginx jails"
+      when: lab_nginx | default(false) | bool
+      ansible.builtin.include_role:
+        name: 03-firewall
+        tasks_from: fail2ban-nginx

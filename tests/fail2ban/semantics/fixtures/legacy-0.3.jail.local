@@ -1,0 +1,17 @@
+[DEFAULT]
+bantime  = 1h
+bantime.increment = true
+bantime.factor = 2
+findtime = 10m
+maxretry = 4
+backend = systemd
+
+[sshd]
+enabled = true
+port = 2222
+
+[nginx-http-auth]
+enabled = true
+
+[nginx-botsearch]
+enabled = true

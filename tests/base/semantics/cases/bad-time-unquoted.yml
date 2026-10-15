@@ -1,0 +1,4 @@
+---
+# Unquoted on purpose: YAML 1.1 reads 3:30 as the number 210.
+unattended_automatic_reboot: true
+unattended_reboot_time: 3:30

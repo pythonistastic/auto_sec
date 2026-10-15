@@ -473,6 +473,88 @@ note "you can add allowed ports later in host_vars (egress_allow_extra)."
 EGRESS="false"
 confirm "Enable egress lockdown?" n && EGRESS="true"
 
+# ------------------------------------------------- updates and reboots
+# Role 01. Every answer here is written to host_vars; the run checks it
+# again and shows what it would change before it changes anything.
+say "Automatic updates and reboots"
+note "Security updates install by themselves every night, at about"
+note "06:00-07:00 server time. Some of them (a new kernel) only take effect"
+note "after a reboot. auto_sec does not turn automatic reboots on unless you"
+note "say so here."
+REBOOT_CHOICE="keep"; REBOOT_TIME=""
+if confirm "Turn on automatic reboots when an update needs one?" n; then
+  note "The server reboots at this time of day, in its own timezone. A time"
+  note "before the updates (for example 03:30) means the next night."
+  ask "Reboot time, 24-hour HH:MM" "03:30"
+  REBOOT_TIME="$REPLY"
+  [[ "$REBOOT_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] \
+    || die "Use a 24-hour time with two-digit hours, like 03:30."
+  REBOOT_CHOICE="true"
+else
+  note "Not turned on. If this server already reboots by itself, the run"
+  note "tells you. To stop that, set unattended_automatic_reboot: false"
+  note "in $HOSTVARS."
+fi
+
+EXCLUDE_DOCKER=""
+if [ "$APP_TYPE" = "docker" ]; then
+  note "An automatic Docker update restarts the Docker service and every"
+  note "container. If you exclude Docker, you update it yourself, when it"
+  note "suits you."
+  EXCLUDE_DOCKER="false"
+  confirm "Never update the Docker packages automatically?" y && EXCLUDE_DOCKER="true"
+fi
+
+# ---------------------------------------------------- hostname, timezone
+say "Hostname and timezone"
+note "auto_sec leaves both as the server has them, unless you choose here."
+# Local mode only: today's values. Display only, never written.
+NOW_HOSTNAME=""; NOW_TZ=""
+if [ "$MODE" = "local" ]; then
+  NOW_HOSTNAME="$(hostname 2>/dev/null || true)"
+  [[ "$NOW_HOSTNAME" =~ ^[A-Za-z0-9.-]{1,64}$ ]] || NOW_HOSTNAME=""
+  NOW_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || true)"
+  [[ "$NOW_TZ" =~ ^[A-Za-z][A-Za-z0-9_+/-]{0,63}$ ]] || NOW_TZ=""
+fi
+
+[ -n "$NOW_HOSTNAME" ] && note "This server's hostname now: ${NOW_HOSTNAME}"
+note "If this server sends e-mail, keep its hostname: a mail server shows it"
+note "to every server it sends to, and a mismatch can put your mail in spam."
+HOST_CHOICE="keep"
+if [[ "$SERVER" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+  confirm "Set the server's hostname to '${SERVER}'?" n && HOST_CHOICE="$SERVER"
+else
+  note "('${SERVER}' cannot be a hostname, so the hostname stays as it is.)"
+fi
+
+[ -n "$NOW_TZ" ] && note "This server's timezone now: ${NOW_TZ}"
+note "A new timezone moves every job that runs at a clock time (backups,"
+note "cron jobs, the reboot time) and the times in the logs."
+ask "Timezone: keep (leave it as it is), or a name like UTC or Europe/Berlin" "keep"
+TZ_CHOICE="$REPLY"
+case "$TZ_CHOICE" in keep|Keep|KEEP) TZ_CHOICE="keep" ;; esac
+if [ "$TZ_CHOICE" != "keep" ]; then
+  [[ "$TZ_CHOICE" =~ ^[A-Za-z][A-Za-z0-9_+-]{0,30}(/[A-Za-z0-9_+-]{1,30}){0,2}$ ]] \
+    || die "Not a timezone name: $TZ_CHOICE (use for example UTC or Europe/Berlin, or keep)."
+  if [ "$MODE" = "local" ] && command -v timedatectl >/dev/null 2>&1; then
+    # Read the list first: with pipefail, `timedatectl | grep -q` can fail
+    # on a match (grep exits early and timedatectl gets SIGPIPE).
+    TZ_LIST="$(timedatectl list-timezones 2>/dev/null || true)"
+    if [ -n "$TZ_LIST" ] && ! grep -Fxq -- "$TZ_CHOICE" <<<"$TZ_LIST"; then
+      die "This server does not know the timezone $TZ_CHOICE (see: timedatectl list-timezones)."
+    fi
+  fi
+fi
+
+# ------------------------------------------------------------- first run
+say "First run"
+note "On a BRAND-NEW server, the first run can also install every update"
+note "that is waiting (apt-get dist-upgrade). That can restart services, and"
+note "a new kernel needs a reboot. Do not do this on a server that already"
+note "runs something: there, the nightly security updates are enough."
+FULL_UPGRADE=0
+confirm "Is this a brand-new server with nothing running on it yet?" n && FULL_UPGRADE=1
+
 # ----------------------------------------------------------------- watcher
 say "Detection suite"
 note "Two robust detectors run automatically (in the mode you pick below):"
@@ -513,9 +595,10 @@ fi
 # source of a newline is a .pub file holding more than one key.
 for v in ADMIN_USER AGE_PUBLIC APP_PORT APP_TYPE B2_APP_KEY B2_BUCKET \
          B2_KEY_ID CLIENT_NAME DB_ENGINE DB_NAME DB_PASSWORD DB_USER \
-         DEPLOY_PUBKEY DOMAIN FWKNOP_HMAC FWKNOP_KEY LE_EMAIL NODE_VERSION \
-         NOW_USER OFFICE_IP PARANOIA PASSWORD_AUTH PERMIT_ROOT SERVER_IP \
-         SSH_KEY_FILE TG_CHAT TG_TOKEN WATCHER_MODE WATCHER_PATTERN; do
+         DEPLOY_PUBKEY DOMAIN EXCLUDE_DOCKER FWKNOP_HMAC FWKNOP_KEY \
+         HOST_CHOICE LE_EMAIL NODE_VERSION NOW_USER OFFICE_IP PARANOIA \
+         PASSWORD_AUTH PERMIT_ROOT REBOOT_CHOICE REBOOT_TIME SERVER_IP \
+         SSH_KEY_FILE TG_CHAT TG_TOKEN TZ_CHOICE WATCHER_MODE WATCHER_PATTERN; do
   case "${!v-}" in
     *$'\n'*|*$'\r'*) die "$v contains a newline; refusing to write $HOSTVARS. (A .pub file with several keys? Pick one.)" ;;
   esac
@@ -546,6 +629,19 @@ say "Writing ${HOSTVARS}"
   echo
   echo "# Also added (never exclusively) for the deploy user."
   echo "deploy_ssh_public_key: $(yaml_str "${DEPLOY_PUBKEY}")"
+  echo
+  echo "# Updates, reboots, hostname, timezone (role 01). keep = leave it as"
+  echo "# the server has it. A reboot time is in the server's own timezone and"
+  echo "# must stay quoted."
+  echo "server_hostname: $(yaml_str "${HOST_CHOICE}")"
+  echo "timezone: $(yaml_str "${TZ_CHOICE}")"
+  echo "unattended_automatic_reboot: $(yaml_str "${REBOOT_CHOICE}")"
+  if [ "$REBOOT_CHOICE" = "true" ]; then
+    echo "unattended_reboot_time: $(yaml_str "${REBOOT_TIME}")"
+  fi
+  if [ -n "$EXCLUDE_DOCKER" ]; then
+    echo "unattended_exclude_docker: $(yaml_str "${EXCLUDE_DOCKER}")"
+  fi
   echo
   echo "app_type: $(yaml_str "${APP_TYPE}")"
   echo "app_dir: \"/opt/app\""
@@ -643,14 +739,22 @@ echo
 echo "===================================================================="
 say "Configuration complete."
 echo
-# RUN_CMD is eval'd below. It is built only from the validated server name
-# and the validated login user name.
+# RUN_CMD is eval'd below. It is built only from the validated server name,
+# the validated login user name and fixed text.
+# The full upgrade is a one-off: only the first run gets it.
+UPGRADE_OPT=""
+[ "$FULL_UPGRADE" = 1 ] && UPGRADE_OPT=" -e apt_full_upgrade=true"
 if [ "$MODE" = "local" ]; then
-  RUN_CMD="sudo ansible-playbook -i inventory site.yml -l ${SERVER}"
+  PREVIEW_CMD="sudo ansible-playbook -i inventory site.yml -l ${SERVER}"
+  RUN_CMD="${PREVIEW_CMD}${UPGRADE_OPT}"
   note "Harden this server now with:"
   note "  ${RUN_CMD}"
-  note "To preview the SSH part first (it writes no config files), add:"
-  note "  --check --diff --tags ssh"
+  note "To preview the SSH part first (it writes no config files):"
+  note "  ${PREVIEW_CMD} --check --diff --tags ssh"
+  if [ "$FULL_UPGRADE" = 1 ]; then
+    note "(-e apt_full_upgrade=true installs every waiting update. Use it on"
+    note "this first run only; later runs are the same command without it.)"
+  fi
   echo
   show_current_rules
   describe_rules
@@ -661,20 +765,25 @@ if [ "$MODE" = "local" ]; then
   note "  ssh ${ADMIN_USER}@<this server's IP>"
 else
   BASE_CMD="ansible-playbook -i inventory site.yml -l ${SERVER}"
-  RUN_CMD="${BASE_CMD}"
-  [ "$NOW_USER" = "$ADMIN_USER" ] || RUN_CMD="${BASE_CMD} -e ansible_user=${NOW_USER}"
+  PREVIEW_CMD="${BASE_CMD}"
+  [ "$NOW_USER" = "$ADMIN_USER" ] || PREVIEW_CMD="${BASE_CMD} -e ansible_user=${NOW_USER}"
+  RUN_CMD="${PREVIEW_CMD}${UPGRADE_OPT}"
   note "Step 1. Connect once by hand. This records the server's host key"
   note "and puts your key on the account you use today:"
   note "  ssh-copy-id -i ${SSH_KEY_FILE}.pub ${NOW_USER}@${SERVER_IP}"
   note "  (Type the password if asked. If the key is already there, it adds nothing.)"
   note ""
   note "Step 2. See what the SSH part would change. This writes no config files:"
-  note "  ${RUN_CMD} --check --diff --tags ssh"
-  note "  (A full --check stops at the firewall role on a new server: ufw and"
-  note "  fail2ban are not installed yet. The real run installs them.)"
+  note "  ${PREVIEW_CMD} --check --diff --tags ssh"
+  note "  (A full --check stops at the firewall role on a new server: ufw is"
+  note "  not installed yet. The real run installs it.)"
   note ""
   note "Step 3. The real run:"
   note "  ${RUN_CMD}"
+  if [ "$FULL_UPGRADE" = 1 ]; then
+    note "  (-e apt_full_upgrade=true installs every waiting update. Use it on"
+    note "  this first run only.)"
+  fi
   if [ "$NOW_USER" != "$ADMIN_USER" ]; then
     note ""
     note "This first run logs in as ${NOW_USER}, because ${ADMIN_USER} does not"
@@ -694,10 +803,19 @@ else
   note "  ssh -i ${SSH_KEY_FILE} ${ADMIN_USER}@${SERVER_IP}"
 fi
 echo
-note "Is this server already in production? Then run only the SSH part for"
-note "now: add --tags ssh. A full run still overwrites jail.local, turns on"
-note "automatic reboots and changes the hostname (issues #2, #3, #7)."
-note "Do not put the full playbook in cron."
+note "Is this server already in production? A full run no longer replaces"
+note "your fail2ban files, turns on reboots or changes the hostname or"
+note "timezone (issues #2, #3, #7 are fixed). But it still:"
+note "  - turns ufw on if it is off (then only SSH, 80 and 443 stay open);"
+note "  - creates the 'deploy' user with passwordless sudo;"
+note "  - installs curl and unattended-upgrades if they are missing (it"
+note "    stops instead if that would upgrade a package you have);"
+note "  - changes kernel network settings and adds the detectors;"
+note "  - sets up the app, database and backups you chose here, including"
+note "    nginx for ${DOMAIN} (it removes nginx's default site)."
+note "On such a server, run only the parts you want, for example"
+note "--tags ssh,fail2ban, and read 'Known limitations' in README.md first."
+note "Do not put the playbook in cron."
 echo
 if confirm "Run the playbook now?" n; then
   eval "$RUN_CMD"

@@ -1,0 +1,621 @@
+#!/usr/bin/python3 -I
+"""auto-sec-f2b-check: read-only trial of an auto_sec fail2ban drop-in.
+
+Role 03 runs this on the managed host as root, with python3 -I, as one
+argv list (no shell). It never writes outside --work and never changes
+fail2ban: it only asks fail2ban's own config reader what a config means
+(`fail2ban-client -c COPY -d`, `-t`, `-vvv -d`) and, with --running, reads
+the running server (`status`, `get`). Python 3.10 standard library only.
+
+Trial mode (default) builds three copies of the fail2ban directory in --work:
+  live     /etc/fail2ban as it is now
+  without  live minus auto_sec's file --candidate-name, and minus jail.local
+           when it is a jail.local written by auto_sec 0.1-0.4 (migration)
+  new      without plus the candidate as jail.d/<candidate-name>
+and prints one JSON object (keys documented in report_defaults()).
+
+Verify mode (--verify) compares the running server with --conf itself.
+
+Exit 0 = JSON printed (the caller decides), 2 = usage or setup error.
+
+Trust boundary: everything printed comes from the host. Every string in the
+output has "{" and "}" replaced with "?", so no value can ever be read as a
+Jinja template by the controller.
+"""
+import argparse
+import ast
+import configparser
+import glob
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+
+OWN_FILES = ("00-autosec.conf", "00-autosec-nginx.conf")
+
+# jail.local as auto_sec 0.1.0-0.3.2 (A) and the 0.4.0 test branch (B) wrote
+# it, after normalising the two variable lines (port, ignoreip).
+LEGACY_A = (
+    "[DEFAULT]\nbantime  = 1h\nbantime.increment = true\nbantime.factor = 2\n"
+    "findtime = 10m\nmaxretry = 4\nbackend = systemd\n\n[sshd]\nenabled = true\n"
+    "port = N\n\n[nginx-http-auth]\nenabled = true\n\n[nginx-botsearch]\nenabled = true\n")
+LEGACY_B = LEGACY_A.replace("[DEFAULT]\n", "[DEFAULT]\nignoreip = L\n", 1)
+LEGACY_PORT_RE = re.compile(r"^port = [0-9]{1,5}$", re.M)
+LEGACY_IGN_RE = re.compile(r"^ignoreip = 127\.0\.0\.1/8 ::1(?: [0-9A-Fa-f:./]{2,49})*$", re.M)
+
+HASHED = ("addfailregex", "addignoreregex", "prefregex")
+LISTS = ("addlogpath", "addjournalmatch", "addignoreip", "addaction")
+SSHD_SHOW = ("backend", "maxretry", "findtime", "bantime", "bantime.increment",
+             "bantime.factor", "bantime.maxtime", "bantime.rndtime", "addignoreip")
+DRIFT_KEYS = ("maxretry", "findtime", "bantime")
+# Role 02 keeps the controller address of a run's runtime-only fail2ban
+# exception here while it is in place: not drift.
+RUNTIME_IGNORE = "/run/auto-sec/f2b-ignore"
+WELL_KNOWN = {"ssh": 22, "http": 80, "https": 443}
+LOOPBACK = ("127.0.0.0/8", "::1/128")
+
+
+class Fail(Exception):
+    pass
+
+
+def clean(obj):
+    """Host data only ever leaves this script without braces."""
+    if isinstance(obj, str):
+        s = obj.replace("{", "?").replace("}", "?")
+        return s if len(s) <= 2000 else s[:2000] + "..."
+    if isinstance(obj, dict):
+        return {clean(str(k)): clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [clean(v) for v in obj]
+    return obj
+
+
+def run(argv, timeout=120):
+    try:
+        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd="/",
+                           timeout=timeout, check=False,
+                           env=dict(os.environ, LC_ALL="C.UTF-8", LANG="C.UTF-8"))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, "", str(e)
+    return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+
+def legacy_kind(path):
+    """absent | a | b | other. Only an exact auto_sec 0.1-0.4 file is a/b."""
+    if not os.path.lexists(path):
+        return "absent"
+    if os.path.islink(path) or not os.path.isfile(path):
+        return "other"
+    with open(path, "rb") as f:
+        raw = f.read(65537)
+    if len(raw) > 65536:
+        return "other"
+    try:
+        txt = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return "other"
+    if "\r" in txt:
+        return "other"
+    norm = LEGACY_IGN_RE.sub("ignoreip = L", LEGACY_PORT_RE.sub("port = N", txt))
+    if not norm.endswith("\n"):
+        norm += "\n"
+    if norm == LEGACY_A:
+        return "a"
+    if norm == LEGACY_B:
+        return "b"
+    return "other"
+
+
+def norm_ports(value):
+    """'ssh,2222' -> ['22', '2222']; ranges 'a:b' -> 'a-b'; unknown names kept."""
+    out = []
+    for p in str(value or "").split(","):
+        p = p.strip()
+        if not p:
+            continue
+        if p.isdigit():
+            out.append(str(int(p)))
+            continue
+        m = re.match(r"^([0-9]+)[:-]([0-9]+)$", p)
+        if m:
+            out.append("%d-%d" % (int(m.group(1)), int(m.group(2))))
+            continue
+        try:
+            out.append(str(socket.getservbyname(p, "tcp")))
+        except OSError:
+            out.append(str(WELL_KNOWN[p]) if p in WELL_KNOWN else p)
+    return sorted(set(out))
+
+
+def port_covers(value, ssh_port):
+    for p in norm_ports(value):
+        if p == str(ssh_port):
+            return True
+        m = re.match(r"^([0-9]+)-([0-9]+)$", p)
+        if m and int(m.group(1)) <= ssh_port <= int(m.group(2)):
+            return True
+    return False
+
+
+def norm_net(token):
+    try:
+        return str(ipaddress.ip_network(token, strict=False))
+    except ValueError:
+        return token
+
+
+def covered(ip, tokens):
+    try:
+        net = ipaddress.ip_network(ip, strict=False)
+    except ValueError:
+        return False
+    for t in tokens:
+        try:
+            other = ipaddress.ip_network(t, strict=False)
+        except ValueError:
+            continue
+        if net.version == other.version and net.subnet_of(other):
+            return True
+    return False
+
+
+def short_hash(obj):
+    return hashlib.sha256(repr(obj).encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def parse_dump(text):
+    """`fail2ban-client -d` stream -> jails {name: {key: str}}, actions."""
+    jails, order, actions, parsed = {}, [], {}, 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("["):
+            continue
+        try:
+            c = ast.literal_eval(line)
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            continue
+        if not isinstance(c, list) or len(c) < 2 or not isinstance(c[1], str):
+            continue
+        parsed += 1
+        if c[0] == "add" and len(c) >= 3:
+            jails[c[1]] = {"backend": str(c[2])}
+            order.append(c[1])
+            actions[c[1]] = {}
+        elif c[0] in ("set", "multi-set") and len(c) >= 4 and c[1] in jails:
+            j, k = c[1], str(c[2])
+            if c[0] == "multi-set" and k == "action" and len(c) >= 5:
+                params = {}
+                if isinstance(c[4], list):
+                    for kv in c[4]:
+                        if isinstance(kv, (list, tuple)) and len(kv) == 2:
+                            params[str(kv[0])] = str(kv[1])
+                name = str(c[3])
+                actions[j][name] = params
+                k = "action " + name
+                v = "port=%s protocol=%s sha=%s" % (params.get("port"), params.get("protocol"),
+                                                     short_hash(sorted(params.items())))
+            elif k in HASHED or c[0] == "multi-set":
+                v = "sha=" + short_hash(c[3:])
+            else:
+                v = " ".join(str(x) for x in c[3:])
+            if k in LISTS and k in jails[j]:
+                jails[j][k] += " | " + v
+            else:
+                jails[j][k] = v
+        elif c[0] == "start" and c[1] in jails:
+            jails[c[1]]["(started)"] = "yes"
+    return {"order": order, "jails": jails, "actions": actions, "parsed": parsed}
+
+
+def errors_of(err):
+    lines = [re.sub(r"^.*?ERROR\s+", "", ln).strip() for ln in err.splitlines() if "ERROR" in ln]
+    return " ".join(lines)[-800:]
+
+
+def dump(client, conf):
+    rc, out, err = run(client + ["-c", conf, "-d"])
+    res = {"ok": rc == 0, "rc": rc, "error": errors_of(err) or (err.strip()[-400:] if rc else "")}
+    parsed = parse_dump(out) if rc == 0 else {"order": [], "jails": {}, "actions": {}, "parsed": 0}
+    # rc 0 but no command we can read: unreadable, never "no jails"
+    parsed["unparsed"] = rc == 0 and parsed["parsed"] == 0
+    res.update(parsed)
+    return res
+
+
+def config_test(client, conf):
+    rc, out, err = run(client + ["-c", conf, "-t"])
+    return {"ok": rc == 0, "rc": rc, "error": errors_of(err + "\n" + out) if rc else ""}
+
+
+def read_trace(client, conf):
+    """Files fail2ban reads for the jail config, in order (fail2ban's own trace)."""
+    rc, out, err = run(client + ["-c", conf, "-vvv", "-d"])
+    if rc != 0:
+        return []
+    files, in_jail = [], False
+    for ln in err.splitlines():
+        if re.search(r"Reading configs for jail under ", ln):
+            in_jail = True
+            continue
+        if in_jail and re.search(r"(Reading|Loading) configs for ", ln):
+            break
+        m = re.search(r"Reading file: (.+?)\s*$", ln) if in_jail else None
+        if m and os.path.normpath(m.group(1)) not in files:
+            files.append(os.path.normpath(m.group(1)))
+    return [f for f in files if os.path.isfile(f)]
+
+
+def fallback_order(conf):
+    files = [os.path.join(conf, n) for n in ("jail.conf", "paths-debian.conf", "paths-common.conf",
+                                             "paths-overrides.local")]
+    files += sorted(glob.glob(os.path.join(conf, "jail.d", "*.conf")))
+    files.append(os.path.join(conf, "jail.local"))
+    files += sorted(glob.glob(os.path.join(conf, "jail.d", "*.local")))
+    return [f for f in files if os.path.isfile(f)]
+
+
+def ini(path):
+    """fail2ban's own parser options (configparserinc.py): ';' inline comments."""
+    p = configparser.RawConfigParser(default_section="\x00none", strict=False,
+                                     inline_comment_prefixes=(";",), interpolation=None)
+    try:
+        p.read(path, encoding="utf-8")
+    except (configparser.Error, UnicodeDecodeError, OSError):
+        return None
+    return p
+
+
+def norm_value(key, value):
+    if key == "port":
+        return ",".join(norm_ports(value))
+    return " ".join(str(value).split()).lower()
+
+
+def conffile_md5s(path_list):
+    """{relative path: md5} of fail2ban's dpkg conffiles."""
+    if path_list:
+        with open(path_list, encoding="utf-8") as f:
+            text = f.read()
+    else:
+        rc, text, err = run(["dpkg-query", "-W", "-f=${Conffiles}\\n", "fail2ban"])
+        if rc != 0:
+            return {}
+    out = {}
+    for ln in text.splitlines():
+        parts = ln.split()
+        if len(parts) >= 2 and parts[0].startswith("/etc/fail2ban/") and re.match(r"^[0-9a-f]{32}$", parts[1]):
+            out[parts[0][len("/etc/fail2ban/"):]] = parts[1]
+    return out
+
+
+def md5_of(path):
+    h = hashlib.md5(usedforsecurity=False)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_before_overrides(tree, read_order, cand_name, cand_ini, conffiles):
+    """Keys of auto_sec's sections set (to another value) in a file that is
+    read BEFORE auto_sec's file and is not an unmodified package conffile:
+    auto_sec's value would silently win over them."""
+    target = os.path.normpath(os.path.join(tree, "jail.d", cand_name))
+    if target not in read_order:
+        return [], False
+    found = []
+    for f in read_order[:read_order.index(target)]:
+        rel = os.path.relpath(f, tree)
+        if os.path.basename(f) in OWN_FILES and os.path.dirname(rel) == "jail.d":
+            continue
+        if rel in conffiles and md5_of(f) == conffiles[rel]:
+            continue
+        p = ini(f)
+        if p is None:
+            found.append({"file": rel, "section": "?", "key": "?", "value": "unreadable", "ours": ""})
+            continue
+        for sec in cand_ini.sections():
+            if not p.has_section(sec):
+                continue
+            for k in cand_ini.options(sec):
+                if p.has_option(sec, k) and norm_value(k, p.get(sec, k)) != norm_value(k, cand_ini.get(sec, k)):
+                    found.append({"file": rel, "section": sec, "key": k,
+                                  "value": p.get(sec, k), "ours": cand_ini.get(sec, k)})
+    return found, True
+
+
+def set_in(tree, read_order, jail, keys):
+    """Best effort, for display: the file and section whose value wins, per key."""
+    found = {}
+    for f in read_order:
+        p = ini(f)
+        if p is None:
+            continue
+        rel = os.path.relpath(f, tree)
+        for sec in ("DEFAULT", jail):
+            if not p.has_section(sec):
+                continue
+            for k in p.options(sec):
+                if k not in keys:
+                    continue
+                prev = found.get(k)
+                # a jail-section value beats every [DEFAULT] one, whatever the file order
+                if prev is None or sec == jail or prev[1] == "DEFAULT":
+                    found[k] = (rel, sec, " ".join(p.get(sec, k).split()))
+    return {k: "%s [%s] %s" % v for k, v in sorted(found.items())}
+
+
+def diff(a, b):
+    out = []
+    for j in sorted(set(a) | set(b)):
+        ja, jb = a.get(j), b.get(j)
+        if ja is None or jb is None:
+            out.append({"jail": j, "key": "(jail)", "before": "present" if ja else "absent",
+                        "after": "present" if jb else "absent"})
+            continue
+        for k in sorted(set(ja) | set(jb)):
+            if ja.get(k) != jb.get(k):
+                out.append({"jail": j, "key": k, "before": ja.get(k), "after": jb.get(k)})
+    return out
+
+
+def lines(entries):
+    return ["%s.%s: %s -> %s" % (e["jail"], e["key"], "(unset)" if e["before"] is None else e["before"],
+                                  "(unset)" if e["after"] is None else e["after"]) for e in entries]
+
+
+def action_sig(params):
+    rest = sorted((k, v) for k, v in params.items()
+                  if k not in ("port", "protocol") and not k.startswith("action"))
+    return (",".join(norm_ports(params.get("port"))), params.get("protocol", ""), short_hash(rest))
+
+
+def restart_needed(live_actions, new_actions):
+    """The sshd jail must be restarted when its actions change: nftables and
+    iptables define no actionreload, so a plain reload keeps the old port."""
+    if live_actions is None or new_actions is None:
+        return False
+    a = {n: action_sig(p) for n, p in live_actions.items()}
+    b = {n: action_sig(p) for n, p in new_actions.items()}
+    return a != b
+
+
+class Str2Sec:
+    def __init__(self, client):
+        self.client, self.cache = client, {}
+
+    def __call__(self, value):
+        v = str(value).strip()
+        if re.match(r"^-?[0-9]+$", v):
+            return str(int(v))
+        if v not in self.cache:
+            rc, out, err = run(self.client + ["--str2sec", v], timeout=30)
+            out = out.strip()
+            self.cache[v] = str(int(float(out))) if rc == 0 and re.match(r"^-?[0-9]+(\.[0-9]+)?$", out) else v
+        return self.cache[v]
+
+
+def runtime_ignores(path):
+    try:
+        with open(path, encoding="ascii") as f:
+            ip = f.readline().strip()
+    except (OSError, UnicodeDecodeError):
+        return set()
+    return {norm_net(ip)} if ip else set()
+
+
+def running_state(client, conf, files_jails, compare_all, runtime_ignore_file):
+    """Running server (its socket is set in conf/fail2ban.conf) vs the given dump."""
+    s2s = Str2Sec(client)
+    client = client + ["-c", conf]
+    rc, out, err = run(client + ["status"], timeout=60)
+    m = re.search(r"Jail list:\s*(.*)$", out, re.M)
+    if rc != 0 or not m:
+        return {"ok": False, "error": errors_of(err) or err.strip()[-300:], "jails": None,
+                "same_jails_as_disk": None, "drift": [], "db_disabled": None}
+    running = sorted(x.strip() for x in m.group(1).split(",") if x.strip())
+    res = {"ok": True, "error": "", "jails": running,
+           "same_jails_as_disk": running == sorted(files_jails), "drift": []}
+    # dbfile = None: a jail restart cannot restore its bans from the
+    # database (jail.py restoreCurrentBans runs only with a database).
+    rc, out, err = run(client + ["get", "dbfile"], timeout=60)
+    res["db_disabled"] = rc == 0 and "Database currently disabled" in out
+    if not compare_all:
+        return res
+    skip_ips = runtime_ignores(runtime_ignore_file)
+    for j in running:
+        want = files_jails.get(j)
+        if want is None:
+            continue
+        for k in DRIFT_KEYS:
+            if want.get(k) is None:
+                continue
+            rc, out, err = run(client + ["get", j, k], timeout=60)
+            got = out.strip()
+            if rc == 0 and s2s(got) != s2s(want[k]):
+                res["drift"].append({"jail": j, "key": k, "running": got, "files": want[k]})
+        rc, out, err = run(client + ["get", j, "ignoreip"], timeout=60)
+        if rc == 0:
+            got = {norm_net(ln.strip()[3:].strip()) for ln in out.splitlines()
+                   if ln.strip().startswith(("|-", "`-"))} - skip_ips
+            files = {norm_net(t) for t in (want.get("addignoreip") or "").replace("|", " ").split()}
+            if got != files:
+                res["drift"].append({"jail": j, "key": "ignoreip", "running": " ".join(sorted(got)),
+                                     "files": " ".join(sorted(files))})
+    return res
+
+
+def report_defaults():
+    return {
+        "installed": True,             # /etc/fail2ban/jail.conf exists
+        "fail2ban_version": "",
+        "candidate_name": "",
+        "legacy_jail_local": "absent",  # absent | a | b | other
+        "migrate": False,              # a/b: the trial removed jail.local in without/new
+        "live": {"ok": False, "error": "", "jails": []},
+        "without": {"ok": False, "error": "", "jails": []},
+        "new": {"ok": False, "error": "", "jails": []},
+        "live_test": {"ok": False, "error": ""},
+        "new_test": {"ok": False, "error": ""},
+        "changes": [],                 # live -> new: what this run changes
+        "change_lines": [],            # the same as "jail.key: before -> after"
+        "autosec_effect": [],          # without -> new: what auto_sec's file does
+        "leaks": [],                   # effect on jails that are not auto_sec's
+        "leak_lines": [],
+        "ignore_missing": [],          # --autosec-ip not in sshd's effective ignore list
+        "ignore_dropped": [],          # live -> new: addresses a jail would stop ignoring
+        "sshd": {"enabled": False, "effective": {}, "action_ports": [], "port_ok": False,
+                 "from_autosec": [], "set_in": {}},
+        "read_before_overrides": [],
+        "read_order_from_trace": False,
+        "sshd_action_restart_needed": False,
+        "running": None,
+    }
+
+
+def trial(a, client):
+    conf = os.path.realpath(a.conf)
+    res = report_defaults()
+    res["candidate_name"] = a.candidate_name
+    if not os.path.isfile(os.path.join(conf, "jail.conf")):
+        res["installed"] = False
+        return res
+    a.work = os.path.abspath(a.work)
+    if os.path.lexists(a.work):
+        raise Fail("--work %s already exists; the caller removes it first" % a.work)
+    os.makedirs(a.work, mode=0o700)
+    trees = {n: os.path.join(a.work, n) for n in ("live", "without", "new")}
+    for t in trees.values():
+        shutil.copytree(conf, t, symlinks=True)
+    legacy = legacy_kind(os.path.join(conf, "jail.local"))
+    res["legacy_jail_local"] = legacy
+    res["migrate"] = legacy in ("a", "b") and a.candidate_name == OWN_FILES[0]
+    for n in ("without", "new"):
+        p = os.path.join(trees[n], "jail.d", a.candidate_name)
+        if os.path.lexists(p):
+            os.unlink(p)
+        if res["migrate"]:
+            os.unlink(os.path.join(trees[n], "jail.local"))
+    os.makedirs(os.path.join(trees["new"], "jail.d"), exist_ok=True)
+    shutil.copyfile(a.candidate, os.path.join(trees["new"], "jail.d", a.candidate_name))
+
+    rc, out, err = run(client + ["--version"])
+    res["fail2ban_version"] = ((out or err).strip().splitlines() or [""])[0][:80]
+    d = {n: dump(client, t) for n, t in trees.items()}
+    for n in d:
+        res[n] = {"ok": d[n]["ok"] and not d[n].get("unparsed"), "error": d[n]["error"] or
+                  ("fail2ban-client -d printed nothing readable" if d[n].get("unparsed") else ""),
+                  "jails": d[n]["order"]}
+    res["live_test"] = config_test(client, trees["live"])
+    res["new_test"] = config_test(client, trees["new"])
+    if not (res["live"]["ok"] and res["without"]["ok"] and res["new"]["ok"]):
+        return res
+
+    L, W, N = d["live"]["jails"], d["without"]["jails"], d["new"]["jails"]
+    allowed = set(a.allowed_jail)
+    res["changes"] = diff(L, N)
+    effect = diff(W, N)
+    res["autosec_effect"] = effect
+    res["leaks"] = [e for e in effect if e["jail"] not in allowed and e["key"] != "addignoreip"]
+    res["change_lines"], res["leak_lines"] = lines(res["changes"]), lines(res["leaks"])
+
+    order = read_trace(client, trees["new"])
+    res["read_order_from_trace"] = bool(order)
+    order = order or fallback_order(trees["new"])
+    cand = ini(a.candidate)
+    if cand is None:
+        raise Fail("cannot parse the candidate file %s" % a.candidate)
+    res["read_before_overrides"], seen = read_before_overrides(
+        trees["new"], order, a.candidate_name, cand, conffile_md5s(a.conffiles))
+    if not seen:
+        res["read_before_overrides"] = [{"file": "jail.d/" + a.candidate_name, "section": "?", "key": "?",
+                                         "value": "fail2ban did not read this file", "ours": ""}]
+
+    # An address a jail ignores now and would no longer ignore. auto_sec's
+    # file is read first, so only the migration of a 0.1-0.4 jail.local can
+    # drop one (that file may hold an ignoreip line you added). Loopback
+    # addresses do not count: no attacker connects from them.
+    for j in sorted(set(L) & set(N)):
+        before = (L[j].get("addignoreip") or "").replace("|", " ").split()
+        after = (N[j].get("addignoreip") or "").replace("|", " ").split()
+        gone = [ip for ip in before if ip not in after and not covered(ip, after)
+                and not covered(ip, LOOPBACK)]
+        if gone:
+            res["ignore_dropped"].append({"jail": j, "addresses": gone})
+
+    sshd = N.get("sshd", {})
+    ign = (sshd.get("addignoreip") or "").replace("|", " ").split()
+    res["ignore_missing"] = [ip for ip in a.autosec_ip if not covered(ip, ign)]
+    ports = [p.get("port", "") for p in d["new"]["actions"].get("sshd", {}).values()]
+    show = {k: sshd.get(k) for k in SSHD_SHOW}
+    show["ignoreip"] = show.pop("addignoreip")
+    res["sshd"] = {
+        "enabled": "sshd" in N,
+        "effective": show,
+        "action_ports": ports,
+        "port_ok": bool(ports) and all(port_covers(p, a.ssh_port) for p in ports),
+        "from_autosec": sorted({e["key"] for e in effect if e["jail"] == "sshd"}),
+        "set_in": set_in(trees["new"], order, "sshd",
+                         set(a.autosec_key) | {"port", "enabled", "ignoreip", "backend", "maxretry",
+                                               "findtime", "bantime"}),
+    }
+    res["sshd_action_restart_needed"] = restart_needed(d["live"]["actions"].get("sshd"),
+                                                       d["new"]["actions"].get("sshd"))
+    if a.running:
+        res["running"] = running_state(client, conf, L, bool(res["changes"]), a.runtime_ignore_file)
+    return res
+
+
+def verify(a, client):
+    """After a reload: the running server must match the files on disk."""
+    conf = os.path.realpath(a.conf)
+    d = dump(client, conf)
+    res = {"files": {"ok": d["ok"], "error": d["error"], "jails": d["order"]}}
+    res["running"] = running_state(client, conf, d["jails"], True, a.runtime_ignore_file) if d["ok"] else None
+    return res
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--conf", default="/etc/fail2ban")
+    ap.add_argument("--work", help="scratch directory for the three copies; must not exist")
+    ap.add_argument("--candidate", help="rendered candidate file")
+    ap.add_argument("--candidate-name", default=OWN_FILES[0], choices=OWN_FILES)
+    ap.add_argument("--allowed-jail", action="append", default=[],
+                    help="jail auto_sec's file may change (repeat)")
+    ap.add_argument("--autosec-ip", action="append", default=[],
+                    help="address auto_sec puts in ignoreip (repeat)")
+    ap.add_argument("--autosec-key", action="append", default=[],
+                    help="[DEFAULT] key auto_sec sets (repeat; display only)")
+    ap.add_argument("--ssh-port", type=int, default=22)
+    ap.add_argument("--running", action="store_true", help="also read the running server")
+    ap.add_argument("--verify", action="store_true", help="compare the running server with --conf")
+    ap.add_argument("--runtime-ignore-file", default=RUNTIME_IGNORE)
+    # For tests only: the unpacked client of another fail2ban build, and a
+    # conffile list in `dpkg-query -f '${Conffiles}'` format.
+    ap.add_argument("--client", default="fail2ban-client")
+    ap.add_argument("--conffiles", default="")
+    a = ap.parse_args()
+    client = a.client.split()
+    try:
+        if a.verify:
+            res = verify(a, client)
+        else:
+            if not (a.work and a.candidate):
+                raise Fail("--work and --candidate are required")
+            res = trial(a, client)
+    except Fail as e:
+        print("auto-sec-f2b-check: %s" % e, file=sys.stderr)
+        return 2
+    print(json.dumps(clean(res), indent=1, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

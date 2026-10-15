@@ -1,0 +1,52 @@
+---
+# roles/01-base/tasks/decide.yml - preflight B4: finish the plan from what
+# preflight B2 read. No host access (the tests run it with lab values).
+#
+# Inputs (facts): _base_uu_installed, _base_uu_removed, _base_uu_dist_sha256,
+# _base_uu_pristine_md5, _base_uu_dpkg_md5, _base_hostname_static,
+# _base_hostname_transient, _base_tz_now, plus the plan from plan.yml.
+#
+# _base_uu_legacy          50unattended-upgrades is byte for byte the file
+#                          auto_sec 0.1-0.4 wrote
+# _base_uu_pristine_ok     the distro's copy in /usr/share is the one dpkg
+#                          installed (its md5 matches dpkg's record)
+# _base_uu_trial_pristine  the trial run puts that copy in (to show what the
+#                          migration changes, also when the switch is not
+#                          given: the trial then refuses with that list)
+# _base_uu_restore         role 01 puts the distro's copy back: legacy file,
+#                          verified copy, and -e apt_migrate_unattended_upgrades=true
+# _base_uu_install         role 01 installs unattended-upgrades if it is
+#                          missing: true, or auto unless it was removed on
+#                          purpose (dpkg state "rc": removed, config kept)
+# _base_uu_write_periodic  auto_sec writes the two "1" switches. Only for
+#                          unattended_upgrades_enabled: true. In auto mode the
+#                          package's own 20auto-upgrades holds them, so the
+#                          distro's off switch (dpkg-reconfigure) keeps working
+#                          and an interval like "7" stays.
+# _base_uu_off_on_purpose  auto mode leaves the updates off. Start value here
+#                          (package removed on purpose); the trial run (B6)
+#                          finishes it from apt's configuration after the change.
+# _base_uu_plan_empty      auto_sec has nothing to write (its file is
+#                          removed if it exists)
+
+- name: "Base B4: finish the plan"
+  ansible.builtin.set_fact:
+    _base_uu_legacy: "{{ _base_legacy }}"
+    _base_uu_pristine_ok: "{{ _base_pristine_ok }}"
+    _base_uu_trial_pristine: "{{ (_base_legacy | bool) and (_base_pristine_ok | bool) }}"
+    _base_uu_restore: "{{ (_base_legacy | bool) and (_base_pristine_ok | bool) and (_base_migrate | bool) }}"
+    _base_uu_install: >-
+      {{ _base_uu_enabled_mode == 'on'
+         or (_base_uu_enabled_mode == 'auto' and not (_base_uu_removed | default(false) | bool)) }}
+    _base_uu_off_on_purpose: "{{ _base_uu_enabled_mode == 'auto' and (_base_uu_removed | default(false) | bool) }}"
+    _base_uu_write_periodic: "{{ _base_uu_enabled_mode == 'on' }}"
+    _base_uu_plan_empty: >-
+      {{ _base_uu_enabled_mode != 'on' and _base_uu_reboot == 'keep'
+         and _base_uu_blacklist | length == 0 and _base_uu_origins == 'keep' }}
+    _base_hostname_change: >-
+      {{ _base_hostname_want != 'keep'
+         and (_base_hostname_static != _base_hostname_want or _base_hostname_transient != _base_hostname_want) }}
+    _base_tz_change: "{{ _base_tz_want != 'keep' and _base_tz_now != _base_tz_want }}"
+  vars:
+    _base_legacy: "{{ _base_uu_dist_sha256 == _base_uu_legacy_sha256 }}"
+    _base_pristine_ok: "{{ (_base_uu_pristine_md5 | length == 32) and _base_uu_pristine_md5 == _base_uu_dpkg_md5 }}"

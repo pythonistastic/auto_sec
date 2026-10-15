@@ -1,0 +1,173 @@
+---
+# Role 01 (base) defaults.
+#
+# The first block holds the user-facing settings. They are documented in
+# group_vars/all.yml, which site.yml reads and which beats these defaults.
+# The same values stay here so that the role behaves the same in a
+# playbook without group_vars (the tests in tests/base). CI checks that
+# both files hold the same values.
+
+# Hostname. keep = leave it as the server has it (default). Any other value
+# must be a lowercase hostname or FQDN, at most 64 characters. Nothing in
+# auto_sec uses the system hostname; inventory_hostname names the host in
+# reports, alerts and backups.
+server_hostname: keep
+
+# Timezone. keep = leave it as the server has it (default). Otherwise an
+# IANA name the server knows (timedatectl list-timezones), e.g. "UTC" or
+# "Europe/Berlin". Changing it moves every cron job and timer that runs at
+# a wall-clock time; the preflight lists them first.
+timezone: keep
+
+# Automatic security updates (unattended-upgrades).
+#   auto: install unattended-upgrades if it is missing; its own setup turns
+#         the updates on (the distro default). auto_sec writes no update
+#         switch of its own, so the distro's switch keeps working
+#         (20auto-upgrades, dpkg-reconfigure unattended-upgrades). If the
+#         server has them off, or unattended-upgrades was removed, they stay
+#         off and the run prints a WARNING.
+#   true: turn them on and keep them on: auto_sec's own file sets both
+#         switches to "1" (daily), whatever 20auto-upgrades says
+#   keep: leave them as they are; unattended-upgrades is not installed
+# auto_sec never turns automatic updates off ("false" is refused).
+unattended_upgrades_enabled: auto
+
+# Automatic reboot after an update that needs one.
+#   keep:  leave the server's setting alone (default; off unless you or the
+#          distro turned it on)
+#   true:  reboot at unattended_reboot_time (required, QUOTED: "03:30")
+#   false: never reboot automatically
+unattended_automatic_reboot: keep
+# unattended_reboot_time: "03:30"
+
+# Which archives unattended-upgrades installs from.
+#   keep:     leave the distro's (or your) origin list alone (default)
+#   security: Ubuntu release pocket (new dependencies of security fixes),
+#             security and ESM pockets; Debian security archive only.
+unattended_origins: keep
+
+# true: never update the Docker packages automatically (docker-ce,
+# docker-ce-cli, docker-ce-rootless-extras, docker-buildx-plugin,
+# docker-compose-plugin, containerd.io, docker.io, containerd). An update
+# restarts the Docker daemon and every container.
+unattended_exclude_docker: false
+
+# More packages unattended-upgrades must never update: exact Debian package
+# names (no patterns), e.g. ["nginx", "postgresql-16"]. Added to the list
+# of the other files; nothing is removed from it.
+unattended_upgrade_blacklist: []
+
+# One-off switch: pass with -e on one run, never in host_vars. true runs a
+# full `apt-get dist-upgrade` (it can restart services and needs a reboot
+# for a new kernel). Without it, role 01 only installs missing packages
+# (without their recommendations), stops if that would upgrade or remove
+# an installed package, and the nightly unattended-upgrades applies
+# security updates.
+apt_full_upgrade: false
+
+# One-off switch: pass with -e on one run, never in host_vars. On a server
+# set up by auto_sec 0.1-0.4, whose 50unattended-upgrades is still exactly
+# the file 0.1-0.4 wrote, the run stops and shows what putting the
+# distro's file back changes. true keeps a copy in
+# /var/lib/auto-sec/backup/ and puts the distro's file back.
+apt_migrate_unattended_upgrades: false
+
+# --- Role-internal constants. These are not settings: do not override. ---
+
+# The one apt file role 01 owns. It sorts after the distro's 20auto-upgrades
+# and 50unattended-upgrades (so its values win over theirs) and before
+# 52unattended-upgrades-local, the name unattended-upgrades' README gives
+# for your own overrides (so yours win over auto_sec's).
+_base_apt_parts: /etc/apt/apt.conf.d
+_base_uu_file: /etc/apt/apt.conf.d/51autosec-unattended-upgrades
+_base_uu_header: "// Written by auto_sec (role 01)"
+
+# 50unattended-upgrades exactly as auto_sec 0.1-0.4 wrote it (300 bytes,
+# the same in every release). Only this exact file is put back to the
+# distro's copy; an edited one is yours and is left alone.
+_base_uu_legacy_sha256: 96a5c57fc765cd6274f5b40829485f6dbbf8afe36c68de612a8b4cd591fc3a9d
+_base_uu_dist_file: /etc/apt/apt.conf.d/50unattended-upgrades
+_base_uu_pristine: /usr/share/unattended-upgrades/50unattended-upgrades
+_base_dpkg_md5sums: /var/lib/dpkg/info/unattended-upgrades.md5sums
+_base_ucf_hashfile: /var/lib/ucf/hashfile
+_base_backup_dir: /var/lib/auto-sec/backup
+_base_backup_file: /var/lib/auto-sec/backup/50unattended-upgrades.auto_sec-0.4
+
+# Scratch space for the trial run (tmpfs, root only), also used in --check.
+_base_run_dir: /run/auto-sec
+_base_sim_dir: /run/auto-sec/apt-sim
+_base_candidate: /run/auto-sec/apt-candidate
+
+_base_reboot_required: /var/run/reboot-required
+
+# Your hostname and timezone choice. Not set_fact facts: set_fact in
+# ansible-core < 2.19 would turn a name like "yes" into a boolean.
+_base_hostname_want: "{{ server_hostname | default('keep') }}"
+_base_tz_want: "{{ timezone | default('keep') }}"
+
+# Packages role 01 installs when they are missing, without their
+# recommendations. unattended-upgrades is added unless
+# unattended_upgrades_enabled is keep (or auto, and it was removed on
+# purpose). Only what auto_sec itself needs: curl sends the alerts of
+# roles 07 and 08. 0.1-0.4 also installed git, htop, ncdu, age,
+# apt-listchanges, python3-pip and jq; no role uses them (role 07 installs
+# age itself).
+_base_packages: [curl]
+
+_base_docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - docker-ce-rootless-extras
+  - docker-buildx-plugin
+  - docker-compose-plugin
+  - containerd.io
+  - docker.io
+  - containerd
+
+# unattended_origins: security. Fixed text for both distros, so no host
+# value ever reaches the file. unattended-upgrades fills in the macro.
+_base_uu_security_patterns:
+  - "origin=Ubuntu,archive=${distro_codename}"
+  - "origin=Ubuntu,archive=${distro_codename}-security"
+  - "origin=UbuntuESMApps,archive=${distro_codename}-apps-security"
+  - "origin=UbuntuESM,archive=${distro_codename}-infra-security"
+  - "origin=Debian,codename=${distro_codename}-security,label=Debian-Security"
+  - "origin=Debian,codename=${distro_codename},label=Debian-Security"
+# Allowed-Origins entries ("origin:archive") that name only archives the
+# patterns above already allow. A file read after auto_sec's may add them
+# without breaking "security only" (for example Ubuntu Pro's ESM origins);
+# any other entry there makes the preflight refuse.
+_base_uu_security_legacy_origins:
+  - "${distro_id}:${distro_codename}"
+  - "${distro_id}:${distro_codename}-security"
+  - "${distro_id}ESMApps:${distro_codename}-apps-security"
+  - "${distro_id}ESM:${distro_codename}-infra-security"
+
+# Values apt's FindB() reads as true (apt-pkg/contrib/strutl.cc StringToBool).
+_base_true_words: ["1", "yes", "true", "with", "on", "enable"]
+# Words accepted for an on/off variable (YAML booleans arrive as True/False).
+_base_bool_words: ["true", "false", "yes", "no", "1", "0", "on", "off"]
+_base_yes_words: ["true", "yes", "1", "on"]
+
+_base_hostname_re: '^(?=.{1,64}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$'
+_base_tz_re: '^[A-Za-z][A-Za-z0-9_+-]{0,30}(/[A-Za-z0-9_+-]{1,30}){0,2}$'
+_base_time_re: '^([01][0-9]|2[0-3]):[0-5][0-9]$'
+_base_pkg_re: '^[a-z0-9][a-z0-9+.-]{1,99}$'
+# A host value (name of a cron file, timer, user) is shown only if it has
+# this shape.
+_base_show_re: '^[A-Za-z0-9._@:-]{1,64}$'
+
+# apt keys role 01 reads and compares: the periodic switches and everything
+# under Unattended-Upgrade::.
+_base_keys_re: '^(APT::Periodic::(Enable|Unattended-Upgrade|Update-Package-Lists)|Unattended-Upgrade::\S+)$'
+
+# Parse `apt-config dump` lines (`Key "value";`) into {key: [values]}. List
+# entries are under "<List>::". Callers set _base_kv_lines as a task var.
+# Host output is untrusted: ${macro} becomes <macro> and any other "{" or
+# "}" becomes "?", so a value can never be read as a Jinja template by
+# older ansible-core (2.16 re-templates strings that a filter made "safe").
+_base_kv_g: >-
+  {{ _base_kv_lines | map('regex_replace', '\$\{([a-z_]+)\}', '<\1>') | map('regex_replace', '[{}]', '?')
+     | select('match', '^\S+ ".*";$') | map('regex_replace', '^(\S+) "(.*)";$', '\1 \2')
+     | map('split', ' ', 1) | selectattr(0, 'match', _base_keys_re) | groupby(0) }}
+_base_kv: "{{ dict(_base_kv_g | map('first') | zip(_base_kv_g | map('last') | map('map', attribute=1) | map('list'))) }}"

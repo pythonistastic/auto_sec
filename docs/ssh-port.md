@@ -143,9 +143,12 @@ ufw `limit` rule for it. Until this run, fail2ban still blocks only the
 old port. In high mode, run with `--tags ssh,firewall,fwknop` instead,
 so fwknop's `access.conf` uses the new port too.
 
-Careful: the firewall part still rewrites `/etc/fail2ban/jail.local`
-(issue #2). If you tuned that file by hand, run only `--tags ssh`, and
-change `port =` in the `[sshd]` section of `jail.local` yourself.
+fail2ban: the firewall part changes `port =` in the `[sshd]` section of
+auto_sec's own `/etc/fail2ban/jail.d/00-autosec.conf`, and restarts only
+the `sshd` jail (its bans come back from fail2ban's database). It never
+writes `jail.local`. If your own `jail.local` (or another file of
+yours) sets `port =` for `[sshd]`, that value wins: change it there
+yourself. The run warns when the jail's port is not `ssh_port`.
 
 ## Step 6: later, close the old port
 

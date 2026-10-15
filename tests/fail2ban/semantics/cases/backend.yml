@@ -1,0 +1,10 @@
+---
+# 0.1-0.4's journal reading, kept on purpose (Ubuntu 22.04, Debian 12).
+ssh_port: 2222
+fail2ban_defaults:
+  bantime: "1h"
+  bantime.increment: true
+  bantime.factor: 2
+  findtime: "10m"
+  maxretry: 4
+  backend: systemd
