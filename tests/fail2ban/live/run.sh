@@ -155,6 +155,13 @@ all:
 EOF
   # The canary's jail.local with the runner's log paths (they are the same).
   cp "$FIX/canary.jail.local" "$WORK/canary.jail.local"
+  # fail2ban 0.11 (Ubuntu 22.04) has no nginx-bad-request filter (it came
+  # with 1.0), so there the canary's file is broken and auto_sec rightly
+  # refuses. Drop that one jail on such runners; the canary runs 1.0.2.
+  if [ ! -e "$F2B/filter.d/nginx-bad-request.conf" ]; then
+    echo "      note: no filter.d/nginx-bad-request.conf on this fail2ban; testing the canary layout without that jail"
+    awk '/^\[/ { skip = ($0 == "[nginx-bad-request]") } !skip' "$FIX/canary.jail.local" >"$WORK/canary.jail.local"
+  fi
   printf '[recidive]\nenabled = true\nlogpath = /var/log/fail2ban.log\n' >"$WORK/leak.jail.local"
 }
 

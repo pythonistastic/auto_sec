@@ -156,7 +156,9 @@ baseline() { # the canary's state: stock files, 10periodic, a pending reboot, lo
   BASE_HOST=$(host_state)
 }
 case_vars() { # name yaml-lines: write an -e file
-  printf '%s\n' '---' "$@" >"$WORK/$1.yml"
+  local name=$1
+  shift
+  printf '%s\n' '---' "$@" >"$WORK/$name.yml"
 }
 unchanged() { # case
   expect "$1" "apt.conf.d unchanged" "$(parts_state | sha256sum | cut -c1-16)" "$(printf '%s\n' "$BASE_PARTS" | sha256sum | cut -c1-16)"
