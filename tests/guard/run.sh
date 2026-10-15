@@ -117,8 +117,12 @@ if command -v systemd-analyze >/dev/null; then
   sed "s#^ExecStart=/usr/local/sbin/auto-sec-ssh-guard #ExecStart=$W/probe/guard #" \
     "$UNIT_SRC" > "$W/auto-sec-ssh-guard-boot.service"
   chmod 0644 "$W/auto-sec-ssh-guard-boot.service"
+  # Only lines about our unit count: verify also loads the runner's other
+  # units, and e.g. snapd.service warns about RestartMode on systemd 249.
+  # Ordering cycles always count, whichever unit the line names.
   if systemd-analyze verify "$W/auto-sec-ssh-guard-boot.service" > "$W/verify.out" 2>&1 &&
-     ! grep -q -i -E 'cycle|unknown|invalid|ignoring' "$W/verify.out"; then
+     ! grep -q -i 'cycle' "$W/verify.out" &&
+     ! grep -F 'auto-sec-ssh-guard-boot.service' "$W/verify.out" | grep -q -i -E 'unknown|invalid|ignoring'; then
     ok "systemd-analyze verify passes"
   else
     bad "systemd-analyze verify: $(tr '\n' ' ' < "$W/verify.out")"

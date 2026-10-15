@@ -103,6 +103,7 @@ log_has() { # case log-name fixed-string what
 
 # --- host probes --------------------------------------------------------------
 eff() { # file: effective root view of the live config, sorted
+  sudo -n install -d -m 0755 /run/sshd
   sudo -n /usr/sbin/sshd -T -C user=root,host=autosec-check,addr=127.0.0.1 2>/dev/null | sort >"$1"
 }
 changed() { comm -3 "$1" "$2" | awk '{print $1}' | sort -u | paste -sd' ' -; }
@@ -133,6 +134,8 @@ sighups_since() { # epoch: reloads ssh.service logged since then
 }
 settle() { # make sshd's last load newer than an edit under /etc/ssh (preflight P6)
   sleep 1.2
+  # Socket mode: /run/sshd only exists once ssh.service has started.
+  sudo -n install -d -m 0755 /run/sshd
   sudo -n /usr/sbin/sshd -t || die "sshd -t fails after a test edit"
   sudo -n systemctl try-reload-or-restart ssh.service
   sleep 1.2
@@ -427,19 +430,19 @@ case_p() {
   expect_refused p1 "$rc"
   log_has p1 p1-keep-after-stage2 "login settings you did not choose" "the refusal names the unrequested change"
   unchanged p1 "$B_SUM" "$B_EFF"
-  # p2. A drop-in that sorts before 00-autosec.conf wins, so the chosen value
+  # p2. A drop-in that sorts before 00-autosec.conf ("00-aa" < "00-au") wins, so the chosen value
   #     would not take effect. Trial-run check (a), naming the winning file.
   printf '%s\n' '# role02-live: sorts before 00-autosec.conf' 'PermitRootLogin yes' \
-    | sudo -n tee /etc/ssh/sshd_config.d/00-ci-early.conf >/dev/null
+    | sudo -n tee /etc/ssh/sshd_config.d/00-aa-ci-early.conf >/dev/null
   settle
   eff "$e"
   rc=0
   play p2-earlier-dropin -l live -e "@$STAGE2" || rc=$?
   expect_refused p2 "$rc"
   log_has p2 p2-earlier-dropin "would NOT use what you chose" "the refusal says the choice would not take effect"
-  log_has p2 p2-earlier-dropin "00-ci-early.conf" "the refusal names the winning file"
+  log_has p2 p2-earlier-dropin "00-aa-ci-early.conf" "the refusal names the winning file"
   unchanged p2 "$B_SUM" "$e"
-  sudo -n rm -f /etc/ssh/sshd_config.d/00-ci-early.conf
+  sudo -n rm -f /etc/ssh/sshd_config.d/00-aa-ci-early.conf
   # p3. A stray AllowUsers drop-in adds a user to the chosen list (sshd adds
   #     AllowUsers lines up). Trial-run check (a): the exact set must match.
   printf '%s\n' '# role02-live: stray AllowUsers' 'AllowUsers root alice' \
