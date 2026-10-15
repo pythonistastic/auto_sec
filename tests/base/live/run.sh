@@ -106,7 +106,9 @@ host_state() { printf '%s %s\n' "$(hostnamectl --static status)" "$(timedatectl 
 scheduled() { # "reboot <usec>" or "none"
   local s
   s=$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager ScheduledShutdown 2>/dev/null)
-  case $s in '(st) "" 0'|'') echo none ;; *) echo "$s" | awk '{ gsub(/"/, "", $2); print $2, $3 }' ;; esac
+  # Nothing scheduled: an empty type. systemd 249 reports ("", 0),
+  # systemd 255 ("", 18446744073709551615).
+  case $s in '(st) ""'*|'') echo none ;; *) echo "$s" | awk '{ gsub(/"/, "", $2); print $2, $3 }' ;; esac
 }
 play() { # log-name ansible-playbook-args...: returns its rc
   local name=$1 rc=0
@@ -114,6 +116,9 @@ play() { # log-name ansible-playbook-args...: returns its rc
   (cd "$HERE" && ANSIBLE_ROLES_PATH="$ROOT/roles" ANSIBLE_NOCOLOR=1 ANSIBLE_LOCALHOST_WARNING=False \
     ansible-playbook -i "$INV" play.yml "$@") >"$LOGS/$name.log" 2>&1 || rc=$?
   echo "      ansible-playbook rc=$rc, log $LOGS/$name.log"
+  if [ "$rc" != 0 ]; then
+    grep -E 'fatal:|FAILED!|ERROR|msg|\[WARNING\]' "$LOGS/$name.log" | tail -n 12 | cut -c1-400 | sed 's/^/      | /'
+  fi
   return "$rc"
 }
 
@@ -197,7 +202,8 @@ case_r() {
   got=$(scheduled)
   want=$(TZ=$TEST_TZ date -d "$t" +%s 2>/dev/null)
   [ "$want" -le "$(date +%s)" ] && want=$((want + 86400))
-  expect r "reboot scheduled by unattended-upgrade" "${got%% *} $(( ${got##* } / 1000000 ))" "reboot $want"
+  [ "$got" != none ] && got="${got%% *} $(( ${got##* } / 1000000 ))"
+  expect r "reboot scheduled by unattended-upgrade" "$got" "reboot $want"
   sudo -n shutdown -c >/dev/null 2>&1
   expect r "reboot cancelled again" "$(scheduled)" none
   # keep: the stock setting (off) stays, nothing is scheduled.

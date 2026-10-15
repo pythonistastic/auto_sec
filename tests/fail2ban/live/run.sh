@@ -90,6 +90,9 @@ play() { # log-name ansible-playbook-args...: site.yml --tags fail2ban; returns 
   (cd "$ROOT" && ANSIBLE_NOCOLOR=1 ansible-playbook -i "$INV" site.yml -l live --tags fail2ban "$@") \
     >"$LOGS/$name.log" 2>&1 || rc=$?
   echo "      ansible-playbook rc=$rc, log $LOGS/$name.log"
+  if [ "$rc" != 0 ]; then
+    grep -E 'fatal:|FAILED!|ERROR|msg|\[WARNING\]' "$LOGS/$name.log" | tail -n 12 | cut -c1-400 | sed 's/^/      | /'
+  fi
   return "$rc"
 }
 
