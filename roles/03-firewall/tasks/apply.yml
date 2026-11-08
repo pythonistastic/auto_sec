@@ -44,7 +44,7 @@
       changed_when: false
 
     # F5. Migration (main only, only with -e fail2ban_migrate_jail_local=true
-    # and only for the exact file auto_sec 0.1-0.4 wrote; preflight R4).
+    # and only for the exact file auto_sec 0.1-0.4 wrote; preflight R03-F4).
     - name: "fail2ban F5: backup folder for the old jail.local"
       when:
         - _f2b_will_migrate | bool

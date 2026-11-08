@@ -138,17 +138,23 @@ Then run only the SSH and firewall parts:
 ansible-playbook -i inventory site.yml -l <server> --tags ssh,firewall
 ```
 
-This makes the fail2ban `sshd` jail watch the new port, and keeps the
-ufw `limit` rule for it. Until this run, fail2ban still blocks only the
+With `fail2ban_hardening_enabled: true`, this makes the fail2ban `sshd`
+jail watch the new port. Until this run, fail2ban still blocks only the
 old port. In high mode, run with `--tags ssh,firewall,fwknop` instead,
 so fwknop's `access.conf` uses the new port too.
+
+ufw: auto_sec runs no ufw command on a ufw that is already on, so the
+`limit` rule for the new port is the one you added in step 1. The run
+notes it if no ufw rule mentions `ssh_port`.
 
 fail2ban: the firewall part changes `port =` in the `[sshd]` section of
 auto_sec's own `/etc/fail2ban/jail.d/00-autosec.conf`, and restarts only
 the `sshd` jail (its bans come back from fail2ban's database). It never
 writes `jail.local`. If your own `jail.local` (or another file of
 yours) sets `port =` for `[sshd]`, that value wins: change it there
-yourself. The run warns when the jail's port is not `ssh_port`.
+yourself. The run warns when the jail's port is not `ssh_port`. With
+`fail2ban_hardening_enabled: keep`, auto_sec leaves fail2ban alone, and
+you change the jail's port yourself.
 
 ## Step 6: later, close the old port
 

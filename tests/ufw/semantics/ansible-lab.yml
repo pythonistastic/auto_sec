@@ -1,0 +1,63 @@
+---
+# LAB ONLY (tests/ufw/semantics/lab.py, checks a1-a8). Never run this
+# against a server. It runs role 03's own task files, unchanged, as the
+# current user against a lab ufw tree: lab.py passes -e with _fw_ufw_argv
+# (a wrapper around the real ufw code with --rootdir/--datadir),
+# _fw_python and _fw_helper_lab_args (--root, --proc, --systemctl, --ss
+# fixtures), and puts a dpkg-query stub first in PATH. The steps that need
+# root are left out: the package guard, role 02's undo guard, `ufw
+# --force enable` and the login test. Everything else is what role 03 runs.
+# With lab_ufw_main (always with --check), role 03's ufw.yml itself runs up
+# to U3, the point where --check stops.
+- name: Role 03 ufw lab (unprivileged)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  pre_tasks:
+    - name: "Preflight: role 03 checks (read-only), as site.yml runs them"
+      ansible.builtin.import_role:
+        name: 03-firewall
+        tasks_from: preflight
+      tags: [always]
+
+  tasks:
+    - name: "LAB: what the preflight decided"
+      ansible.builtin.debug:
+        msg: "LAB _plan_03={{ _plan_03 }} LAB _fw_pkg_want={{ _fw_pkg_want }} LAB _fw_plan={{ _fw_plan }}"
+
+    - name: "U5-U7: add the planned rules to the lab tree, check the list"
+      when:
+        - lab_apply | default(false) | bool
+        - _fw_will_turn_on | bool
+      ansible.builtin.include_role:
+        name: 03-firewall
+        tasks_from: ufw-add
+
+    - name: "LAB: a rule appears between the preflight and role 03 main"
+      when: lab_touch_between | default(false) | bool
+      ansible.builtin.command:
+        argv: "{{ _fw_ufw_argv + ['allow', '9999/tcp'] }}"
+      changed_when: true
+      check_mode: false
+
+    # Someone runs `ufw enable` while roles 01 and 02 run: ENABLED=yes,
+    # and from now on the lab ufw reports active (UFW_LAB_ACTIVE=1).
+    - name: "LAB: ufw is turned on between the preflight and role 03 main"
+      when: lab_turn_on_between | default(false) | bool
+      ansible.builtin.replace:
+        path: "{{ lab_tree }}/etc/ufw/ufw.conf"
+        regexp: '^ENABLED=.*$'
+        replace: ENABLED=yes
+      check_mode: false
+
+    - name: "LAB: from now on the lab ufw is the active one"
+      when: lab_turn_on_between | default(false) | bool
+      ansible.builtin.set_fact:
+        _fw_ufw_argv: "{{ lab_active_argv }}"
+        _fw_helper_lab_args: "{{ lab_active_helper_args }}"
+
+    - name: "U0-U3: role 03's ufw.yml in --check"
+      when: lab_ufw_main | default(false) | bool
+      ansible.builtin.include_role:
+        name: 03-firewall
+        tasks_from: ufw

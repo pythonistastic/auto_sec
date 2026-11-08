@@ -2,16 +2,18 @@
 # roles/03-firewall/tasks/fail2ban.yml - role 03's fail2ban part (issue #2).
 #
 # Included by main.yml (tags: fail2ban) when fail2ban_hardening_enabled is
-# true. auto_sec writes one file of its own, /etc/fail2ban/jail.d/
-# 00-autosec.conf, and never writes jail.local. fail2ban reads that file
-# right after jail.conf, so every value your own files set wins.
+# true (with keep, role 03 leaves fail2ban alone). auto_sec writes one file
+# of its own, /etc/fail2ban/jail.d/00-autosec.conf, and never writes
+# jail.local. fail2ban reads that file right after jail.conf, so every value
+# your own files set wins.
 #
-#   F1  install fail2ban (state present: an installed one is never upgraded)
+#   F1  install fail2ban through the package guard (autosec-apt: a dry run
+#       first, nothing upgraded or removed, needrestart held back)
 #   F2  --check on a host without fail2ban: say so and stop here
 #   F3  trial run and decision again, after roles 01 and 02 (preflight P3
 #       did the same before anything changed)
 #   F4-F10 apply.yml: write, check, reload only on an effective change, verify
-#   F11 start and enable fail2ban only if this run installed it
+#   F11 start fail2ban only if this run installed it (its package enables it)
 #   F12 one line for the report (_f2b_report)
 
 - name: "fail2ban: the preflight must have run in this play"
@@ -27,10 +29,14 @@
       name=03-firewall tasks_from=preflight, tags always). Do the same in any other
       playbook that uses role 03. Nothing has been changed in fail2ban.
 
-- name: "fail2ban F1: install fail2ban"
-  ansible.builtin.apt:
-    name: "{{ ['fail2ban'] + (['python3-systemd'] if (_f2b_defaults.backend | default('')) == 'systemd' else []) }}"
-    state: present
+- name: "fail2ban F1: install fail2ban (package guard)"
+  when: not ansible_check_mode
+  ansible.builtin.include_role:
+    name: autosec-apt
+    tasks_from: install
+  vars:
+    _aptg_want: "{{ _f2b_pkg_want }}"
+    _aptg_who: role 03 (fail2ban)
 
 - name: "fail2ban F1: is fail2ban installed now?"
   ansible.builtin.command:
@@ -79,13 +85,33 @@
         _f2b_kind: main
 
     # F11. A fail2ban that was installed before this run keeps its state:
-    # auto_sec never starts, stops or enables it (W4 said so).
-    - name: "fail2ban F11: start and enable the fail2ban this run installed"
+    # auto_sec never starts, stops or enables it (N03-F6 said so). The
+    # package enables and starts the one this run installed; start it if
+    # it is not running yet. No `systemctl enable`: that reloads systemd
+    # like a daemon-reload.
+    - name: "fail2ban F11: start the fail2ban this run installed"
       when: not (_f2b_installed_before | bool)
       ansible.builtin.systemd:
         name: fail2ban
         state: started
-        enabled: true
+
+    - name: "fail2ban F11: is it enabled at boot?"
+      when: not (_f2b_installed_before | bool)
+      ansible.builtin.command:
+        argv: [systemctl, is-enabled, fail2ban.service]
+      register: _f2b_f11_enabled
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "fail2ban F11: not enabled at boot"
+      when:
+        - _f2b_f11_enabled is not skipped
+        - (_f2b_f11_enabled.stdout | default('') | trim) != 'enabled'
+      ansible.builtin.debug:
+        msg: >-
+          NOTE: fail2ban runs on {{ inventory_hostname }}, but its package did not enable it at
+          boot. Enable it with: sudo systemctl enable fail2ban
 
     - name: "fail2ban F12: one line for the report"
       ansible.builtin.include_tasks:

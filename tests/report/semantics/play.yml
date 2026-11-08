@@ -1,0 +1,14 @@
+---
+# LAB ONLY (tests/report/semantics/run.sh). Runs role 10's own main.yml,
+# unchanged, on this computer as the current user: `ufw` and
+# `fail2ban-client` are stubs first in PATH (or missing), the role 01/02/03
+# facts come from -e. run.sh copies this file into its work directory, so
+# the report lands in <work>/reports/, never in the repo.
+- name: Role 10 report lab
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Role 10, as site.yml runs it
+      ansible.builtin.include_role:
+        name: 10-report

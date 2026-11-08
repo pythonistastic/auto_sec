@@ -15,7 +15,35 @@
 #                          with "." and "+" escaped
 #   _base_full_upgrade     bool
 #   _base_migrate          bool  apt_migrate_unattended_upgrades
+#   _base_account_mode     keep | create  (deploy_user_account)
 # (_base_hostname_want and _base_tz_want are in defaults/main.yml.)
+
+- name: "Base B1: deploy_user_account is keep or create (R01-A0)"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _base_acc in ['keep', 'create']
+      - _base_acc == 'keep' or (deploy_user is string and deploy_user is match(_base_user_re))
+    fail_msg: >-
+      {% if _base_acc not in ['keep', 'create'] %}[R01-A0] deploy_user_account is
+      "{{ deploy_user_account }}". Allowed: keep (auto_sec creates no account and writes no sudo
+      rule) or create (create {{ deploy_user | default('deploy_user') }} if it does not exist and give it
+      passwordless sudo; an existing account is never changed).
+      {% else %}[R01-A0] deploy_user is "{{ deploy_user | default('') }}". With deploy_user_account: create
+      it must be a plain account name (lowercase letters, digits, _ and -, at most 32
+      characters).
+      {% endif %}Nothing has been changed.
+  vars:
+    _base_acc: "{{ deploy_user_account | default('keep') | string }}"
+
+- name: "Base B1: deploy_user_account: create needs a non-root deploy_user (R01-A1)"
+  when: (deploy_user_account | default('keep') | string) == 'create'
+  ansible.builtin.assert:
+    quiet: true
+    that: deploy_user != 'root'
+    fail_msg: >-
+      [R01-A1] deploy_user is root. deploy_user_account: create is for a non-root account. Set it to
+      keep, or choose another deploy_user. Nothing has been changed.
 
 - name: "Base B1: on/off switches are true or false"
   ansible.builtin.assert:
@@ -43,7 +71,7 @@
       on) or keep (leave them as they are).
       {% endif %}Nothing has been changed.
   vars:
-    _base_en: "{{ unattended_upgrades_enabled | default('auto') | string | lower }}"
+    _base_en: "{{ unattended_upgrades_enabled | default('keep') | string | lower }}"
 
 - name: "Base B1: unattended_automatic_reboot is keep, true or false"
   ansible.builtin.assert:
@@ -135,8 +163,9 @@
     _base_uu_reboot_time: "{{ unattended_reboot_time | default('') | string }}"
     _base_full_upgrade: "{{ (apt_full_upgrade | default(false) | string | lower) in _base_yes_words }}"
     _base_migrate: "{{ (apt_migrate_unattended_upgrades | default(false) | string | lower) in _base_yes_words }}"
+    _base_account_mode: "{{ deploy_user_account | default('keep') | string }}"
   vars:
-    _base_en: "{{ unattended_upgrades_enabled | default('auto') | string | lower }}"
+    _base_en: "{{ unattended_upgrades_enabled | default('keep') | string | lower }}"
     _base_rb: "{{ unattended_automatic_reboot | default('keep') | string | lower }}"
     _base_bl_all: >-
       {{ ((_base_docker_packages if ((unattended_exclude_docker | default(false) | string | lower) in _base_yes_words) else [])

@@ -1,0 +1,45 @@
+---
+# The run plan (roles/00-plan) without a server. The roles' plan facts come
+# from a fixture (-e @cases/<case>.json), as the role preflights would set
+# them; the layer and tag flags (_layer_NN, _sel_NN) too. run.sh points
+# ANSIBLE_ROLES_PATH at the repository's roles/.
+#   ansible-playbook -i <host>, -c local plan.yml -e @cases/<case>.json
+#     -e lab_out=<file> [-e autosec_approve=<id>] [--check]
+# The second play writes what the plan computed to <lab_out> as JSON. It is
+# not reached when the plan refuses (R00-4, R00-5); after
+# autosec_plan_only it still runs (meta: end_host ends one play only).
+- name: Run plan lab
+  hosts: all
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  pre_tasks:
+    - name: "Lab: the plan switches"
+      ansible.builtin.import_role:
+        name: 00-plan
+        tasks_from: vars
+      tags: [always]
+
+    - name: "Lab: the plan"
+      ansible.builtin.import_role:
+        name: 00-plan
+        tasks_from: summary
+      tags: [always]
+
+- name: Run plan lab output
+  hosts: all
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  tasks:
+    - name: "Lab: write what the plan computed"
+      tags: [always]
+      check_mode: false
+      delegate_to: localhost
+      ansible.builtin.copy:
+        dest: "{{ lab_out }}"
+        mode: "0600"
+        content: >-
+          {{ {'id': _plan_id, 'lines': _plan_lines, 'notes': _plan_notes, 'status': _plan_status,
+              'need_approval': _plan_need_approval | bool, 'server_changes': _plan_server_changes | int,
+              'canon': _plan_canon} | to_nice_json }}

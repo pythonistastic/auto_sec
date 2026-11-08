@@ -1,0 +1,118 @@
+#!/bin/sh
+# autosec-sudo-scan - role 01's read-only look at sudo's own files, before
+# it adds its sudo rule (preflight B3 and main step 6b). It changes nothing.
+# Role 01 runs it as `sh -c "<this file>" sh <args>`; the tests run it the
+# same way, on lab trees.
+#
+# Usage: autosec-sudo-scan <sudoers> <sudoers.d> <own_file> <user> [<group>...]
+#                          [-- <uid> [<gid>...]]
+#   sudoers    sudo's main file (/etc/sudoers)
+#   sudoers.d  the directory auto_sec's file goes into (/etc/sudoers.d)
+#   own_file   auto_sec's own file there: not scanned
+#   user       the account; groups: the account's groups (id -nG)
+#   uid, gid   the account's numbers (id -u, id -G), when it exists
+#
+# sudo uses the LAST rule that matches, so a rule of auto_sec's could
+# override one of yours (for example make a password rule passwordless).
+# The scan finds every line that names the user (or #<uid>), or one of its
+# groups as %group, %:group, %#<gid> or %:#<gid>, in <sudoers> and in every
+# file sudo reads from <sudoers.d> (@includedir: no "." in the name, no
+# trailing "~"). It is conservative: "deploy-ci" counts as naming "deploy"
+# (grep -w), and so do Defaults:deploy and User_Alias lines. Comment lines
+# do not count, except #include and #includedir, which sudo reads, and
+# "#<digits>", which sudo reads as a uid. A netgroup (+name) cannot be
+# checked here, so every line where one can name a user is reported.
+#
+# Output, one record per line:
+#   I yes|no                <sudoers> reads <sudoers.d> (@includedir or #includedir)
+#   U <line> <file>         a line that names <user> or #<uid>
+#   G <group> <line> <file> a line that names %<group> or %:<group>
+#                           (<group> is gid:<gid> for %#<gid> and %:#<gid>;
+#                           no "#" in the output, role 01 filters it out)
+#   X <line> <file>         a line with a netgroup (+name)
+#   E <text>                a file could not be read, or a bad argument
+# Exit: 0 done, 2 usage.
+set -u
+LC_ALL=C
+export LC_ALL
+if [ $# -lt 4 ]; then
+  echo "E usage: autosec-sudo-scan <sudoers> <sudoers.d> <own_file> <user> [<group>...]"
+  exit 2
+fi
+main=$1 dir=$2 own=$3 user=$4
+shift 4
+name_ok() { printf '%s\n' "$1" | grep -Eq '^[a-z_][a-z0-9_-]{0,31}$'; }
+if ! name_ok "$user"; then
+  echo "E bad user name"
+  exit 2
+fi
+groups=
+while [ $# -gt 0 ]; do
+  [ "$1" = -- ] && { shift; break; }
+  if name_ok "$1"; then groups="$groups $1"; else echo "E bad group name"; fi
+  shift
+done
+num_ok() { case $1 in ''|*[!0-9]*) return 1 ;; esac; [ ${#1} -le 10 ]; }
+uid=
+gids=
+if [ $# -gt 0 ]; then
+  if num_ok "$1"; then uid=$1; else echo "E bad uid"; exit 2; fi
+  shift
+  for g in "$@"; do
+    if num_ok "$g"; then gids="$gids $g"; else echo "E bad gid"; fi
+  done
+fi
+
+# Lines "N:text" on stdin; prints the numbers of those that are not comments.
+not_comment() {
+  awk '{ n = $0; sub(/:.*/, "", n); t = $0; sub(/^[0-9]+:/, "", t)
+         if (t ~ /^[[:space:]]*#/ && t !~ /^[[:space:]]*#include/ && t !~ /^[[:space:]]*#[0-9]/) next
+         print n }'
+}
+
+if [ ! -r "$main" ]; then
+  echo "E cannot read $main"
+  echo "I no"
+elif D=$dir awk '($1 == "@includedir" || $1 == "#includedir") && $2 == ENVIRON["D"] && NF == 2 { f = 1 } END { exit !f }' "$main"; then
+  echo "I yes"
+else
+  echo "I no"
+fi
+
+for f in "$main" "$dir"/*; do
+  [ "$f" = "$own" ] && continue
+  if [ "$f" != "$main" ]; then
+    n=${f##*/}
+    case $n in *.*|*~) continue ;; esac
+  fi
+  [ -f "$f" ] || continue
+  if [ ! -r "$f" ]; then
+    printf 'E cannot read %s\n' "$f"
+    continue
+  fi
+  grep -nwE -- "$user" "$f" 2>/dev/null | not_comment | while read -r l; do
+    printf 'U %s %s\n' "$l" "$f"
+  done
+  if [ -n "$uid" ]; then
+    grep -nE -- "(^|[^%:0-9A-Za-z_])#$uid([^0-9]|\$)" "$f" 2>/dev/null | not_comment | while read -r l; do
+      printf 'U %s %s\n' "$l" "$f"
+    done
+  fi
+  for g in $groups; do
+    grep -nE -- "%:?$g([[:space:],=]|\$)" "$f" 2>/dev/null | not_comment | while read -r l; do
+      printf 'G %s %s %s\n' "$g" "$l" "$f"
+    done
+  done
+  for g in $gids; do
+    grep -nE -- "%:?#$g([^0-9]|\$)" "$f" 2>/dev/null | not_comment | while read -r l; do
+      printf 'G gid:%s %s %s\n' "$g" "$l" "$f"
+    done
+  done
+  # A netgroup where it can name a user: before the first "=" of a rule or
+  # Defaults line, or anywhere in a User_Alias line.
+  grep -nE -- '^[^=]*(^|[[:space:],!:])\+[A-Za-z0-9_]|^[[:space:]]*User_Alias[[:space:]].*[[:space:],!=]\+[A-Za-z0-9_]' "$f" 2>/dev/null \
+    | not_comment | while read -r l; do
+    printf 'X %s %s\n' "$l" "$f"
+  done
+done
+exit 0

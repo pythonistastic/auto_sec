@@ -5,12 +5,146 @@ All notable changes to auto_sec are documented here. Format based on
 [SemVer](https://semver.org/).
 
 While auto_sec is **pre-1.0**, minor versions (0.x) may include breaking
-changes. Treat it as early-stage — see the
+changes. auto_sec is a personal research project, not a production service — see the
 [Disclaimer](README.md#disclaimer) and [RETROSPECTIVE](docs/RETROSPECTIVE.md).
 
 ## [Unreleased]
 
-_Nothing yet._
+**A full run that changes nothing on an existing server unless asked.** Each
+server now says whether it is `existing` or `new`, every run prints a plan
+first, and on an existing server auto_sec changes only what you name. It is a
+personal research project, not a production service; read **Upgrading
+(0.6.0)** before you run it on a server set up by 0.1–0.5.
+
+### Breaking (0.6.0)
+
+- New required per-host `autosec_server: existing | new`. The run stops
+  until it is set (R00-1).
+- Role 01 no longer creates `deploy_user` or writes a sudo rule unless
+  `deploy_user_account: create` (the default with `new` when it is
+  `ssh_admin_user`). An existing account is never changed, and a new
+  account gets no extra groups.
+- Role 01 no longer sets kernel settings. The lines 0.1–0.5 wrote in
+  `/etc/sysctl.conf` stay, as yours.
+- Role 03 runs no ufw command on an active ufw, and never runs
+  `ufw default` on its own. It turns ufw on only when ufw is inactive and
+  `firewall_state: enabled`. 80/443 are no longer opened by default; list
+  them in `firewall_inbound`. `egress_lockdown: false` leaves the
+  outgoing policy alone.
+- fail2ban and unattended-upgrades are no longer installed on `existing`
+  servers by default.
+- Roles 08 and 09 change nothing in 0.6 (#18). They install nothing,
+  write nothing and no longer delete `hardening.rules`. The detector
+  variables do nothing.
+- `cve_watch_enabled` defaults to false.
+- The report is written only on the controller.
+- `site.yml` runs one host at a time, and refuses several hosts without
+  `-l` (an empty `-l ""` counts as none).
+- High mode needs `fwknop_pcap_intf`.
+
+### Fixed (0.6.0)
+
+- Overwriting `/etc/sudoers.d/<user>`, and changing an existing account's
+  shell and groups.
+- Rewriting `/etc/sysctl.conf` and re-applying it whole.
+- #8: the hardcoded 80/443, allow→limit, an operator deny turned into
+  allow, and lost comments.
+- Two full ufw restarts on every run.
+- The README's claims about the office rule and ICMP redirects.
+- Deleting the operator's `hardening.rules`.
+- Unguarded installs of auditd, audispd-plugins, inotify-tools, rsyslog,
+  python3 and iproute2.
+- needrestart restarting services during auto_sec installs.
+- The apt module installing python3-apt by itself.
+- Role 10 failing without `client_name`/`client_domain` or without ufw.
+- #10: unmeasured report claims.
+- Role 11 skipping the OS count without `app_dir`.
+- Role 04 copying a host fact into its config.
+- `--check` failing on a new server.
+- `unattended_upgrades_enabled: keep` removing auto_sec's own
+  `51autosec-unattended-upgrades` (it could turn the updates off). Only
+  `auto` removes it now.
+- Layer 05 changing an existing `app` account's shell and the owner of an
+  existing `app_dir` (R05-3, R05-4).
+- Layer 07 overwriting `/opt/backup/*` and `/etc/logrotate.d/backup`
+  files that are not auto_sec's (R07-2).
+
+### Added (0.6.0)
+
+- The run plan with a plan id, `-e autosec_plan_only=true`, and
+  `autosec_require_approval` / `-e autosec_approve=<id>` (R00-4, R00-5).
+  The id covers the packages to install and the values auto_sec's files
+  get.
+- `autosec_confirm_hosts` and `autosec_serial` (both `-e`).
+- The shared package check (`roles/autosec-apt`).
+- The ufw turn-on checks (`auto-sec-ufw-turnon`), and the undo guard's
+  `--ufw` mode: a revert turns ufw off, then puts its four files back. The
+  boot-time undo unit now also runs before `ufw.service`.
+- `deploy_user_account`, `firewall_state`, `firewall_ssh_rule`,
+  `firewall_inbound`, `firewall_closed_ok`, `firewall_revert_seconds`
+  (120–3600).
+- Refusal and note IDs (R00-…, R01-A…, R01-U1, R03-W…, R03-F…, R05-…,
+  R07-…, R11-…, M…, P1–P5, N…, W08-1, W09-1) at the start of the
+  messages or task names.
+- The wizard asks `existing` or `new`, the admin account, the ports to
+  keep open, the CVE watch and approval. Its detector questions are gone.
+- CI jobs `site-semantics`, `ufw-semantics`, `autosec-apt-semantics`,
+  `report-semantics`, `cve-semantics`, `legacy-semantics`,
+  `full-adopt-live`, `full-new-live` (with the planned `ufw-live` cases),
+  `apt-guard-live` and `legacy-live`, and a static check that every role
+  emits its plan and that refusal IDs are unique.
+
+### Upgrading (0.6.0)
+
+- Add `autosec_server` to every host: `new` for hosts auto_sec set up
+  from scratch (they keep 0.5's management, minus kernel settings and
+  detection; nothing is removed), `existing` for everything else.
+- `deploy` stays as it is. A `/etc/sudoers.d/deploy` with 0.1–0.5's exact
+  bytes is kept in both modes (N01-A2). If you deleted that file on
+  purpose, `create` refuses (R01-A3), so your choice stands. Use
+  `create` only where 0.5's file still exists, or where you want
+  auto_sec's rule.
+- The 7 kernel lines in `/etc/sysctl.conf` stay (N01-K2). To remove
+  them: delete the lines, then run `sudo sysctl --system`. On Debian 13
+  move them to `/etc/sysctl.d` (N01-K1).
+- ufw: the 0.x rules are now your rules. A 0.x office rule behind
+  `limit` gets a note with the delete/prepend commands (N03-W3); auto_sec
+  does not move it. A high-mode host from 0.1–0.3 without an SSH rule
+  gets N03-W9: run `sudo ufw limit <port>/tcp` yourself.
+- fail2ban: 0.5's `00-autosec.conf` stays under `keep` (N03-F1). `true`
+  continues 0.5's management.
+- Updates: 0.5's `51autosec-unattended-upgrades` (from `true`) stays
+  under `keep` (N01-U1). `keep` together with a reboot, origins or
+  blacklist value stops the run if the rewritten file would change the
+  update switches (R01-U1): set `true` or `auto` then.
+- `office_static_ip` is used only where auto_sec writes: its fail2ban
+  file (`true`) and a ufw it turns on. With `keep`, put the address in
+  your own `jail.local` and ufw rules.
+- Detection: everything stays, with W08-1 and W09-1. Active mode stops
+  the run at its first step (R00-3) until you stop the detectors. See
+  README "Removing the 0.1-0.5 detection suite".
+- CVE watch: an old timer stays when `cve_watch_enabled` is false
+  (N11-1, with the removal commands). Set it to true, with `app_dir`, to
+  keep it.
+- Old `/root/security-report-*.md` files on servers are not deleted.
+- Start with `-e autosec_plan_only=true` and read the plan.
+
+### Known limitations (0.6.0)
+
+- needrestart runs at your next apt run (nightly unattended-upgrades on
+  Ubuntu 24.04).
+- Sudo rules from LDAP/sssd, Runas aliases and `ALL` user lists are not
+  scanned. A line with a netgroup (`+name`) counts as naming the account.
+- The ufw turn-on, and the undo guard's `--ufw` mode with its
+  `Before=ufw.service` boot ordering, were checked only in a lab (the ufw
+  code of Ubuntu 22.04/24.04 and Debian 12/13), never on a real server
+  yet.
+- Detection is not managed until 0.7.
+- 0.4's and 0.5's live jobs (`role02-live`, `fail2ban-live`, `base-live`)
+  ran on GitHub's runners for those releases, and 0.4's SSH undo once on
+  a real server with a reboot. 0.6's new live jobs (`full-adopt-live`,
+  `full-new-live`, `apt-guard-live`, `legacy-live`) and its changes to
+  the old ones have not run yet.
 
 ## [0.5.0] - 2026-11-08
 

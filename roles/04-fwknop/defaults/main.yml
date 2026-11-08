@@ -1,2 +1,13 @@
 ---
 fwknop_open_seconds: 30
+
+# Required with paranoia_level: high (no default): the network interface
+# fwknopd listens on, e.g. "eth0". auto_sec never copies it from the host;
+# the run shows the default-route interface as a hint.
+# fwknop_pcap_intf: eth0
+
+# --- Role-internal constants. These are not settings: do not override. ---
+# First line of both files role 04 writes. auto_sec changes a file only
+# while this line is first, or while it is the package's own file or
+# exactly the file auto_sec 0.1-0.5 wrote.
+_l04_header: "# Written by auto_sec (role 04). auto_sec changes this file only while this line is first."

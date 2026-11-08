@@ -1,0 +1,47 @@
+---
+# roles/06-database/tasks/plan.yml - role 06's read-only plan (db_engine set).
+#
+# site.yml includes this in pre_tasks (tags always) when layer 06 is on.
+# Layer 06 sets up a NEW database server: it edits the server's config and
+# restarts it. So it runs only on a fresh host, or on one that carries
+# exactly what layer 06 wrote before:
+#
+#   R06-1  a PostgreSQL or MySQL cluster exists, and its config does not
+#          have layer 06's lines (postgres: listen_addresses = '127.0.0.1'
+#          and log_min_duration_statement = 1000 in
+#          /etc/postgresql/<pg_version>/main/postgresql.conf; mysql:
+#          bind-address = 127.0.0.1 in mysqld.cnf and the db_name database
+#          folder)
+#
+# Sets _plan_06 and the _l06_* facts main.yml uses.
+
+- name: "Database plan: existing clusters (read-only)"
+  ansible.builtin.include_tasks:
+    file: read.yml
+
+- name: "Database plan R06-1: layer 06 sets up a database server only on a fresh host"
+  ansible.builtin.assert:
+    quiet: true
+    that: (_l06_now.clusters | default('0') | int) == 0 or _l06_now.ours == 'yes'
+    fail_msg: >-
+      Layer 06 sets up a new {{ 'PostgreSQL' if db_engine == 'postgres' else 'MySQL' }} server, but
+      {{ inventory_hostname }} already has one, and its config is yours (it does not have exactly
+      the lines layer 06 writes). Layer 06 would edit its config and restart it. Remove db_engine
+      to skip layer 06. Nothing has been changed.
+
+- name: "Database plan: plan lines"
+  ansible.builtin.set_fact:
+    _l06_planned: true
+    _l06_plan_snapshot: "{{ _l06_now }}"
+    _l06_pkg_want: >-
+      {{ ['postgresql', 'postgresql-contrib', 'python3-psycopg2'] if db_engine == 'postgres'
+         else ['mysql-server', 'python3-pymysql'] }}
+    _plan_06: >-
+      {{ ([{'role': '06', 'part': 'database', 'do': 'install', 'what': (['postgresql', 'postgresql-contrib', 'python3-psycopg2']
+             if db_engine == 'postgres' else ['mysql-server', 'python3-pymysql']) | join(' '), 'note': ''}]
+          if (_l06_now.clusters | default('0') | int) == 0 else [])
+         + [{'role': '06', 'part': 'database', 'do': 'write',
+             'what': ('postgresql.conf: listen_addresses 127.0.0.1, log_min_duration_statement 1000' if db_engine == 'postgres'
+                      else 'mysqld.cnf: bind-address 127.0.0.1'), 'note': ''},
+            {'role': '06', 'part': 'database', 'do': 'restart', 'what': db_engine ~ ' (when its config changes)', 'note': ''},
+            {'role': '06', 'part': 'database', 'do': 'user', 'what': 'database ' ~ db_name ~ ' and its user ' ~ db_user, 'note': ''}] }}

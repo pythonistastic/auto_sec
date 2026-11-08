@@ -1,0 +1,38 @@
+---
+# --- Role-internal constants. These are not settings: do not override. ---
+# First line of the nginx vhost role 05 writes. Layer 05 runs on a host
+# whose nginx was installed before only while its vhost carries this line.
+_l05_header: "# Written by auto_sec (role 05). auto_sec changes this file only while this line is first."
+
+# What plan.yml (and main.yml, right before the change) reads, one
+# "<key> <value>" line each: nginx, vhost, user (deploy_user), node,
+# docker, pm2, app ("<uid> <shell>" or absent) and appdir ("dir
+# <owner>:<group>", absent or other). $1 header, $2 vhost path,
+# $3 deploy_user, $4 app_dir. Read-only.
+_l05_read_sh: |
+  H=$1; v=$2; u=$3; d=$4
+  st=$(dpkg-query -W -f='${db:Status-Abbrev}' nginx 2>/dev/null) || st=
+  echo "nginx ${st:-none}"
+  if [ -L "$v" ] || [ ! -f "$v" ]; then echo "vhost $( [ -e "$v" ] && echo other || echo absent)"
+  elif [ "$(head -n 1 -- "$v")" = "$H" ]; then echo "vhost ours"
+  else echo "vhost foreign"
+  fi
+  if getent passwd -- "$u" >/dev/null 2>&1; then echo "user present"; else echo "user absent"; fi
+  if [ -x /usr/bin/node ]; then echo "node present"; else echo "node absent"; fi
+  if [ -x /usr/bin/docker ]; then echo "docker present"; else echo "docker absent"; fi
+  if [ -x /usr/bin/pm2 ] || [ -x /usr/local/bin/pm2 ]; then echo "pm2 present"; else echo "pm2 absent"; fi
+  if a=$(getent passwd app 2>/dev/null); then
+    echo "app $(printf '%s\n' "$a" | cut -d: -f3) $(printf '%s\n' "$a" | cut -d: -f7)"
+  else
+    echo "app absent"
+  fi
+  if [ -L "$d" ]; then echo "appdir other"
+  elif [ -d "$d" ]; then echo "appdir dir $(stat -c '%U:%G' -- "$d")"
+  elif [ -e "$d" ]; then echo "appdir other"
+  else echo "appdir absent"
+  fi
+
+# An existing account "app" layer 05 accepts as its own: a system account
+# (uid below 1000) with one of these shells.
+_l05_app_re: '^[0-9]{1,10} /[A-Za-z0-9/._-]{1,64}$'
+_l05_nologin_shells: [/usr/sbin/nologin, /sbin/nologin, /bin/false, /usr/bin/false]

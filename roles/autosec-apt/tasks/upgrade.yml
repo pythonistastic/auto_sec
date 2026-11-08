@@ -1,0 +1,42 @@
+---
+# roles/autosec-apt/tasks/upgrade.yml - the full upgrade of role 01 step 5,
+# only with -e apt_full_upgrade=true (one run, never in host_vars). It
+# installs every waiting update; package scripts restart their own
+# upgraded services, and a new kernel needs a reboot (role 01's INFO says
+# so). needrestart is held back as for every auto_sec install (N-P2).
+# Not in --check: the preflight showed the number of waiting updates.
+#   - ansible.builtin.include_role:
+#       name: autosec-apt
+#       tasks_from: upgrade
+#       apply: {tags: [base]}
+
+- name: "Packages: full upgrade (not in --check)"
+  when: not ansible_check_mode
+  block:
+    - name: "Packages: refresh the package lists (apt_full_upgrade)"
+      ansible.builtin.command:
+        argv: [apt-get, update]
+      environment: "{{ _aptg_env }}"
+      # Only the lists change, no installed package.
+      changed_when: false
+
+    - name: "Packages: units with edits systemd has not loaded yet (P4)"
+      ansible.builtin.import_tasks: plan.yml
+      vars:
+        _aptg_req: []
+        _aptg_ctx: main
+        _aptg_check_units: true
+
+    - name: "Packages: full upgrade (apt_full_upgrade)"
+      ansible.builtin.command:
+        argv: [apt-get, -y, -o, DPkg::Lock::Timeout=300, -o, "Dpkg::Options::=--force-confdef", -o, "Dpkg::Options::=--force-confold", dist-upgrade]
+      environment: "{{ _aptg_env }}"
+      register: _aptg_fu
+      changed_when: _aptg_fu.stdout is not search('(?m)^0 upgraded, 0 newly installed, 0 to remove')
+
+    - name: "Packages: needrestart was held back"
+      ansible.builtin.debug:
+        msg: >-
+          [N-P2] NOTE: needrestart was held back. Services that already used replaced libraries before
+          this run are restarted by needrestart at the next package install or nightly update on
+          {{ inventory_hostname }}, as they would have been without auto_sec. "needrestart -r l" lists them.

@@ -729,7 +729,9 @@ def s16_ansible(lab, d, playbook_bin):
               "_f2b_run_dir": os.path.join(lab.w, ptag, "run-" + name),
               "_f2b_sim_dir": os.path.join(lab.w, ptag, "run-" + name, "f2b-sim"),
               "_f2b_prev_dir": os.path.join(lab.w, ptag, "run-" + name, "f2b-prev"),
-              "_f2b_backup_dir": os.path.join(lab.w, ptag, "backup-" + name), "ssh_port": 22}
+              "_f2b_backup_dir": os.path.join(lab.w, ptag, "backup-" + name), "ssh_port": 22,
+              # 0.6: fail2ban is managed only when asked for (keep by default).
+              "fail2ban_hardening_enabled": True}
         ev.update(extra_vars or {})
         evf = os.path.join(lab.w, ptag, "ev-%s.json" % name)
         write(evf, json.dumps(ev))

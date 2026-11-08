@@ -1,0 +1,57 @@
+---
+# roles/07-backups/tasks/plan.yml - role 07's read-only plan (b2_bucket set).
+#
+# site.yml includes this in pre_tasks (tags always) when layer 07 is on.
+#
+#   R07-1  /root/.config/rclone/rclone.conf exists and is not auto_sec's
+#          (no auto_sec header, and not exactly the 4-line file auto_sec
+#          0.1-0.5 wrote): layer 07 would overwrite your rclone remotes
+#   R07-2  another file layer 07 writes (/opt/backup/backup.sh,
+#          recipients.txt, .tg_token, .tg_chat, /etc/logrotate.d/backup)
+#          exists and is not auto_sec's
+#
+# The checks run on the host and print one word per file: the keys and
+# tokens never come back to Ansible. Sets _plan_07 and the _l07_* facts.
+
+- name: "Backups plan: the files layer 07 writes (read-only)"
+  ansible.builtin.include_tasks:
+    file: read.yml
+
+- name: "Backups plan R07-1: rclone.conf is absent or auto_sec's"
+  ansible.builtin.assert:
+    quiet: true
+    that: _l07_now in ['absent', 'ours', 'legacy']
+    fail_msg: >-
+      /root/.config/rclone/rclone.conf on {{ inventory_hostname }} is yours (no auto_sec header,
+      and not the file auto_sec 0.1-0.5 wrote). Layer 07 would replace it and lose your rclone
+      remotes. Remove b2_bucket to skip layer 07. Nothing has been changed.
+
+- name: "Backups plan R07-2: the other files layer 07 writes are absent or auto_sec's"
+  ansible.builtin.assert:
+    quiet: true
+    that: _l07_bad | length == 0
+    fail_msg: >-
+      [R07-2] {{ _l07_bad | join(', ') }} on {{ inventory_hostname }} {{ 'is' if _l07_bad | length == 1 else 'are' }}
+      not auto_sec's (not the shape or content auto_sec writes, or not a plain file or folder).
+      Layer 07 would replace {{ 'it' if _l07_bad | length == 1 else 'them' }}. Rename or move
+      {{ 'it' if _l07_bad | length == 1 else 'them' }}, or remove b2_bucket to skip layer 07.
+      Nothing has been changed.
+  vars:
+    _l07_bad: >-
+      {%- set out = [] -%}
+      {%- for k, p in _l07_paths | dictsort if k != 'rclone' -%}
+      {%- if (_l07_files[k] | default('other')) not in ['absent', 'ours', 'legacy'] -%}{%- set _ = out.append(p) -%}{%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: "Backups plan: plan lines"
+  ansible.builtin.set_fact:
+    _l07_planned: true
+    _l07_plan_snapshot: "{{ _l07_now }}"
+    _l07_files_snapshot: "{{ _l07_files }}"
+    _l07_pkg_want: [rclone, age, curl]
+    _plan_07:
+      - { role: "07", part: backups, do: install, what: "rclone age curl (those missing)", note: "" }
+      - { role: "07", part: backups, do: write, what: "/root/.config/rclone/rclone.conf and /opt/backup (script, recipient, alert credentials)", note: "" }
+      - { role: "07", part: backups, do: cron, what: "nightly backup at {{ '%02d:%02d' | format(backup_hour | int, backup_minute | int) }} (root crontab)", note: "" }
+      - { role: "07", part: backups, do: write, what: /etc/logrotate.d/backup, note: "" }

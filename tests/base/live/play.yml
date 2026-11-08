@@ -1,9 +1,10 @@
 ---
 # Role 01 exactly as site.yml runs it: the read-only preflight in pre_tasks
-# (tags always), then the role (tag base). Used by tests/base/live/run.sh,
-# which points ANSIBLE_ROLES_PATH at the repository's roles/. It does not
-# use site.yml itself so that the test covers role 01 alone (no role 02/03
-# preflight, no group_vars/all.yml).
+# (tags always), the package guard's preflight after it (one check of every
+# package the run installs), then the role (tag base). Used by
+# tests/base/live/run.sh, which points ANSIBLE_ROLES_PATH at the
+# repository's roles/. It does not use site.yml itself so that the test
+# covers role 01 alone (no role 02/03 preflight, no group_vars/all.yml).
 - name: Role 01 live test
   hosts: all
   become: true
@@ -11,6 +12,12 @@
     - name: "Preflight: role 01 checks (read-only)"
       ansible.builtin.import_role:
         name: 01-base
+        tasks_from: preflight
+      tags: [always]
+
+    - name: "Preflight: packages (read-only)"
+      ansible.builtin.import_role:
+        name: autosec-apt
         tasks_from: preflight
       tags: [always]
   roles:

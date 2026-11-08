@@ -1,10 +1,10 @@
 ---
 # roles/01-base/tasks/preflight.yml
 #
-# Read-only role 01 checks B1-B9. site.yml imports this file in pre_tasks
+# Read-only role 01 checks B1-B13. site.yml imports this file in pre_tasks
 # with tags [always], after the SSH preflight, so a refusal happens BEFORE
 # role 01 changes anything. It also runs in --check. It writes only below
-# /run/auto-sec (the trial run's copy, removed again).
+# /run/auto-sec (the trial runs' copies, removed again).
 #
 # Trust boundary (SECURITY.md): what is read from the host is shown to you,
 # compared with values you typed, or used to refuse. It never becomes part
@@ -32,16 +32,25 @@
 #   _base_reboot_pkgs      list  packages that asked for it
 #   _base_pending_upgrades int   `apt-get -s dist-upgrade` Inst lines (-1 unknown)
 #   _base_pending_kernel   bool  a linux-image package is among them
-#   _base_pkgs_missing     list  packages role 01 would install (packages.yml)
+#   _base_pkg_want         list  packages role 01 wants (for roles/autosec-apt)
+#   _base_pkgs_missing     list  of those, the ones that are not installed
 #   _base_hostname_now     str   static hostname now ('' unknown)
 #   _base_tz_now           str   timezone now ('' unknown)
 #   _base_tz_after         str   start value _base_tz_now; main updates it
+#   _base_user_exists      bool  deploy_user exists now
+#   _base_user_plan        str   keep | exists | create
+#   _base_sudo_pf          dict  sudo.yml's reads (state of auto_sec's sudo
+#                                file, and sudo's configuration when checked)
+#   _base_sudo_write       bool  main step 6b writes /etc/sudoers.d/<user>
+#   _base_sudo_installed   bool  sudo is installed now
+#   _plan_01               list  the plan items {role, part, do, what, note}
 #   plus the plan facts of plan.yml and decide.yml.
 #
 # The variable checks (B1) run, and refuse, with every tag. Host checks and
-# refusals (B3, B5-B8) run only when the tags select role 01 (tag "base"),
-# so that for example `--tags ssh` is not refused because of a role 01
-# change that would not happen in that run.
+# refusals (B3, B5-B8, B13) run only when the tags select role 01 (tag
+# "base"), so that for example `--tags ssh` is not refused because of a
+# role 01 change that would not happen in that run. B12 (the account role
+# 02 logs in as) runs whenever role 02 runs.
 
 - name: "Base preflight: start every base fact from a safe value"
   ansible.builtin.set_fact:
@@ -68,7 +77,20 @@
     _base_pending_upgrades: -1
     _base_pending_kernel: false
     _base_docker_installed: []
+    _base_pkg_want: []
     _base_pkgs_missing: []
+    _base_uu_file_sha256: ""
+    _base_uu_file_change: none
+    _base_user_exists: false
+    _base_user_shell: ""
+    _base_user_plan: keep
+    _base_sudo_pf: {state: absent, sha256: "", checked: false}
+    _base_sudo_write: false
+    _base_sudo_installed: false
+    _base_sysctl_lines: 0
+    _base_sysctl_legacy: false
+    _base_sysctl_unread: false
+    _plan_01: []
     _base_hostname_static: ""
     _base_hostname_transient: ""
     _base_hostname_now: ""
@@ -139,7 +161,7 @@
   ansible.builtin.stat:
     path: "{{ _base_uu_file }}"
     follow: false
-    get_checksum: false
+    checksum_algorithm: sha256
   register: _base_pf_own
 
 - name: "Base B2: first line of auto_sec's own apt file"
@@ -222,6 +244,7 @@
       {{ 'absent' if not _base_pf_own.stat.exists
          else ('other' if not _base_pf_own.stat.isreg
                else ('ours' if (_base_pf_own_head.stdout | default('')).startswith(_base_uu_header) else 'foreign')) }}
+    _base_uu_file_sha256: "{{ (_base_pf_own.stat.checksum | default('')) if (_base_pf_own.stat.isreg | default(false)) else '' }}"
     _base_uu_timer: "{{ _base_id.I if _base_id.I is match('^[a-z-]{1,20}$') else '' }}"
     _base_reboot_pending: "{{ _base_pf_rr.stat.exists }}"
     _base_reboot_pkgs: >-
@@ -295,13 +318,22 @@
   when: _base_role_runs | bool
   ansible.builtin.import_tasks: trial.yml
 
-# --- B5b. Packages: install only, never upgrade (only when role 01 runs) ----
+# --- B2, B3, B5b. The account, its sudo rule, packages (only when role 01 runs)
 
-- name: "Base B5b: packages"
+- name: "Base B2, B3: account, sudo and packages"
   when: _base_role_runs | bool
-  ansible.builtin.import_tasks: packages.yml
-  vars:
-    _base_pkg_ctx: preflight
+  ansible.builtin.import_tasks: account.yml
+
+# --- B12. The account role 02 logs in as (whenever role 02 runs) ------------
+
+- name: "Base B12: the admin account"
+  ansible.builtin.import_tasks: admin.yml
+
+# --- B13. Kernel settings, read only (only when role 01 runs) ----------------
+
+- name: "Base B13: kernel settings"
+  when: _base_role_runs | bool
+  ansible.builtin.import_tasks: kernel.yml
 
 # --- B7. Hostname and timezone (only when a change is planned) ---------------
 
@@ -361,7 +393,7 @@
       move): {{ _base_tzj_t }}; /etc/crontab (cron.daily, weekly,
       monthly){{ (', auto_sec backups at %02d:%02d' | format(backup_hour | int, backup_minute | int))
       if (b2_bucket is defined) else '' }}{{ (', the CVE scan at %02d:00' | format(cve_watch_hour | default(6) | int))
-      if (cve_watch_enabled | default(true) | bool) else '' }}{{ (', automatic reboots at ' ~ _base_uu_reboot_time)
+      if ((cve_watch_enabled | default(false) | string | lower) in _base_yes_words) else '' }}{{ (', automatic reboots at ' ~ _base_uu_reboot_time)
       if _base_uu_reboot == 'on' else '' }}.
   vars:
     _base_tzj_lines: "{{ _base_pf_tzjobs.stdout_lines | default([]) }}"
@@ -513,9 +545,27 @@
              ~ (_base_pending_upgrades if (_base_pending_upgrades | int) >= 0 else 'an unknown number of') ~ ' updates'
              ~ (' including a new kernel, which takes effect after a reboot' if (_base_pending_kernel | bool) else '')
              ~ '. It can restart services. unattended_exclude_docker and unattended_upgrade_blacklist do not'
-             ~ ' apply to it.'] if (_base_full_upgrade | bool) else []) }}
+             ~ ' apply to it.'] if (_base_full_upgrade | bool) else [])
+         + (['[N01-U1] INFO: auto_sec' ~ "'s " ~ (_base_uu_file | basename) ~ ' from an earlier run stays and still'
+             ~ ' applies on ' ~ inventory_hostname ~ ' (unattended_upgrades_enabled: keep). Set true to keep'
+             ~ ' managing it, or delete it by hand.']
+            if (_base_uu_enabled_mode == 'keep' and _base_uu_file_state == 'ours' and _base_uu_file_change == 'none') else [])
+         + (['[N01-A1] INFO: ' ~ deploy_user ~ ' exists on ' ~ inventory_hostname
+             ~ (' (shell ' ~ _base_user_shell ~ ')' if (_base_user_shell | length > 0) else '')
+             ~ '. auto_sec never changes an existing account.'] if _base_user_plan == 'exists' else [])
+         + (['[N01-A2] INFO: ' ~ _base_sudo_file ~ " is exactly 0.1-0.5's file; it stays as it is."]
+            if _base_sudo_pf.state == 'legacy' else [])
+         + (['[N01-K1] WARNING: ' ~ _base_sysctl_conf ~ ' on ' ~ inventory_hostname ~ ' has ' ~ _base_sysctl_lines
+             ~ ' setting lines, but systemd-sysctl does not read it here (Debian 13+). Move them to /etc/sysctl.d.']
+            if (_base_sysctl_unread | bool) else [])
+         + (['[N01-K2] INFO: ' ~ _base_sysctl_conf ~ ' has the lines auto_sec 0.1-0.5 wrote. They are yours now;'
+             ~ ' auto_sec no longer edits kernel settings.'] if (_base_sysctl_legacy | bool) else []) }}
 
-# --- B9. Summary ---------------------------------------------------------------
+# --- B9. Plan and summary -------------------------------------------------------
+
+- name: "Base B9: the plan items"
+  when: _base_role_runs | bool
+  ansible.builtin.import_tasks: plan_items.yml
 
 - name: "Base preflight: summary"
   when: _base_role_runs | bool
@@ -535,9 +585,19 @@
       legacy_file: "{{ 'restored to the distro file' if (_base_uu_restore | bool) else ('yes, not migrated' if (_base_uu_legacy | bool) else 'no') }}"
       packages_to_install: "{{ _base_pkgs_missing }}"
       apt_file: >-
-        {{ ('remove ' if _base_uu_file_state == 'ours' else 'none') if (_base_uu_plan_empty | bool)
-           else ('write ' ~ (_base_uu_file | basename)) }}
+        {{ (_base_uu_file_change ~ ' ' ~ (_base_uu_file | basename)) if _base_uu_file_change in ['write', 'remove']
+           else ('unchanged' if _base_uu_file_state == 'ours' else 'none') }}
       full_upgrade: "{{ _base_full_upgrade }}"
+      account: >-
+        {{ deploy_user ~ (': exists (left as it is)' if (_base_user_exists | bool)
+           else (': missing, created by this run' if _base_user_plan == 'create'
+           else ': missing (deploy_user_account: keep)')) }}
+      sudo: >-
+        {{ ('write ' ~ _base_sudo_file ~ ' (passwordless sudo)') if (_base_sudo_write | bool)
+           else {'absent': 'none', 'legacy': "kept: auto_sec 0.1-0.5's file", 'ours': "kept: auto_sec's file",
+                 'foreign': "not auto_sec's: left alone", 'other': "not auto_sec's: left alone"}[_base_sudo_pf.state]
+           | default('none') }}
+      kernel_settings: auto_sec 0.6 writes none
       hostname: "{{ (_base_hostname_now | default('?', true)) ~ ((' -> ' ~ _base_hostname_want) if (_base_hostname_change | bool) else ' (kept)') }}"
       timezone: "{{ (_base_tz_now | default('?', true)) ~ ((' -> ' ~ _base_tz_want) if (_base_tz_change | bool) else ' (kept)') }}"
       keys_that_change: "{{ _base_uu_diff_lines if (_base_uu_diff | length > 0) else 'no change' }}"

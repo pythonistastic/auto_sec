@@ -1,0 +1,42 @@
+---
+# roles/03-firewall/tasks/ufw-armed.yml - U8's gate, right before
+# `ufw --force enable` (included by ufw.yml).
+#
+# If the undo's timer has already put the four files back, `ufw --force
+# enable` would load them without the SSH rule, and nothing would undo
+# that. So the change of _ssh_guard_id must still be pending, its timer
+# must run, and at least 60 s must be left for the login test.
+#
+# A read-only status, not check: check would record the rule files as
+# written by this run before ufw.conf is, and an undo after the grace time
+# would then put the rules back but leave ufw on. ufw.yml runs check right
+# after the enable instead, which records all four files at once.
+
+- name: "ufw U8: is the undo still armed by this run? (read-only)"
+  ansible.builtin.include_role:
+    name: 02-ssh-hardening
+    tasks_from: guard
+  vars:
+    _ssh_guard_action: status
+
+- name: "ufw U8: the undo is armed, its timer runs, and time is left for the login test"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (_ssh_guard_status.rc | default(1)) == 0
+      - (_fw_st | first | default('')) == 'pending ' ~ _ssh_guard_id
+      - "_fw_st | select('match', '^timer: +active ') | list | length > 0"
+      - (_fw_left | int) >= 60
+    fail_msg: >-
+      {% if (_fw_st | first | default('')) != 'pending ' ~ _ssh_guard_id %}The automatic undo on
+      {{ inventory_hostname }} is no longer armed by this run (its timer already put ufw's files
+      back?).{% elif _fw_st | select('match', '^timer: +active ') | list | length == 0 %}The
+      automatic undo's timer on {{ inventory_hostname }} is not running.{% else %}Only
+      {{ _fw_left }} s of the automatic undo are left on {{ inventory_hostname }}: too little for
+      the login test after ufw goes on. Raise firewall_revert_seconds (now
+      {{ firewall_revert_seconds | int }}).{% endif %} ufw was not turned on.
+  vars:
+    _fw_st: "{{ _ssh_guard_status.stdout_lines | default([]) }}"
+    _fw_left: >-
+      {{ ((_fw_st | select('match', '^deadline: ') | first | default('')
+           | regex_findall('[(]in ([0-9]+)s[)]')) + ['0']) | first }}

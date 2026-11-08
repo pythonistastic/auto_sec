@@ -1,0 +1,40 @@
+---
+# Role 02's plan lines (roles/02-ssh-hardening/tasks/plan.yml) without a
+# server. The preflight facts it reads come from -e lab_facts=<json>; run.sh
+# puts a fake getent first in PATH that gives each lab account a home under
+# the work directory, so the authorized_keys check reads lab files only.
+#   ansible-playbook -i localhost, plan02.yml -e @<vars.json> -e lab_out=<file>
+- name: Role 02 plan lab
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  tasks:
+    - name: "Lab: the preflight facts"
+      ansible.builtin.set_fact:
+        _ssh_enabled: "{{ lab_facts._ssh_enabled }}"
+        _ssh_role_runs: "{{ lab_facts._ssh_role_runs }}"
+        _ssh_admin: "{{ lab_facts._ssh_admin }}"
+        _ssh_admin_keys: "{{ lab_facts._ssh_admin_keys }}"
+        _ssh_deploy_keys: "{{ lab_facts._ssh_deploy_keys }}"
+        _ssh_needs_write: "{{ lab_facts._ssh_needs_write }}"
+        _ssh_migrate_kind: "{{ lab_facts._ssh_migrate_kind }}"
+        _ssh_diff: "{{ lab_facts._ssh_diff }}"
+        _ssh_deferred: "{{ lab_facts._ssh_deferred }}"
+        _ssh_deferred_reason: "{{ lab_facts._ssh_deferred_reason }}"
+        _ssh_local_mode: "{{ lab_facts._ssh_local_mode }}"
+        _ssh_controller_ip: "{{ lab_facts._ssh_controller_ip }}"
+        _base_role_runs: "{{ lab_facts._base_role_runs }}"
+        _base_user_plan: "{{ lab_facts._base_user_plan }}"
+
+    - name: "Lab: role 02's plan"
+      ansible.builtin.import_role:
+        name: 02-ssh-hardening
+        tasks_from: plan
+
+    - name: "Lab: write the plan lines"
+      ansible.builtin.copy:
+        dest: "{{ lab_out }}"
+        mode: "0600"
+        content: "{{ {'items': _plan_02, 'notes': _plan_02_notes} | to_nice_json }}"

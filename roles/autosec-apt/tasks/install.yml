@@ -1,0 +1,133 @@
+---
+# roles/autosec-apt/tasks/install.yml - install a role's missing packages,
+# without their recommendations, and prove that nothing else changed.
+# A role includes it in its apply phase:
+#   - ansible.builtin.include_role:
+#       name: autosec-apt
+#       tasks_from: install
+#       apply: {tags: [<the role's tag>]}
+#     vars:
+#       _aptg_want: [...]            # role constants
+#       _aptg_who: "role NN (...)"
+#       _aptg_allow_changes: false   # true only for apt_full_upgrade
+#       _aptg_off: "..."             # optional: how to turn the feature off
+#
+# Skipped in --check: the preflight already ran the same simulation. A host
+# that has every package gets no apt run at all, not even a list refresh.
+# Steps: refresh the lists; check again (plan.yml: P1-P5); note what is
+# installed; install; prove: every wanted package is installed, only the
+# packages apt announced were added, no installed version changed (M-P1).
+# needrestart is held back for the install (_aptg_env, N-P2).
+
+- name: "Packages: install (not in --check)"
+  when: not ansible_check_mode
+  block:
+    - name: "Packages: what is installed now"
+      ansible.builtin.import_tasks: status.yml
+
+    - name: "Packages: what is missing"
+      ansible.builtin.set_fact:
+        _aptg_todo: "{{ _aptg_missing }}"
+
+    - name: "Packages: refresh the package lists"
+      when: _aptg_todo | length > 0
+      ansible.builtin.command:
+        argv: [apt-get, update]
+      environment: "{{ _aptg_env }}"
+      register: _aptg_upd
+      # Only the lists change, no installed package.
+      changed_when: false
+
+    - name: "Packages: check again with the fresh lists"
+      when: _aptg_todo | length > 0
+      ansible.builtin.import_tasks: plan.yml
+      vars:
+        _aptg_req: >-
+          {{ [{'who': _aptg_who | default('auto_sec'), 'pkgs': _aptg_want}
+              | combine({'off': _aptg_off} if (_aptg_off is defined) else {})] }}
+        _aptg_ctx: main
+
+    - name: "Packages: the installed packages and versions before the install"
+      when: _aptg_todo | length > 0
+      ansible.builtin.command:
+        argv: [dpkg-query, -W, "-f=${db:Status-Abbrev} ${Package} ${Architecture} ${Version}\n"]
+      register: _aptg_before
+      changed_when: false
+      failed_when: false
+
+    - name: "Packages: install {{ _aptg_missing | join(' ') }}"
+      when: _aptg_todo | length > 0
+      ansible.builtin.command:
+        argv: "{{ ['apt-get', 'install', '-y', '--no-install-recommends'] + _aptg_dpkg_opts + _aptg_missing }}"
+      environment: "{{ _aptg_env }}"
+      register: _aptg_inst
+      changed_when: true
+      failed_when: false
+
+    - name: "Packages: the install worked (M-P2)"
+      when: _aptg_todo | length > 0
+      ansible.builtin.assert:
+        quiet: true
+        that: _aptg_inst.rc == 0
+        fail_msg: >-
+          [M-P2] apt-get install {{ _aptg_missing | join(' ') }} failed on {{ inventory_hostname }}
+          (exit {{ _aptg_inst.rc }}): {{ (_aptg_inst.stderr_lines | default([]) + _aptg_inst.stdout_lines | default([]))
+          | select('match', '^(E|dpkg):') | map('regex_replace', '[{}]', '?') | list | join(' ') | truncate(600) }}.
+          Check `sudo dpkg --audit` and `sudo apt-get -f install` yourself.
+
+    - name: "Packages: the installed packages and versions after the install"
+      when: _aptg_todo | length > 0
+      ansible.builtin.command:
+        argv: [dpkg-query, -W, "-f=${db:Status-Abbrev} ${Package} ${Architecture} ${Version}\n"]
+      register: _aptg_after
+      changed_when: false
+      failed_when: false
+
+    - name: "Packages: what is installed after the install"
+      when: _aptg_todo | length > 0
+      ansible.builtin.import_tasks: status.yml
+
+    - name: "Packages: only what apt announced was added, nothing else changed (M-P1)"
+      when: _aptg_todo | length > 0
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _aptg_missing | length == 0
+          - _aptg_p_added | reject('in', _aptg_new + _aptg_todo) | list | length == 0
+          - (_aptg_p_changed + _aptg_p_removed) | length == 0 or (_aptg_allow_changes | default(false) | bool)
+        fail_msg: >-
+          [M-P1] this should not happen; another apt run (unattended-upgrades?) changed packages at
+          the same time on {{ inventory_hostname }}:
+          {{ ((['still missing: ' ~ (_aptg_missing | join(' '))] if (_aptg_missing | length > 0) else [])
+              + (['added without notice: ' ~ (_aptg_p_added | reject('in', _aptg_new + _aptg_todo) | join(' '))]
+                 if (_aptg_p_added | reject('in', _aptg_new + _aptg_todo) | list | length > 0) else [])
+              + (['version changed: ' ~ (_aptg_p_changed | join(', '))] if (_aptg_p_changed | length > 0) else [])
+              + (['removed: ' ~ (_aptg_p_removed | join(' '))] if (_aptg_p_removed | length > 0) else []))
+             | join('; ') | truncate(800) }}. Check /var/log/apt/history.log.
+      vars:
+        _aptg_p_b: >-
+          {{ _aptg_before.stdout_lines | default([]) | select('match', '^.i. \S+ \S+ \S+$')
+             | map('regex_replace', '^.i. (\S+) (\S+) (\S+)$', '\1:\2 \3') | map('regex_replace', '[{}]', '?') | list }}
+        _aptg_p_a: >-
+          {{ _aptg_after.stdout_lines | default([]) | select('match', '^.i. \S+ \S+ \S+$')
+             | map('regex_replace', '^.i. (\S+) (\S+) (\S+)$', '\1:\2 \3') | map('regex_replace', '[{}]', '?') | list }}
+        _aptg_p_bkeys: "{{ _aptg_p_b | map('split', ' ') | map('first') | list }}"
+        _aptg_p_akeys: "{{ _aptg_p_a | map('split', ' ') | map('first') | list }}"
+        # "<pkg>:<arch> <version>" lines that are gone: removed, or another version now.
+        _aptg_p_lost: "{{ _aptg_p_b | reject('in', _aptg_p_a) | list }}"
+        _aptg_p_changed: "{{ _aptg_p_lost | map('split', ' ') | selectattr(0, 'in', _aptg_p_akeys) | map('join', ' was ') | list }}"
+        _aptg_p_removed: "{{ _aptg_p_lost | map('split', ' ') | rejectattr(0, 'in', _aptg_p_akeys) | map('first') | list }}"
+        # Package names (without :arch) that are new.
+        _aptg_p_added: >-
+          {{ _aptg_p_a | map('split', ' ') | rejectattr(0, 'in', _aptg_p_bkeys) | map('first')
+             | map('regex_replace', ':[^:]*$', '') | unique | list }}
+
+    - name: "Packages: needrestart was held back"
+      when: _aptg_todo | length > 0
+      ansible.builtin.debug:
+        msg: >-
+          [N-P2] NOTE: installed on {{ inventory_hostname }} for {{ _aptg_who | default('auto_sec') }}:
+          {{ _aptg_todo | join(' ') }}{{ (' (+ ' ~ (_aptg_deps | join(' ')) ~ ')') if (_aptg_deps | length > 0) else '' }}.
+          needrestart was held back. Services that already used replaced libraries before this run are
+          restarted by needrestart at the next package install or nightly update on {{ inventory_hostname }},
+          as they would have been without auto_sec. "needrestart -r l" lists them.

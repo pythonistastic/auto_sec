@@ -1,7 +1,41 @@
 ---
-# Global defaults. Override per client in host_vars/<client>.yml
+# Global defaults. Override per server in host_vars/<server>.yml.
+#
+# Every server needs ONE line in its host_vars. It has no default: the run
+# stops until it is set.
+#   autosec_server: existing   a server that already runs something.
+#                              auto_sec changes nothing unless you name it.
+#   autosec_server: new        a brand-new server. auto_sec turns on ufw,
+#                              fail2ban and automatic updates, and creates
+#                              the admin account.
+# The settings marked "follows autosec_server" below take their default
+# from it. Set them in host_vars to choose yourself.
+
+# --- The run plan ---------------------------------------------------------
+# Every run prints a plan before it changes anything: one line per role,
+# the totals and a plan id.
+# true: a run that would change this server needs your OK, given as
+# -e autosec_approve=<plan id>. A run that changes nothing needs none.
+autosec_require_approval: false
+# One-off switch: pass with -e on one run, never in host_vars. true prints
+# the plan and stops before anything changes.
+autosec_plan_only: false
+# Also -e only: autosec_confirm_hosts=<n> lets a run over n hosts go without
+# -l; autosec_serial=<n> runs n hosts at a time (default 1).
 
 deploy_user: "deploy"
+
+# --- The admin account (role 01) ------------------------------------------
+#   keep:   auto_sec creates no account and writes no sudo rule.
+#   create: create deploy_user if it does not exist (home, shell /bin/bash,
+#           password locked: key login only, no extra groups), and give it
+#           passwordless sudo in auto_sec's own /etc/sudoers.d/<deploy_user>.
+#           The run stops if that file is yours, or if your sudo rules
+#           already name the account or one of its groups.
+# An existing account is never changed (shell, groups, home, password).
+# Follows autosec_server: create with new when deploy_user is also
+# ssh_admin_user (and not root), else keep.
+deploy_user_account: "{{ 'create' if ((autosec_server | default('') | string) == 'new' and (ssh_admin_user | default(deploy_user)) == deploy_user and deploy_user != 'root') else 'keep' }}"
 
 # --- Updates, reboots, hostname, timezone (role 01) -----------------------
 # auto_sec writes at most one apt file,
@@ -12,7 +46,8 @@ deploy_user: "deploy"
 # set up by auto_sec 0.1-0.4 it puts the distro's 50unattended-upgrades
 # back once). Your own 52unattended-upgrades-local is read after auto_sec's
 # file and wins; the run stops if it would cancel a choice made here.
-# keep = leave it as the server has it.
+# keep = leave it as the server has it. auto_sec 0.6 writes no kernel
+# settings (the lines 0.1-0.5 put in /etc/sysctl.conf are yours now).
 
 # Hostname: keep, or a lowercase hostname/FQDN (at most 64 characters).
 # Nothing in auto_sec needs it: reports, alerts and backups use the
@@ -37,7 +72,8 @@ timezone: keep
 #   keep: leave them as they are (auto_sec does not even install
 #         unattended-upgrades)
 # auto_sec never turns them off ("false" is refused).
-unattended_upgrades_enabled: auto
+# Follows autosec_server: auto with new, keep with existing.
+unattended_upgrades_enabled: "{{ 'auto' if (autosec_server | default('') | string) == 'new' else 'keep' }}"
 
 # Automatic reboot after an update that needs one (a new kernel):
 #   keep:  auto_sec does not touch it (off unless you or the distro turned
@@ -69,10 +105,10 @@ unattended_upgrade_blacklist: []
 
 # One-off switch: pass with -e on one run, never in host_vars. true runs
 # `apt-get dist-upgrade` (all waiting updates; it can restart services and
-# a new kernel needs a reboot). Without it, role 01 only installs missing
-# packages, without their recommendations, and stops if that would
-# upgrade or remove an installed package; the nightly automatic updates do
-# the rest.
+# a new kernel needs a reboot). Without it, auto_sec only installs the
+# packages a feature you chose needs, without their recommendations, and
+# stops if that would upgrade or remove an installed package; the nightly
+# automatic updates do the rest.
 apt_full_upgrade: false
 
 # One-off switch: pass with -e on one run, never in host_vars. On a server
@@ -89,8 +125,8 @@ apt_migrate_unattended_upgrades: false
 # QUOTED: an unquoted no becomes false and the preflight stops with
 # "quote it", e.g. "no".
 
-# The port sshd ALREADY listens on. auto_sec checks it and opens it in ufw,
-# but never moves sshd. To move the port, follow docs/ssh-port.md.
+# The port sshd ALREADY listens on. auto_sec checks it, but never moves
+# sshd. To move the port, follow docs/ssh-port.md.
 ssh_port: 22
 
 # false: role 02 writes nothing. The read-only SSH checks still run.
@@ -99,6 +135,8 @@ ssh_hardening_enabled: true
 # The account you and Ansible log in as. Its keys are added and tested on
 # a fresh connection. Stricter login rules are applied only on a run where
 # Ansible really is logged in as this user (set ansible_user to match).
+# If it is not root, it must exist, or deploy_user_account: create must
+# create it (then it must be deploy_user).
 ssh_admin_user: "{{ deploy_user }}"
 
 # Public key lines for ssh_admin_user ("ssh-ed25519 AAAA... comment", no
@@ -132,28 +170,84 @@ ssh_extra_settings: {}
 ssh_migrate_sshd_config: false
 ssh_accept_unrequested_changes: false
 
-# At most this many hosts get an SSH change in one run; use -l for more.
+# At most this many hosts get an SSH change in one batch. Hosts run one at
+# a time (autosec_serial), so this matters only with -e autosec_serial > 1.
 # The undo window (ssh_revert_seconds, default 300) is a role 02 default.
 ssh_max_hosts_per_run: 5
 
-# Your office/home static IP kept as break-glass direct SSH access, and
-# never banned by fail2ban. Must be YOUR address, not the server's.
-# Set to empty string to disable.
+# Your office/home static IP (break-glass). auto_sec uses it only where it
+# writes: in ignoreip of its fail2ban file (fail2ban_hardening_enabled:
+# true), and, when this run turns ufw on, in a rule above every other that
+# lets it reach SSH without the rate limit. With keep, or on a ufw that is
+# already on, add it to your own jail.local and ufw rules. Must be YOUR
+# address, not the server's. Set to empty string to disable.
 office_static_ip: ""
 
 # More fixed IPs/CIDRs fail2ban must never ban, e.g.
 # ["203.0.113.7", "198.51.100.0/24"]. Together with office_static_ip they
-# go to ignoreip in [DEFAULT] of jail.d/00-autosec.conf. An ignoreip of
-# your own (jail.local) replaces that list; the run warns when one of
-# these addresses is then missing.
+# go to ignoreip in [DEFAULT] of jail.d/00-autosec.conf (only with
+# fail2ban_hardening_enabled: true). An ignoreip of your own (jail.local)
+# replaces that list; the run warns when one of these addresses is then
+# missing.
 fail2ban_ignore_ips: []
+
+# --- Firewall: ufw (role 03) ----------------------------------------------
+# auto_sec runs no ufw command on a ufw that is already on: it adds,
+# changes, reorders and restarts nothing there. It turns ufw on only when
+# ufw is off and firewall_state is enabled, after its checks, with an
+# automatic undo, and keeps it on only if a brand-new SSH login works.
+#   keep:    leave ufw as it is, on or off
+#   enabled: turn an inactive ufw on; installs ufw if it is missing
+# Follows autosec_server: enabled with new, keep with existing.
+firewall_state: "{{ 'enabled' if (autosec_server | default('') | string) == 'new' else 'keep' }}"
+
+# The SSH rule added when this run turns ufw on and no rule of yours lets
+# ssh_port in from every address: limit (rate-limited), allow, or keep
+# (add none: then a rule of yours must let SSH in).
+firewall_ssh_rule: limit
+
+# Ports to let in when this run turns ufw on (at most 64 items). Nothing
+# else is let in: 80 and 443 are no longer opened by default.
+#   - { port: 443 }                          # tcp from anywhere (allow)
+#   - { port: 51820, proto: udp }
+#   - { port: "6000:6010", proto: tcp }       # a range needs proto
+#   - { port: 5432, from: "203.0.113.0/24" }  # one address or network
+#   - { port: 25, rule: limit }               # allow (default) or limit
+# On a ufw that is already on, nothing is added: the run prints the
+# `sudo ufw ...` line for each item it does not find.
+firewall_inbound: []
+
+# Ports that listen now and may close when this run turns ufw on, e.g.
+# ["3000/tcp"]. A listening port that is neither here nor let in stops
+# the turn-on.
+firewall_closed_ok: []
+
+# Seconds the automatic undo waits for the brand-new SSH login after ufw
+# is turned on (120-3600).
+firewall_revert_seconds: 300
+
+# Outgoing traffic.
+#   false: leave the outgoing policy as it is (0.1-0.5 set it to allow).
+#   true:  when this run turns ufw on, allow out only DNS, NTP, HTTP and
+#          HTTPS (plus egress_allow_extra) and deny the rest. On a ufw that
+#          is already on, auto_sec changes nothing; the run stops and prints
+#          the commands if outgoing traffic is still allowed there.
+# It can break apps that call outside services on other ports.
+egress_lockdown: false
+# Extra outbound ports for egress_lockdown, e.g.
+#   - { port: 587, proto: tcp }   # SMTP submission
+egress_allow_extra: []
 
 # --- fail2ban (role 03) ---------------------------------------------------
 # auto_sec writes only /etc/fail2ban/jail.d/00-autosec.conf, never
 # jail.local. fail2ban reads it first, so any value YOUR files set wins.
 # fail2ban is reloaded only when its effective config changes.
-# false: role 03 does not install or configure fail2ban (ufw still runs).
-fail2ban_hardening_enabled: true
+#   keep: leave fail2ban alone: no install, no file, no reload. "false"
+#         means the same.
+#   true: install fail2ban if missing (it then starts and bans), write
+#         00-autosec.conf, reload only on an effective change.
+# Follows autosec_server: true with new, keep with existing.
+fail2ban_hardening_enabled: "{{ 'true' if (autosec_server | default('') | string) == 'new' else 'keep' }}"
 
 # fail2ban [DEFAULT] values. They apply to every jail that sets none of its
 # own; if one would change a jail of yours, the run stops and names it.
@@ -176,8 +270,9 @@ fail2ban_migrate_jail_local: false
 # never adds nginx jails, so a host without nginx gets none.
 fail2ban_nginx_jails: true
 
-# Paranoia: standard | high. high adds fwknop (Single Packet Authorization).
-# In 0.4.0 SSH stays visible (rate-limited) in high mode too; hiding SSH
+# Paranoia: standard | high. high adds fwknop (Single Packet Authorization)
+# and then needs fwknop_pcap_intf (the interface fwknopd listens on, e.g.
+# "eth0"). SSH stays visible (rate-limited) in both modes; hiding SSH
 # behind fwknop returns in a later release.
 paranoia_level: "standard"
 
@@ -188,74 +283,43 @@ backup_retention_daily: 7
 backup_retention_weekly: 4
 backup_retention_monthly: 6
 
-# Alerts (Telegram bot)
+# Alerts (Telegram bot): backup status and the CVE watch.
 telegram_bot_token: "CHANGE_ME"
 telegram_chat_id: "CHANGE_ME"
 
-# Application directory the detectors watch (ransomware canary etc.).
-# Safe default so core hardening + detection work without an app deployed.
+# Your app's folder on the server. The CVE watch scans it for lockfiles
+# (it must exist when cve_watch_enabled is true, unless layer 05 creates
+# it in the same run); roles 05 and 07 use it.
 app_dir: "/opt/app"
 
-# Watcher
-watcher_mode: "alert"        # alert | active
-watcher_window_seconds: 60
-# Secret command a valid interactive login must run within the window
-# (only used when ssh_pattern_watcher_enabled is true). Defaulted here so
-# a minimal/declarative host_vars never fails late, after SSH is already
-# locked down. Override per host and keep it secret if you enable the
-# login watcher.
-watcher_pattern: "cd /opt/app"
-# Extra trusted source IPs/CIDRs that never trigger the watcher
-# (office_static_ip is always included automatically).
-watcher_whitelist_ips: []
-# Sessions without a TTY (scp, rsync, ansible, git) are skipped.
-watcher_skip_non_interactive: true
-
-# Detection suite (all default to alert mode via watcher_mode)
-# Reverse-shell / unexpected-shell scanner (watches the process table).
-revshell_enabled: true
-# Recon-burst detector (watches auditd for enumeration bursts). This is
-# the robust, vector-independent detector - it catches an intruder
-# "looking around" however they got in.
-recon_enabled: true
-# SSH login-pattern watcher (the "tripwire second factor"). EXPERIMENTAL
-# and OFF by default: reacting to a login and then inspecting the session
-# is racy under concurrent same-IP logins (it can misattribute a session
-# and false-positive on automation). Enable only if you understand this
-# and whitelist your automation/ops IPs via watcher_whitelist_ips. The
-# recon and reverse-shell detectors cover the real breach cases.
-ssh_pattern_watcher_enabled: false
-
-# Egress lockdown: default-deny OUTBOUND traffic, allowing only
-# DNS/NTP/HTTP/HTTPS plus egress_allow_extra. Stops arbitrary-high-port
-# reverse shells. Off by default because it can break apps that call
-# external services on non-standard ports. 443-tunnelled C2 still needs
-# the detection layers.
-egress_lockdown: false
-# Extra outbound ports to permit when egress_lockdown is on, e.g.
-#   - { port: 587, proto: tcp }   # SMTP submission
-egress_allow_extra: []
+# Detection (roles 08 and 09) is not managed in 0.6: the 0.1-0.5 detectors
+# did not work as documented (issue #18). auto_sec installs nothing there
+# and warns when old detectors are still on a server. Their variables
+# (watcher_*, revshell_*, recon_*, ssh_pattern_watcher_enabled) do nothing
+# in 0.6; the run lists them when they are set. Detection returns,
+# rewritten, in 0.7.
 
 # --- CVE watch (role 11) -------------------------------------------------
-# Daily scan of the app's dependency lockfiles against OSV.dev, plus a
-# count of unapplied OS security updates. Alerts with the exact fix.
-# Detection only: it never upgrades anything by itself, because the
-# source of truth for app dependencies is your git repo - patch there,
-# or the next deploy silently reverts the fix. See scripts/cve-pr.sh
-# (Tier 2) to turn findings into a pull request.
-cve_watch_enabled: true
+# Off by default. When on, it adds a daily root timer that reads the
+# lockfiles in app_dir and sends the names and versions of those packages
+# to api.osv.dev, plus a count of unapplied OS security updates. Alerts
+# with the exact fix. It never upgrades anything by itself, because the
+# source of truth for app dependencies is your git repo. See
+# scripts/cve-pr.sh to turn findings into a pull request.
+cve_watch_enabled: false
 # low | moderate | high | critical. Starts at 'high' deliberately: a
 # first scan of a real app can surface dozens of findings, and an alert
 # channel nobody reads is worse than no alert. Lower it after triage.
 cve_watch_min_severity: "high"
 cve_watch_include_dev: false     # dev-only deps are not shipped
 cve_watch_include_os: true       # also count pending OS security updates
-cve_watch_scan_on_deploy: true   # one scan right after hardening
+cve_watch_scan_on_deploy: true   # one scan right after setup
 cve_watch_max_alert_items: 10    # per alert; full list always on disk
 cve_watch_hour: 6                # daily, local time, +random <1h
 
 # Let's Encrypt registration email for certbot
 letsencrypt_email: "CHANGE_ME@example.com"
 
-# Name that appears on the generated security report
+# Name that appears on the generated security report ("Your Company" is
+# left out of the report).
 report_prepared_by: "Your Company"

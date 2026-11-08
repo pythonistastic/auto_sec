@@ -1,0 +1,25 @@
+# Pinned ufw packages for tests/ufw/semantics/run.sh.
+#
+# Format (whitespace separated, one file per line):
+#   <set> <pool file name> <sha256> <url> [<fallback url>...]
+# run.sh tries the URLs in order and uses a file only if its SHA256 matches.
+# The first URL is the official archive pool; the second is the official
+# snapshot service, which keeps the exact file after the archive drops a
+# superseded version.
+#
+# noble: the SHA256 of the file `apt-get download ufw` fetched on Ubuntu
+# 24.04 (apt checks it against the signed archive index). jammy, bookworm
+# and trixie: the SHA256 of the file downloaded from the official pool;
+# not yet checked against the signed index (UNVERIFIED provenance).
+
+# Ubuntu 24.04 noble, ufw 0.36.2-6 (noble main)
+noble ufw_0.36.2-6_all.deb 096eb403ecaf6740d160bb306970f025222ef71324319cc1cb78d06dfa462ef1 https://archive.ubuntu.com/ubuntu/pool/main/u/ufw/ufw_0.36.2-6_all.deb https://snapshot.ubuntu.com/ubuntu/20261014T200000Z/pool/main/u/ufw/ufw_0.36.2-6_all.deb
+
+# Ubuntu 22.04 jammy, ufw 0.36.1 (jammy-updates main)
+jammy ufw_0.36.1-4ubuntu0.1_all.deb 24d8307789d20fe5220f1fccbefa37a6f3d72403229dead6a5d9e71a8e828ad4 https://archive.ubuntu.com/ubuntu/pool/main/u/ufw/ufw_0.36.1-4ubuntu0.1_all.deb https://snapshot.ubuntu.com/ubuntu/20261014T200000Z/pool/main/u/ufw/ufw_0.36.1-4ubuntu0.1_all.deb
+
+# Debian 12 bookworm, ufw 0.36.2 (bookworm main)
+bookworm ufw_0.36.2-1_all.deb 8c49b7e010b046717eb9a910d14ba2185bc1342be7a2201dd63bfb536676426c https://deb.debian.org/debian/pool/main/u/ufw/ufw_0.36.2-1_all.deb https://snapshot.debian.org/archive/debian/20260601T000000Z/pool/main/u/ufw/ufw_0.36.2-1_all.deb
+
+# Debian 13 trixie, ufw 0.36.2 (trixie main)
+trixie ufw_0.36.2-9_all.deb 7017dd1b5fd5a1755bc0095ef464281de72a07ab15f4bda3b9181ca371892026 https://deb.debian.org/debian/pool/main/u/ufw/ufw_0.36.2-9_all.deb https://snapshot.debian.org/archive/debian/20260601T000000Z/pool/main/u/ufw/ufw_0.36.2-9_all.deb

@@ -1,0 +1,135 @@
+---
+# roles/01-base/tasks/account.yml - preflight B2, B3 and B5b: the account
+# deploy_user, auto_sec's sudo file, sudo's own configuration, and the
+# packages role 01 wants. Read-only (check_mode false), so it also runs in
+# --check; it writes only the rendered sudo file below /run/auto-sec and
+# removes it again. Imported by preflight.yml only when role 01 runs; the
+# tests (tests/base/semantics) run it against lab trees.
+#
+# Sets _base_user_exists, _base_user_shell, _base_user_plan (keep | exists |
+# create), _base_sudo_write, _base_pkg_want, _base_pkgs_missing,
+# _base_sudo_installed and _base_sudo_pf (sudo.yml's reads, compared again
+# in main step 6b). Refuses with R01-A2 to R01-A5 (sudo_check.yml), only
+# with deploy_user_account: create.
+
+- name: "Base B2: the account deploy_user"
+  ansible.builtin.command:
+    argv: [getent, passwd, "{{ deploy_user }}"]
+  register: _base_pf_user
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Base B2, B3: account, sudo file and packages"
+  block:
+    - name: "Base B2: auto_sec's sudo file"
+      ansible.builtin.import_tasks: sudo.yml
+      vars:
+        _base_sudo_scan: false
+
+    - name: "Base B3: scratch folder, root only"
+      when: _base_account_mode == 'create' and _base_sudo_now.state in ['absent', 'ours']
+      ansible.builtin.file:
+        path: "{{ _base_run_dir }}"
+        state: directory
+        mode: "0700"
+      changed_when: false
+      check_mode: false
+      diff: false
+
+    # Operator values and constants only (templates/sudoers-autosec.j2).
+    - name: "Base B3: render auto_sec's sudo file as this run would write it"
+      when: _base_account_mode == 'create' and _base_sudo_now.state in ['absent', 'ours']
+      ansible.builtin.template:
+        src: sudoers-autosec.j2
+        dest: "{{ _base_sudo_candidate }}"
+        mode: "0600"
+      changed_when: false
+      check_mode: false
+      diff: false
+
+    - name: "Base B3: its checksum"
+      when: _base_account_mode == 'create' and _base_sudo_now.state in ['absent', 'ours']
+      ansible.builtin.stat:
+        path: "{{ _base_sudo_candidate }}"
+        checksum_algorithm: sha256
+      register: _base_pf_scand
+
+    # The sudo rule is written only for create, and only into a file that is
+    # absent or auto_sec's own with other content. 0.1-0.5's exact file
+    # already gives the same rule and stays.
+    - name: "Base B3: account and sudo plan"
+      ansible.builtin.set_fact:
+        _base_user_exists: "{{ _base_pf_user.rc == 0 }}"
+        _base_user_shell: "{{ _base_u_shell if (_base_u_shell is match(_base_shell_re)) else '' }}"
+        _base_user_plan: >-
+          {{ 'keep' if _base_account_mode != 'create' else ('exists' if _base_pf_user.rc == 0 else 'create') }}
+        _base_sudo_write: >-
+          {{ _base_account_mode == 'create'
+             and (_base_sudo_now.state == 'absent'
+                  or (_base_sudo_now.state == 'ours' and (_base_pf_scand.stat.checksum | default('-')) != _base_sudo_now.sha256)) }}
+      vars:
+        _base_u_shell: "{{ ((_base_pf_user.stdout | default('')).split(':') + ['', '', '', '', '', '', ''])[6] | trim }}"
+
+    - name: "Base B5b: the packages role 01 wants"
+      ansible.builtin.set_fact:
+        _base_pkg_want: >-
+          {{ (['unattended-upgrades'] if (_base_uu_install | bool) else [])
+             + (['sudo'] if (_base_sudo_write | bool) else []) }}
+
+    - name: "Base B5b: which of them are installed"
+      ansible.builtin.import_role:
+        name: autosec-apt
+        tasks_from: status
+      vars:
+        _aptg_want: "{{ _base_pkg_want }}"
+
+    - name: "Base B5b: remember them"
+      ansible.builtin.set_fact:
+        _base_pkgs_missing: "{{ _aptg_missing }}"
+        _base_sudo_installed: "{{ 'sudo' in _aptg_have }}"
+
+    # Without sudo there is no configuration to read yet: main step 1
+    # installs sudo and then runs these checks first.
+    - name: "Base B3: sudo's configuration"
+      when: (_base_sudo_write | bool) and (_base_sudo_installed | bool)
+      ansible.builtin.import_tasks: sudo.yml
+      vars:
+        _base_sudo_scan: true
+
+    - name: "Base B3: visudo checks auto_sec's sudo file"
+      when: (_base_sudo_write | bool) and (_base_sudo_installed | bool)
+      ansible.builtin.command:
+        argv: [visudo, -c, -q, -f, "{{ _base_sudo_candidate }}"]
+      register: _base_pf_scand_ok
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Base B3: visudo accepts auto_sec's sudo file (an auto_sec bug otherwise)"
+      when: (_base_sudo_write | bool) and (_base_sudo_installed | bool)
+      ansible.builtin.assert:
+        quiet: true
+        that: _base_pf_scand_ok.rc == 0
+        fail_msg: >-
+          auto_sec's sudo file for {{ deploy_user }} does not pass visudo -c on {{ inventory_hostname }}.
+          This is an auto_sec bug; please report it. Nothing has been changed.
+
+    - name: "Base B3: refusals"
+      when: _base_account_mode == 'create'
+      ansible.builtin.import_tasks: sudo_check.yml
+      vars:
+        _base_sudo_end: Nothing has been changed.
+
+    - name: "Base B3: remember the sudo reads for main"
+      ansible.builtin.set_fact:
+        _base_sudo_pf: "{{ _base_sudo_now }}"
+
+  always:
+    - name: "Base B3: remove the rendered sudo file"
+      ansible.builtin.file:
+        path: "{{ _base_sudo_candidate }}"
+        state: absent
+      changed_when: false
+      check_mode: false
+      diff: false

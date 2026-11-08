@@ -1,0 +1,127 @@
+---
+# roles/05-app-runtime/tasks/plan.yml - role 05's read-only plan (app_type set).
+#
+# site.yml includes this in pre_tasks (tags always) when layer 05 is on.
+# Layer 05 sets up a NEW web server: it removes nginx's default site, edits
+# nginx.conf and runs NodeSource's or Docker's install script. So it runs
+# only on a fresh host, or on one where auto_sec set nginx up:
+#
+#   R05-1  nginx was installed before this run, and the vhost for
+#          client_domain is not auto_sec's (no auto_sec header)
+#   R05-2  app_type docker adds deploy_user to the docker group, but
+#          deploy_user does not exist and this run does not create it
+#   R05-3  an account "app" exists that is not a system account without
+#          login (layer 05 never changes an existing account)
+#   R05-4  app_dir exists and does not belong to app (layer 05 would give
+#          it to app)
+#
+# The NodeSource and get.docker.com scripts cannot be simulated; the plan
+# says so. Sets _plan_05 and the _l05_* facts main.yml uses. Host values
+# (uid, shell, owner) are only compared and shown, after a pattern check.
+
+- name: "App plan: nginx, the auto_sec vhost, the accounts and app_dir (read-only)"
+  ansible.builtin.command:
+    argv: "{{ ['sh', '-c', _l05_read_sh, 'sh', _l05_header, '/etc/nginx/sites-available/' ~ client_domain, deploy_user, app_dir] }}"
+  environment:
+    LC_ALL: C
+  register: _l05_read
+  changed_when: false
+  check_mode: false
+
+- name: "App plan: remember what is there"
+  ansible.builtin.set_fact:
+    _l05_now: >-
+      {%- set out = {} -%}
+      {%- for ln in _l05_read.stdout_lines | select('match', '^(nginx|vhost|user|node|docker|pm2|app|appdir) ') -%}
+      {%- set f = ln.split(' ', 1) -%}
+      {%- set _ = out.update({f[0]: (f[1] if f | length > 1 else '')}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: "App plan R05-1: layer 05 sets up nginx only on a fresh host"
+  ansible.builtin.assert:
+    quiet: true
+    that: (_l05_now.nginx | default('none')) is not match('^.i') or _l05_now.vhost == 'ours'
+    fail_msg: >-
+      Layer 05 sets up a new web server; nginx is already installed on {{ inventory_hostname }}
+      and its config is yours (no auto_sec vhost for {{ client_domain }}). Remove app_type to
+      skip layer 05. (If auto_sec 0.1-0.5 set this nginx up, put this line first in
+      /etc/nginx/sites-available/{{ client_domain }}: {{ _l05_header }})
+      Nothing has been changed.
+
+- name: "App plan R05-2: the docker group needs an existing deploy_user"
+  when: app_type == 'docker'
+  ansible.builtin.assert:
+    quiet: true
+    that: _l05_now.user == 'present' or _l05_user_created
+    fail_msg: >-
+      app_type is docker, so layer 05 adds {{ deploy_user }} to the docker group, but
+      {{ deploy_user }} does not exist on {{ inventory_hostname }} and this run does not create
+      it. Layer 05 no longer creates accounts. Set deploy_user_account: create (role 01), or
+      remove app_type to skip layer 05. Nothing has been changed.
+  vars:
+    _l05_user_created: >-
+      {{ (deploy_user_account | default('keep') | string) == 'create'
+         and (('all' in ansible_run_tags) or ('tagged' in ansible_run_tags) or ('base' in ansible_run_tags))
+         and ('base' not in ansible_skip_tags) }}
+
+- name: "App plan R05-3: an existing account app must be a system account without login"
+  ansible.builtin.assert:
+    quiet: true
+    that: _l05_app == 'absent' or (_l05_app_uid | int < 1000 and _l05_app_shell in _l05_nologin_shells)
+    fail_msg: >-
+      [R05-3] An account named app already exists on {{ inventory_hostname }}
+      ({{ ('uid ' ~ _l05_app_uid ~ ', shell ' ~ _l05_app_shell) if _l05_app is match(_l05_app_re) else 'unusual entry' }}),
+      and it is not a system account without login. Layer 05 runs the app as the system user app
+      and never changes an existing account. Remove app_type to skip layer 05. Nothing has been
+      changed.
+  vars:
+    _l05_app: "{{ _l05_now.app | default('absent') }}"
+    _l05_app_uid: "{{ (_l05_app.split(' ')[0]) if _l05_app is match(_l05_app_re) else '99999' }}"
+    _l05_app_shell: "{{ (_l05_app.split(' ')[1]) if _l05_app is match(_l05_app_re) else '?' }}"
+
+- name: "App plan R05-4: an existing app_dir must belong to app"
+  ansible.builtin.assert:
+    quiet: true
+    that: _l05_dir == 'absent' or _l05_dir is match('^dir app:')
+    fail_msg: >-
+      [R05-4] app_dir {{ app_dir }} already exists on {{ inventory_hostname }}
+      ({{ ('a folder owned by ' ~ _l05_dir[4:]) if _l05_dir is match('^dir [a-z_][a-z0-9_-]{0,31}:[a-z_][a-z0-9_-]{0,31}$')
+          else 'not a plain folder, or an unusual owner' }}). Layer 05 would give it to the app user. Point
+      app_dir at a folder that does not exist yet (layer 05 creates it), or remove app_type to skip
+      layer 05. Nothing has been changed.
+  vars:
+    _l05_dir: "{{ _l05_now.appdir | default('other') }}"
+
+- name: "App plan: plan lines"
+  ansible.builtin.set_fact:
+    _l05_planned: true
+    _l05_plan_snapshot: "{{ _l05_now }}"
+    _l05_pkg_want: [nginx, certbot, python3-certbot-nginx]
+    _plan_05: >-
+      {{ ([] if ((_l05_now.nginx | default('none')) is match('^.i')) else
+          [{'role': '05', 'part': 'app', 'do': 'install', 'what': 'nginx certbot python3-certbot-nginx', 'note': ''}])
+         + ([{'role': '05', 'part': 'app', 'do': 'user', 'what': 'create system user app (no login shell)', 'note': ''}]
+            if (_l05_now.app | default('absent')) == 'absent' else [])
+         + ([{'role': '05', 'part': 'app', 'do': 'write', 'what': 'create ' ~ app_dir ~ ' (owner app, mode 0750)', 'note': ''}]
+            if (_l05_now.appdir | default('absent')) == 'absent' else [])
+         + ([{'role': '05', 'part': 'app', 'do': 'install', 'what': 'Node.js ' ~ (node_version | default('') | string) ~ ' from NodeSource (its script; not simulated) and pm2', 'note': ''}]
+            if (app_type == 'node' and _l05_now.node == 'absent') else [])
+         + ([{'role': '05', 'part': 'app', 'do': 'install', 'what': 'pm2 (npm install -g; not simulated)', 'note': ''}]
+            if (app_type == 'node' and _l05_now.node == 'present' and (_l05_now.pm2 | default('absent')) == 'absent') else [])
+         + ([{'role': '05', 'part': 'app', 'do': 'install', 'what': 'Docker from get.docker.com (its script; not simulated)', 'note': ''}]
+            if (app_type == 'docker' and _l05_now.docker == 'absent') else [])
+         + ([{'role': '05', 'part': 'app', 'do': 'user', 'what': 'adds ' ~ deploy_user ~ ' to group docker (root-equivalent)', 'note': ''}]
+            if app_type == 'docker' else [])
+         + [{'role': '05', 'part': 'app', 'do': 'write', 'what': 'nginx vhost ' ~ client_domain ~ ', removes the default site, server_tokens off in nginx.conf', 'note': ''},
+            {'role': '05', 'part': 'app', 'do': 'reload', 'what': 'nginx (when its config changes)', 'note': ''},
+            {'role': '05', 'part': 'app', 'do': 'network-call', 'what': 'certbot: TLS certificate for ' ~ client_domain ~ ' (once)', 'note': ''}]
+         + ([{'role': '05', 'part': 'fail2ban', 'do': 'write',
+              'what': (_f2b_nginx_dropin | default('/etc/fail2ban/jail.d/00-autosec-nginx.conf')) ~ ' (jails nginx-http-auth, nginx-botsearch)',
+              'note': 'only once nginx and fail2ban are installed'},
+             {'role': '05', 'part': 'fail2ban', 'do': 'reload', 'what': 'fail2ban (when the nginx jails change)', 'note': ''}]
+            if (_l05_f2b_jails | bool) else []) }}
+  vars:
+    _l05_f2b_jails: >-
+      {{ (_f2b_enabled | default(false) | bool) and (fail2ban_nginx_jails | default(true) | bool)
+         and ('fail2ban' not in ansible_skip_tags) }}

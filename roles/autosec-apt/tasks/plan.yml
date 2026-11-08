@@ -1,0 +1,188 @@
+---
+# roles/autosec-apt/tasks/plan.yml - what installing the wanted packages
+# would do, and the refusals. Read-only: dpkg-query, `apt-get -s` and
+# systemctl reads, so it also runs in --check. Used twice:
+#   preflight (_aptg_ctx: preflight): tasks/preflight.yml, once for the
+#     union of every role's wants, before any role changes the server;
+#   main (_aptg_ctx: main): tasks/install.yml, right before the install,
+#     after `apt-get update`.
+#
+# Installing a package can also upgrade packages you have (it may need an
+# exact newer version of a library, e.g. libc6) or remove one (a conflict),
+# and on a production server that restarts services. apt's own simulation
+# shows both, as "Inst <pkg> [<installed>]" and "Remv" lines. The run stops
+# on them (P2), unless the source allows it (role 01's apt_full_upgrade).
+#
+# Inputs:
+#   _aptg_req             list of {who, pkgs[, off]}: who wants which packages
+#   _aptg_ctx             preflight | main
+#   _aptg_allow_changes   bool: upgrades and removals are allowed
+#   _aptg_check_units     bool: check pending unit edits even when nothing is
+#                         missing (the full upgrade)
+# Outputs (plus those of status.yml):
+#   _aptg_side     "<pkg> <installed> -> <new>", "remove <pkg> <installed>"
+#   _aptg_new      every package apt would newly install (wanted ones too)
+#   _aptg_deps     _aptg_new without the wanted ones: new dependencies
+#   _aptg_units    units with edits systemd has not loaded yet
+#   _aptg_by_who   [[who, [missing packages]], ...], only who misses some
+#
+# Host output is untrusted: names are shown only if they match a strict
+# pattern, and "{" and "}" become "?" in every message.
+
+- name: "Packages: what is installed"
+  ansible.builtin.import_tasks: status.yml
+  vars:
+    _aptg_want: "{{ _aptg_req | default([]) | map(attribute='pkgs') | flatten | unique | list }}"
+
+- name: "Packages: start values"
+  ansible.builtin.set_fact:
+    _aptg_side: []
+    _aptg_new: []
+    _aptg_deps: []
+    _aptg_units: []
+    _aptg_by_who: >-
+      {{ _aptg_req | default([]) | map(attribute='who')
+         | zip(_aptg_req | default([]) | map(attribute='pkgs') | map('select', 'in', _aptg_missing) | map('list'))
+         | selectattr(1) | list }}
+
+# dpkg state "rc": you removed the package and kept its configuration.
+# auto_sec does not bring it back; the feature that wants it must be off.
+- name: "Packages: a package you removed is not installed again (P1)"
+  ansible.builtin.assert:
+    quiet: true
+    that: _aptg_removed | length == 0
+    fail_msg: >-
+      [P1] {{ _aptg_removed | join(', ') }} {{ 'was' if (_aptg_removed | length == 1) else 'were' }} removed
+      on purpose on {{ inventory_hostname }} (dpkg state rc). auto_sec does not reinstall
+      {{ 'it' if (_aptg_removed | length == 1) else 'them' }}.
+      {% for p in _aptg_removed %}{{ p }} is wanted by {{ _aptg_req | default([]) | selectattr('pkgs', 'contains', p)
+      | map(attribute='who') | join(' and ') }}; to turn that off, {{ _aptg_req | default([])
+      | selectattr('pkgs', 'contains', p) | selectattr('off', 'defined') | map(attribute='off')
+      | first | default(_aptg_off_by_pkg[p] | default(_aptg_off_default)) }}. {% endfor %}Or install
+      {{ 'it' if (_aptg_removed | length == 1) else 'them' }} yourself. Nothing has been
+      changed{{ ' (only the package lists were refreshed)' if (_aptg_ctx | default('preflight')) == 'main' else '' }}.
+
+# The package names come from the roles (constants), never from the host.
+- name: "Packages: what apt would do to install the missing ones"
+  when: _aptg_missing | length > 0
+  ansible.builtin.command:
+    argv: "{{ ['apt-get', '-s', '-o', 'Debug::NoLocking=true', '--no-install-recommends', 'install'] + _aptg_missing }}"
+  environment:
+    LC_ALL: C
+  register: _aptg_sim
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Packages: upgrades, removals and new packages the install would cause"
+  when: _aptg_missing | length > 0
+  ansible.builtin.set_fact:
+    _aptg_side: >-
+      {{ (_aptg_sim_lines | select('match', '^Inst \S+ \[[^]]*\] \(\S+')
+          | map('regex_replace', '^Inst (\S+) \[([^]]*)\] \((\S+).*$', '\1 \2 -> \3') | list)
+         + (_aptg_sim_lines | select('match', '^Remv \S+')
+            | map('regex_replace', '^Remv (\S+)( \[([^]]*)\])?.*$', 'remove \1 \3') | map('trim') | list) }}
+    _aptg_new: "{{ _aptg_new_l }}"
+    _aptg_deps: "{{ _aptg_new_l | reject('in', _aptg_missing) | list }}"
+  vars:
+    _aptg_sim_lines: "{{ _aptg_sim.stdout_lines | default([]) | map('regex_replace', '[{}]', '?') | list }}"
+    _aptg_new_l: >-
+      {{ _aptg_sim_lines | select('match', '^Inst [a-z0-9][a-z0-9+.-]{1,99}(:[a-z0-9-]+)? \(')
+         | map('regex_replace', '^Inst ([a-z0-9][a-z0-9+.-]{1,99})(:[a-z0-9-]+)? \(.*$', '\1') | unique | list }}
+
+# Before the lists are refreshed, apt may not know a package yet (a new
+# server often has no lists at all): only a note here. install.yml runs
+# `apt-get update` and checks again (--check does not refresh the lists).
+# Any other apt error refuses at once (P5).
+- name: "Packages: apt cannot plan the install with the current lists"
+  when:
+    - _aptg_missing | length > 0
+    - (_aptg_ctx | default('preflight')) == 'preflight'
+    - _aptg_sim.rc != 0
+    - _aptg_err | length > 0
+    - _aptg_err | reject('match', _aptg_nolist_re) | list | length == 0
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: apt cannot plan the install of {{ _aptg_missing | join(', ') }} on {{ inventory_hostname }}
+      with its current package lists ({{ _aptg_err | join(' ') | truncate(300) }}). auto_sec refreshes
+      the lists (apt-get update) and checks again before it installs anything.
+  vars:
+    _aptg_err: >-
+      {{ (_aptg_sim.stderr_lines | default([]) + _aptg_sim.stdout_lines | default([]))
+         | select('match', '^E:') | map('regex_replace', '[{}]', '?') | list }}
+
+- name: "Packages: apt can install them, upgrading or removing nothing you have (P5, P2)"
+  when: _aptg_missing | length > 0
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - >-
+        _aptg_sim.rc == 0
+        or ((_aptg_ctx | default('preflight')) == 'preflight'
+            and _aptg_err | length > 0 and _aptg_err | reject('match', _aptg_nolist_re) | list | length == 0)
+      - _aptg_side | length == 0 or (_aptg_allow_changes | default(false) | bool)
+    fail_msg: >-
+      {% if _aptg_sim.rc != 0 %}[P5] apt cannot install {{ _aptg_missing | join(', ') }} on
+      {{ inventory_hostname }}: {{ _aptg_err | first | default('apt-get exit ' ~ _aptg_sim.rc) | truncate(300) }}.
+      {% else %}[P2] Installing {{ _aptg_missing | join(', ') }} on {{ inventory_hostname }} would also
+      change packages you have: {{ _aptg_side | join('; ') | truncate(800) }}. That can restart services.
+      auto_sec ({{ _aptg_whos | join(', ') }}) installs missing packages only; it upgrades or removes
+      nothing unless you ask. {% if _aptg_up | length > 0 %}Upgrade those packages yourself when it suits you
+      (apt-get install --only-upgrade {{ _aptg_up | join(' ') }}), or install
+      {% else %}Install {% endif %}{{ _aptg_missing | join(' ') }} yourself{{ ', or run once with
+      -e apt_full_upgrade=true' if ('role 01 (base)' in _aptg_whos) else '' }}.
+      {% endif %}Nothing has been changed{{ ' (only the package lists were refreshed)'
+      if (_aptg_ctx | default('preflight')) == 'main' else '' }}.
+  vars:
+    _aptg_err: >-
+      {{ (_aptg_sim.stderr_lines | default([]) + _aptg_sim.stdout_lines | default([]))
+         | select('match', '^E:') | map('regex_replace', '[{}]', '?') | list }}
+    _aptg_up: "{{ _aptg_side | reject('match', '^remove ') | map('split', ' ') | map('first') | list }}"
+    _aptg_whos: "{{ _aptg_by_who | map('first') | list }}"
+
+# A package's scripts run `systemctl daemon-reload` (deb-systemd-helper,
+# dh_installsystemd). That also loads every unit edit you made but did not
+# load yet, and the next restart of that unit then runs the edited one.
+# Every loaded unit is asked: `systemctl show '*'` leaves out the inactive
+# ones (139 of 302 loaded units on systemd 255). auto_sec's own units are
+# left out: role 02 loads its guard unit itself.
+- name: "Packages: units with edits systemd has not loaded yet"
+  when: _aptg_missing | length > 0 or (_aptg_check_units | default(false) | bool)
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - |
+        command -v systemctl >/dev/null 2>&1 || exit 0
+        systemctl list-units --all --no-legend --plain --full 2>/dev/null \
+          | awk '$2 == "loaded" { print $1 }' \
+          | xargs -r -d '\n' systemctl show -p Id,NeedDaemonReload -- 2>/dev/null \
+          | awk 'function flush() { if (nd == "yes" && id != "") print "U " id; id = ""; nd = "" }
+                 /^Id=/ { id = substr($0, 4) }
+                 /^NeedDaemonReload=/ { nd = substr($0, 18) }
+                 /^$/ { flush() }
+                 END { flush() }'
+        exit 0
+  register: _aptg_nd
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Packages: remember those units"
+  when: _aptg_missing | length > 0 or (_aptg_check_units | default(false) | bool)
+  ansible.builtin.set_fact:
+    _aptg_units: >-
+      {{ _aptg_nd.stdout_lines | default([]) | select('match', '^U ') | map('regex_replace', '^U ', '')
+         | select('match', _aptg_unit_re) | reject('match', '^auto-sec-') | unique | list }}
+
+- name: "Packages: no unit edits waiting for a daemon-reload (P4)"
+  ansible.builtin.assert:
+    quiet: true
+    that: _aptg_units | length == 0
+    fail_msg: >-
+      [P4] {{ inventory_hostname }} has unit edits systemd has not loaded yet:
+      {{ _aptg_units | join(', ') | truncate(600) }}. {% if _aptg_missing | length > 0 %}Installing
+      {{ _aptg_missing | join(', ') }}{% else %}The full upgrade (apt_full_upgrade){% endif %} reloads
+      systemd (the package scripts run daemon-reload), which would load them. Check them, run
+      sudo systemctl daemon-reload yourself, then run again. Nothing has been
+      changed{{ ' (only the package lists were refreshed)' if (_aptg_ctx | default('preflight')) == 'main' else '' }}.

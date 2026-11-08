@@ -158,9 +158,9 @@
         quiet: true
         that: _ssh_admin not in _ssh_key_missing_users
         fail_msg: >-
-          ssh_admin_user {{ _ssh_admin }} does not exist on {{ inventory_hostname }}. Role 01
-          creates deploy_user ({{ deploy_user }}) in a full run; create any other
-          ssh_admin_user yourself first. Nothing in sshd has been changed.
+          ssh_admin_user {{ _ssh_admin }} does not exist on {{ inventory_hostname }}. To have
+          role 01 create it, set deploy_user_account: create (with deploy_user: {{ _ssh_admin }});
+          otherwise create it yourself first. Nothing in sshd has been changed.
       vars:
         _ssh_key_missing_users: "{{ _ssh_key_check.results | selectattr('rc', 'equalto', 3) | map(attribute='item') | map('first') | unique | list }}"
 
@@ -171,9 +171,9 @@
         - deploy_user != _ssh_admin
       ansible.builtin.debug:
         msg: >-
-          Note: {{ deploy_user }} does not exist on {{ inventory_hostname }} yet (role 01 creates
-          it in a full run), so its key from deploy_ssh_public_key/ssh_public_key_file is
-          added on a later run.
+          Note: {{ deploy_user }} does not exist on {{ inventory_hostname }}, so its key from
+          deploy_ssh_public_key/ssh_public_key_file waits. Set deploy_user_account: create to
+          have role 01 create the account; the key is then added on that run.
       vars:
         _ssh_key_missing_users: "{{ _ssh_key_check.results | selectattr('rc', 'equalto', 3) | map(attribute='item') | map('first') | unique | list }}"
 

@@ -1,0 +1,55 @@
+---
+# roles/03-firewall/tasks/ufw-plan.yml - role 03's ufw lines of the run plan.
+#
+# Included at the end of ufw-preflight.yml. Sets _plan_03_ufw, a list of
+# {role, part, do, what, note} (the plan contract). "what" is built from
+# your variables and constant names only; host detail goes in "note".
+# An empty list means "no change": the canary's active ufw gets [].
+
+- name: "ufw plan: no ufw change"
+  when: not (_fw_will_turn_on | bool)
+  ansible.builtin.set_fact:
+    _plan_03_ufw: []
+
+- name: "ufw plan: the turn-on"
+  when: _fw_will_turn_on | bool
+  vars:
+    _fw_tight: >-
+      {{ (_fw_turnon.notes | default([]) | selectattr('id', 'equalto', 'N03-W8') | map(attribute='changes') | flatten
+          | map(attribute='key') | list) }}
+    _fw_closing: >-
+      {{ (_fw_turnon.notes | default([]) | selectattr('id', 'equalto', 'N03-W1') | map(attribute='closing') | flatten | list) }}
+    _fw_policy: "{{ (_fw_egress | bool) and _fw_out_policy not in ['DROP', 'REJECT'] }}"
+    _fw_add_items: >-
+      {%- set out = [] -%}
+      {%- for it in _fw_add -%}
+      {%- set _ = out.append({'role': '03', 'part': 'ufw', 'do': 'add-rule', 'what': 'ufw ' ~ (it.argv | join(' ')), 'note': ''}) -%}
+      {%- endfor -%}
+      {{ out }}
+    # The turn-on installs role 02's undo guard (ufw.yml U4). Role 02's own
+    # plan lists the same two files when it changes sshd in this run; then
+    # they are listed once, there.
+    _fw_guard_listed: >-
+      {{ (_ssh_enabled | default(false) | bool) and (_ssh_role_runs | default(false) | bool)
+         and (_ssh_needs_write | default(false) | bool) }}
+    _fw_guard_item: >-
+      {{ [] if (_fw_guard_listed | bool) else
+         [{'role': '03', 'part': 'undo', 'do': 'write',
+           'what': (_ssh_guard_bin | default('/usr/local/sbin/auto-sec-ssh-guard')) ~ ' and /etc/systemd/system/'
+                   ~ (_ssh_guard_unit | default('auto-sec-ssh-guard-boot.service')) ~ ' (the automatic undo)',
+           'note': 'written only where they differ from the files already there'}] }}
+  ansible.builtin.set_fact:
+    _plan_03_ufw: >-
+      {{ ([{'role': '03', 'part': 'ufw', 'do': 'install', 'what': 'ufw', 'note': ''}] if not (_fw_installed | bool) else [])
+         + _fw_add_items
+         + ([{'role': '03', 'part': 'ufw', 'do': 'policy', 'what': 'ufw default deny outgoing', 'note': ''}] if (_fw_policy | bool) else [])
+         + _fw_guard_item
+         + [{'role': '03', 'part': 'ufw', 'do': 'firewall-on',
+             'what': 'ufw --force enable, undone after ' ~ (firewall_revert_seconds | int) ~ ' s unless a brand-new SSH login works',
+             'note': (('closes ' ~ (_fw_closing | join(', ')) ~ '; ') if _fw_closing | length > 0 else '')
+                     ~ (('ufw sets ' ~ (_fw_tight | join(', ')) ~ ' at every start; they stay after an undo until the next reboot')
+                        if _fw_tight | length > 0 else '')}] }}
+    _fw_plan: >-
+      {{ ('install ufw; then checks; then ' if not (_fw_installed | bool) else '') ~ 'turn ufw on'
+         ~ ' (' ~ (_fw_add | length) ~ ' rule(s) to add' ~ (', outgoing deny' if (_fw_policy | bool) else '') ~ ')' }}
+    _fw_report: ufw was off; this run turns it on

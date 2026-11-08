@@ -1,0 +1,63 @@
+---
+# Role 09 (watcher) defaults.
+#
+# auto_sec 0.6 does not manage detection. Role 09 installs nothing and
+# writes nothing. It only looks for the detectors that auto_sec 0.1-0.5
+# installed: tasks/legacy_active.yml stops the run when they are in active
+# mode (R00-3), tasks/legacy.yml warns when they are there (W09-1). The
+# rewritten detection comes in 0.7. Role 09 has no settings in 0.6.
+
+# --- Role-internal constants. These are not settings: do not override. ---
+
+# What auto_sec 0.1-0.5 installed (roles 08 and 09 of those releases).
+_l09_watcher_dir: /opt/watcher
+_l09_watcher_conf: "{{ _l09_watcher_dir }}/watcher.conf"
+_l09_detect_dir: /opt/detect
+_l09_unit_dir: /etc/systemd/system
+_l09_units:
+  - login-watcher.service
+  - recon-watch.service
+  - revshell-scan.service
+  - ransomware-canary.service
+# Root's crontab, and the line Ansible's cron module put above the
+# 5-minute audit scan.
+_l09_crontab: /var/spool/cron/crontabs/root
+_l09_cron_marker: "#Ansible: audit alert scan"
+
+# The three detectors that act in active mode: they end SSH sessions or
+# kill processes. ransomware-canary only alerts.
+_l09_active_units:
+  - recon-watch.service
+  - revshell-scan.service
+  - login-watcher.service
+
+# The detectors act only when watcher.conf says exactly "active". This
+# pattern (grep -E) is wider on purpose: any `mode = active` or
+# `mode: active` line, in any section, with any spacing.
+_l09_mode_active_re: '^[[:space:]]*[Mm][Oo][Dd][Ee][[:space:]]*[=:][[:space:]]*active[[:space:]]*$'
+
+# systemctl is-active words for a unit that does not run.
+_l09_stopped_words: [inactive, failed, unknown]
+
+# Variables of the 0.1-0.5 detectors. They do nothing in 0.6 (N09-1).
+_l09_ignored_vars:
+  - watcher_mode
+  - watcher_window_seconds
+  - watcher_pattern
+  - watcher_whitelist_ips
+  - watcher_skip_non_interactive
+  - revshell_enabled
+  - recon_enabled
+  - ssh_pattern_watcher_enabled
+  - revshell_allowed_parent_cmdlines
+  - recon_patterns
+  - revshell_scan_interval
+  - revshell_shell_names
+  - revshell_netcat_names
+  - revshell_app_users
+  - revshell_service_parents
+  - recon_poll_interval
+  - recon_window_seconds
+  - recon_threshold
+  - ransomware_canary_interval
+  - ransomware_canary_threshold

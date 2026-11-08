@@ -49,13 +49,29 @@
 {%- set _rb_time = _uu['Unattended-Upgrade::Automatic-Reboot-Time'] | default(['now']) | last -%}
 {%- set _tz = _base_tz_after | default('', true) -%}
 {%- set _tz_txt = (' ' ~ _tz) if (_tz | length > 0) else ' (server time)' -%}
+{#- Header lines without a value are left out: client_name, client_domain
+    and report_prepared_by are optional ("Your Company" is the unfilled
+    placeholder). -#}
+{%- set _by = report_prepared_by | default('') | string | trim -%}
+{%- set _by = '' if _by == 'Your Company' else _by -%}
+{%- set _date = (ansible_facts['date_time']['date'] | default('')) if (ansible_facts['date_time'] is defined) else '' -%}
+{%- set _date = _date or now(utc=true, fmt='%Y-%m-%d') -%}
 # Server Security Report
 
+{% if client_name | default('') | string | trim | length > 0 %}
 **Client:** {{ client_name }}
-**Server:** {{ inventory_hostname }} ({{ ansible_host | default(ansible_default_ipv4.address) }})
+{% endif %}
+**Server:** {{ inventory_hostname }}{{ (' (' ~ ansible_host ~ ')') if (ansible_host | default('') | string) not in ['', inventory_hostname] else '' }}
+{% if client_domain | default('') | string | length > 0 %}
 **Domain:** {{ client_domain }}
-**Prepared by:** {{ report_prepared_by }}
-**Date:** {{ ansible_date_time.date }}
+{% endif %}
+{% if _by | length > 0 %}
+**Prepared by:** {{ _by }}
+{% endif %}
+**Date:** {{ _date }}
+
+This report states only what this auto_sec run measured on the server.
+Anything else says "not checked by auto_sec".
 
 ---
 
@@ -102,87 +118,47 @@
 - SSH login settings are not managed by auto_sec on this server
   (ssh_hardening_enabled is false)
 {% endif %}
-{# The SSH firewall claim comes from `ufw status verbose` (role 10's own
-    task), not from intent: a host set up by 0.1-0.3 in high mode may
-    still have no SSH rule. #}
-{% set _ssh_fw_limit = (ufw_status.stdout | default('')) is search('(?m)^' ~ (ssh_port | int) ~ '/tcp +LIMIT IN ') %}
-- Firewall: default deny on all inbound traffic. Open ports: web
-  (80/443){% if _ssh_fw_limit %} and SSH (port {{ ssh_port | int }}, rate-limited){% else %}. No rate-limited
-  SSH rule for port {{ ssh_port | int }} was found (see the firewall status below){% endif %}
-
-- Intrusion throttling (fail2ban, read during this run): {{ _f2b_report | default('not checked in this run') }}
-{% if paranoia_level == "high" %}
-- Single Packet Authorization (fwknop) is set up.{% if _ssh_fw_limit %} In this release SSH
-  is not hidden behind it: the SSH port stays reachable, rate-limited by
-  the firewall{% else %} No rate-limited SSH rule was found, so whether
-  the SSH port is reachable without a knock depends on the firewall rules
-  below{% endif %}
-
+{#- Firewall: role 03's measured line, else role 10's own read. -#}
+{% set _fw_line = _fw_report | default('', true) %}
+{% if _fw_line | length == 0 or _fw_line is search('not checked') %}
+{% set _fw_line = ('ufw is not installed' if (_rep_ufw_missing | default(false) | bool)
+                   else ('ufw is on' if (_rep_ufw_text | default('')) is search('(?m)^Status: active$')
+                   else ('ufw is installed but off' if (_rep_ufw_text | default('')) is search('(?m)^Status: inactive$')
+                   else 'ufw state could not be read'))) %}
 {% endif %}
-- Web server hardened: TLS enforced (auto-renewing certificates),
-  security headers active, version disclosure disabled
-- Application runs as an unprivileged system user
+- Firewall (ufw, read during this run): {{ _fw_line }}. The full status is in section 5.
+- Intrusion throttling (fail2ban, read during this run): {{ _f2b_report | default('not checked in this run') }}
+{% if paranoia_level | default('standard') == "high" %}
+- Single Packet Authorization (fwknop): not checked by auto_sec
+{% endif %}
+- Web server: not checked by auto_sec
 
 ## 2. Data protection
 
-{% if db_engine is defined %}
-- Database engine: {{ db_engine }}
-- Database bound to localhost only, verified unreachable from the internet
-- Application database account restricted to least privilege
-- Encryption at rest: documented per provisioning method (see appendix)
-{% else %}
-- No database on this server
-{% endif %}
+- Database: not checked by auto_sec
 
 ## 3. Backup and recovery
 
-- Nightly encrypted backups at {{ '%02d:%02d' | format(backup_hour | int, backup_minute | int) }}{{ _tz_txt }}
-- Encryption performed on the server before upload, decryption key is
-  held offline by {{ report_prepared_by }}, never stored on the server
-- Destination: Backblaze B2 bucket with versioning, using an access key
-  that has NO delete permission. Even a fully compromised server cannot
-  destroy backup history
-- Retention: {{ backup_retention_daily }} daily, {{ backup_retention_weekly }} weekly, {{ backup_retention_monthly }} monthly
-- Backup success/failure monitored in real time
-- Restore verification: performed monthly on isolated infrastructure
+- Backups: not checked by auto_sec
 
 ## 4. Detection and response
 
-- System audit trail active: identity changes, privilege changes,
-  SSH trust changes, scheduled task changes, binary tampering
-- Ransomware early warning: mass file-change detection with immediate
-  alerting
-- Breach detection suite, three independent detectors:
-  - Behavioral login verification (interactive SSH sessions must match
-    an expected usage pattern)
-  - Reverse-shell detection (shells attached to a network socket, or the
-    application account spawning a shell)
-  - Recon-burst detection (a session running a rapid series of system
-    enumeration commands)
-- Response mode: {% if watcher_mode == "active" %}automatic — offending
-  session terminated and source blocked, after forensic evidence is
-  captured{% else %}alert-only — immediate operator notification with
-  captured evidence{% endif %}
-{% if egress_lockdown | default(false) %}
-- Egress lockdown active: outbound traffic default-denied except
-  required service ports, refusing reverse-shell callbacks
-{% endif %}
-- All alerts delivered to the operations team in real time
+- Detection: not managed by auto_sec 0.6
 
 ## 5. Firewall state at time of report
 
 ```
-{{ ufw_status.stdout }}
+{{ _rep_ufw_text | default('', true) or ('ufw is not installed' if (_rep_ufw_missing | default(false) | bool) else 'ufw status could not be read') }}
 ```
 
 ## 6. Intrusion throttling state
 
 ```
-{{ f2b_status.stdout | default("n/a") }}
+{{ _rep_f2b_text | default('', true) or 'fail2ban status could not be read (not installed, or not running)' }}
 ```
 
 ---
 
 *This report was generated automatically by
-[auto_sec]({{ report_repo_url | default("https://github.com/pythonistastic/auto_sec") }})
-on behalf of {{ report_prepared_by }}.*
+[auto_sec]({{ report_repo_url | default("https://github.com/pythonistastic/auto_sec") }}),
+a personal research project{{ (', on behalf of ' ~ _by) if _by | length > 0 else '' }}.*

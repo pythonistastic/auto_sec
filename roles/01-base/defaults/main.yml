@@ -19,6 +19,18 @@ server_hostname: keep
 # a wall-clock time; the preflight lists them first.
 timezone: keep
 
+# The admin account deploy_user (role 01).
+#   keep:   auto_sec creates no account and writes no sudo rule.
+#   create: create deploy_user if it does not exist (home, shell /bin/bash,
+#           password locked: key login only, no extra groups), and give it
+#           passwordless sudo in auto_sec's own /etc/sudoers.d/<deploy_user>.
+#           The run stops if that file is yours, or if your sudo rules
+#           already name the account or one of its groups.
+# An existing account is never changed (shell, groups, home, password).
+# Default: create with autosec_server: new when deploy_user is also
+# ssh_admin_user (and not root), else keep.
+deploy_user_account: "{{ 'create' if ((autosec_server | default('') | string) == 'new' and (ssh_admin_user | default(deploy_user)) == deploy_user and deploy_user != 'root') else 'keep' }}"
+
 # Automatic security updates (unattended-upgrades).
 #   auto: install unattended-upgrades if it is missing; its own setup turns
 #         the updates on (the distro default). auto_sec writes no update
@@ -30,7 +42,8 @@ timezone: keep
 #         switches to "1" (daily), whatever 20auto-upgrades says
 #   keep: leave them as they are; unattended-upgrades is not installed
 # auto_sec never turns automatic updates off ("false" is refused).
-unattended_upgrades_enabled: auto
+# Default: auto with autosec_server: new, keep with existing.
+unattended_upgrades_enabled: "{{ 'auto' if (autosec_server | default('') | string) == 'new' else 'keep' }}"
 
 # Automatic reboot after an update that needs one.
 #   keep:  leave the server's setting alone (default; off unless you or the
@@ -59,7 +72,7 @@ unattended_upgrade_blacklist: []
 
 # One-off switch: pass with -e on one run, never in host_vars. true runs a
 # full `apt-get dist-upgrade` (it can restart services and needs a reboot
-# for a new kernel). Without it, role 01 only installs missing packages
+# for a new kernel). Without it, auto_sec only installs missing packages
 # (without their recommendations), stops if that would upgrade or remove
 # an installed package, and the nightly unattended-upgrades applies
 # security updates.
@@ -105,14 +118,61 @@ _base_reboot_required: /var/run/reboot-required
 _base_hostname_want: "{{ server_hostname | default('keep') }}"
 _base_tz_want: "{{ timezone | default('keep') }}"
 
-# Packages role 01 installs when they are missing, without their
-# recommendations. unattended-upgrades is added unless
+# Packages role 01 installs when they are missing (through the shared
+# package guard, roles/autosec-apt): unattended-upgrades unless
 # unattended_upgrades_enabled is keep (or auto, and it was removed on
-# purpose). Only what auto_sec itself needs: curl sends the alerts of
-# roles 07 and 08. 0.1-0.4 also installed git, htop, ncdu, age,
-# apt-listchanges, python3-pip and jq; no role uses them (role 07 installs
-# age itself).
-_base_packages: [curl]
+# purpose), and sudo when deploy_user_account: create must write a sudo
+# rule on a host without sudo. Nothing else: curl moved to role 07 in 0.6;
+# 0.1-0.4 also installed git, htop, ncdu, age, apt-listchanges, python3-pip
+# and jq.
+
+# The account and its sudo rule (deploy_user_account: create). sudo reads
+# every file in /etc/sudoers.d whose name has no "." and does not end in
+# "~"; deploy_user cannot contain a "." (site.yml), so the file is read.
+_base_sudoers: /etc/sudoers
+_base_sudo_dir: /etc/sudoers.d
+_base_sudo_file: "{{ _base_sudo_dir }}/{{ deploy_user }}"
+_base_sudo_header: "# Written by auto_sec (role 01)"
+# Exactly what 0.1-0.5 wrote (30 bytes for "deploy"). Only this content, or
+# the header, proves the file is auto_sec's. A file with these bytes is
+# kept as it is: it already gives the same rule.
+_base_sudo_legacy_sha256: "{{ (deploy_user ~ ' ALL=(ALL) NOPASSWD:ALL\n') | hash('sha256') }}"
+# The candidate is rendered here (preflight, also in --check) to compare it
+# with auto_sec's file from an earlier run and to let visudo check it.
+_base_sudo_candidate: /run/auto-sec/sudoers-candidate
+# `visudo -c` reads sudo's whole configuration (the tests point it at a
+# lab tree with -f).
+_base_visudo_check: [visudo, -c]
+# Names auto_sec puts into a grep pattern (the account and its groups).
+_base_user_re: '^[a-z_][a-z0-9_-]{0,31}$'
+# A login shell from the host is shown only if it has this shape.
+_base_shell_re: '^/[A-Za-z0-9/._-]{1,64}$'
+# A file name from the host is shown only after this filter (sudo scan).
+_base_path_bad_re: '[^A-Za-z0-9/._@:+ -]'
+
+# Preflight B12: the account role 02 logs in as must exist, or be created
+# by this run, before anything changes. _ssh_* are role 02's preflight
+# facts (site.yml runs that preflight first).
+_base_admin: "{{ _ssh_admin | default(ssh_admin_user | default(deploy_user)) }}"
+_base_b12: "{{ (_ssh_role_runs | default(false) | bool) and (_ssh_enabled | default(false) | bool) and _base_admin != 'root' }}"
+_base_admin_created: >-
+  {{ (_base_role_runs | default(false) | bool) and (_base_account_mode | default('keep')) == 'create'
+     and _base_admin == deploy_user }}
+
+# Kernel settings: auto_sec 0.6 writes none. The preflight only reads
+# /etc/sysctl.conf, for two notes: the lines 0.1-0.5 wrote there are yours
+# now (N01-K2), and on Debian 13 systemd-sysctl no longer reads that file
+# (N01-K1: 99-sysctl.conf does not lead to it).
+_base_sysctl_conf: /etc/sysctl.conf
+_base_sysctl_link: /etc/sysctl.d/99-sysctl.conf
+_base_sysctl_legacy_lines:
+  - net.ipv4.tcp_syncookies=1
+  - net.ipv4.icmp_echo_ignore_broadcasts=1
+  - net.ipv4.conf.all.log_martians=1
+  - net.ipv4.conf.all.accept_redirects=0
+  - net.ipv4.conf.all.send_redirects=0
+  - net.ipv4.conf.all.accept_source_route=0
+  - kernel.dmesg_restrict=1
 
 _base_docker_packages:
   - docker-ce

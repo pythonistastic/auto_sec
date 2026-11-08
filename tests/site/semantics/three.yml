@@ -1,0 +1,16 @@
+---
+# Three hosts in TEST-NET-1 (RFC 5737): no route, nothing answers. run.sh
+# uses them to show which site.yml checks run before the first connection.
+all:
+  vars:
+    ansible_user: autosec-lab
+    ansible_ssh_private_key_file: /dev/null
+    ansible_ssh_common_args: "-o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    ansible_python_interpreter: /usr/bin/python3
+    autosec_server: existing
+    ssh_permit_root_login: keep
+    ssh_password_authentication: keep
+  hosts:
+    h1: {ansible_host: 192.0.2.1}
+    h2: {ansible_host: 192.0.2.2}
+    h3: {ansible_host: 192.0.2.3}

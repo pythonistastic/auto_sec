@@ -19,9 +19,9 @@ Useful things to include, in rough order of value:
   managed server.
 - The OS and `ansible-core` version you saw it on.
 
-You will get an acknowledgement within a few days. This is a one-maintainer, early-stage
-project, so please don't expect enterprise response times — but security reports go to the
-front of the queue.
+You will get an acknowledgement within a few days. auto_sec is a personal research project
+with one maintainer, not a production service, so please don't expect enterprise response
+times — but security reports go to the front of the queue.
 
 ## What counts as a vulnerability here
 
@@ -191,6 +191,68 @@ Every string in the helper's output has `{` and `}` replaced by `?`, so host tex
 never be read as a Jinja template. During a run, `/run/auto-sec/f2b-prev` (root only)
 keeps the previous `00-autosec.conf` for the rollback, and is removed at the end.
 
+### What 0.6 reads from the host
+
+0.6 adds more read-only checks. Unless a point below says otherwise, what they read is
+**only compared, shown, or used to refuse a run**. Text from the host is shown only after
+a strict pattern check or a filter (printable ASCII, braces replaced by `?`).
+
+- **Old detectors (R00-3, before fact gathering).** A `stat` of
+  `/opt/watcher/watcher.conf`; when it exists, `grep -Eq` for a `mode = active` line and
+  `systemctl is-active` of three units. The file holds the Telegram bot token: grep
+  returns only yes or no, so nothing of it leaves the host. Unit states are compared with
+  fixed words. Root's crontab is searched with `grep -Fxq` for one fixed line (yes or no).
+- **Audit rule files (W08-1).** The content of `90-autosec.rules` and `hardening.rules`
+  in `/etc/audit/rules.d` (regular files, at most 4096 bytes) is read to the controller
+  only to compute a SHA-256 (with the `authorized_keys` line normalized) and compare it
+  with two fixed values. Only the file name is shown.
+- **Account and sudo (role 01).** `getent passwd <deploy_user>` (the shell is shown only
+  if it matches a strict pattern), the `stat`, SHA-256 and first line of
+  `/etc/sudoers.d/<deploy_user>` (compared with fixed values), `visudo -c` (its first
+  error line is shown), and the sudo scan (`file:line` of lines that name the account or
+  its groups, shown). **One documented exception:** the account's group names from
+  `id -nG` are passed back to the same host, each as one argv item, to the sudo scan
+  (`roles/01-base/files/autosec-sudo-scan`). The scan uses a name in its `grep` pattern
+  only after it matched `^[a-z_][a-z0-9_-]{0,31}$`; any other name stops the run
+  (R01-A3). The account's uid and gids from `id -u` and `id -G` go the same way, only as
+  digits (anything else is dropped), so the scan also finds `#<uid>` and `%#<gid>` rules.
+  The groups and numbers decide only whether auto_sec refuses; they never reach a file.
+- **Kernel settings (role 01).** `/etc/sysctl.conf` is read for a count of setting lines
+  and whether 0.1–0.5's seven lines are there (N01-K1, N01-K2).
+- **Packages (`roles/autosec-apt`).** `dpkg-query` states, `apt-get -s` output (only
+  `Inst` and `Remv` lines count; names are shown after a pattern check) and the names of
+  units with `NeedDaemonReload=yes` (shown after a pattern check). Package names come
+  from role constants only.
+- **ufw (role 03).** On an active ufw: `ufw status verbose` and `ufw show added`, compared
+  with your `firewall_inbound` and shown. When ufw is off and you chose
+  `firewall_state: enabled`, the turn-on helper (`auto-sec-ufw-turnon`, Python standard
+  library, run with `python3 -I`) also reads `/etc/default/ufw`, ufw's rule files and its
+  `IPT_SYSCTL` file, the live values under `/proc/sys`, the listening sockets in
+  `/proc/net/{tcp,tcp6,udp,udp6}`, process names from `ss` (shown after filtering to
+  `[A-Za-z0-9._-]`), `/sys/class/net/*/uevent` and `systemctl` states. All of it refuses
+  or is shown. The rules auto_sec adds are built from your variables only (`--want`); the
+  helper only says which are already there. The controller's address
+  (`_ssh_controller_ip`, the existing exception above) is passed as `--controller-ip` for
+  comparison only (does a rule admit it?); it never becomes part of a rule.
+- **Layers 04-07 and 11 (plans).** Each file auto_sec would write is classified on the
+  host as absent, auto_sec's (header), the package's own (role 04: md5 against dpkg's
+  conffile record), 0.1–0.5's exact file, or yours; one word per file comes back. Role 11
+  compares SHA-256 values with fixed hashes. Role 04 shows the default-route interface as
+  a hint only; `fwknop_pcap_intf` is always typed by you. Role 05 also reads the uid and
+  shell of an account `app` and the owner of `app_dir`, compared with fixed values and
+  shown only after a pattern check (R05-3, R05-4).
+- **Role 02's plan.** Whether each key is already in its account's `authorized_keys`
+  (exit code only, as in role 02 main).
+- **The plan (role 00).** The plan id is computed only from your values and constant
+  names, including the names of the packages this run would install (role constants;
+  the host decides only which of them are missing). Host details appear only in the
+  plan's notes, which are shown and not hashed.
+- **The report (role 10), a documented exception for file content.** The output of
+  `ufw status verbose` and `fail2ban-client status` is written into the report, after it
+  is filtered (printable ASCII, a backtick becomes `'`, braces become `?`). The report is
+  a file for you, written only on the controller (`reports/`, 0600), never on the server
+  and never read by auto_sec again.
+
 A new use of host data as an argument, a value or file content needs the same kind of
 written exception here, and a review. Treat anything else that crosses this line as a
 high-severity bug.
@@ -212,7 +274,9 @@ how you want to be named.
 
 ## Honest limitations
 
-auto_sec is early-stage and does not promise complete security. Known gaps — including
-parts that are shipped but not yet validated end-to-end — are tracked openly in
-[docs/RETROSPECTIVE.md](docs/RETROSPECTIVE.md). Reading that first may save you a report
-about something already known.
+auto_sec is a personal research project and does not promise complete security. Known
+gaps — including parts that are shipped but not yet validated end-to-end — are tracked
+openly in [docs/RETROSPECTIVE.md](docs/RETROSPECTIVE.md) and the README's Known
+limitations. The 0.1–0.5 detectors that did not work as documented are issue #18; 0.6 no
+longer installs them. Reading those first may save you a report about something already
+known.

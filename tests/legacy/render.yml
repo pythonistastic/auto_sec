@@ -1,0 +1,85 @@
+---
+# Renders the audit rules file auto_sec 0.1-0.5 wrote, the way those
+# releases rendered it: the content below is the copy task of
+# roles/08-detection/tasks/main.yml, unchanged, from v0.2.1 (same in
+# v0.1.0-v0.2.1) and v0.3.0 (same in every later tag and in 0.5).
+# Copied from `git show v0.2.1:roles/08-detection/tasks/main.yml` and
+# v0.3.0; only dest and mode differ. Values come as JSON extra vars:
+#   ansible-playbook render.yml -e '{"lab_out": "<dir>", "deploy_user": "<name>",
+#     "deploy_authkeys": {"stat": {"exists": true}}}'
+- name: Render the 0.1-0.5 audit rules files
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: "0.1.0-0.2.1: hardening.rules"
+      ansible.builtin.copy:
+        dest: "{{ lab_out }}/hardening.rules"
+        mode: "0600"
+        content: |
+          ## Managed by Ansible
+          ## Identity changes
+          -w /etc/passwd -p wa -k identity
+          -w /etc/shadow -p wa -k identity
+          -w /etc/group -p wa -k identity
+          -w /etc/sudoers -p wa -k privilege
+          -w /etc/sudoers.d/ -p wa -k privilege
+
+          ## SSH trust changes (attacker persistence)
+          -w /home/{{ deploy_user }}/.ssh/authorized_keys -p wa -k ssh_trust
+          -w /root/.ssh/ -p wa -k ssh_trust
+
+          ## Scheduled task persistence
+          -w /etc/crontab -p wa -k cron
+          -w /etc/cron.d/ -p wa -k cron
+          -w /var/spool/cron/ -p wa -k cron
+
+          ## Binary tampering
+          -w /usr/bin/ -p wa -k bin_tamper
+          -w /usr/sbin/ -p wa -k bin_tamper
+
+          ## Record all executed commands per session (feeds the watcher)
+          -a always,exit -F arch=b64 -S execve -k exec_log
+
+          ## Shell spawns get their own key for fast forensic lookup
+          ## (ausearch -k shell_exec) when the reverse-shell scanner fires
+          -w /bin/bash -p x -k shell_exec
+          -w /bin/sh -p x -k shell_exec
+          -w /bin/dash -p x -k shell_exec
+
+    - name: "0.3.0-0.5: 90-autosec.rules"
+      ansible.builtin.copy:
+        dest: "{{ lab_out }}/90-autosec.rules"
+        mode: "0600"
+        content: |
+          ## Managed by Ansible
+          ## Identity changes
+          -w /etc/passwd -p wa -k identity
+          -w /etc/shadow -p wa -k identity
+          -w /etc/group -p wa -k identity
+          -w /etc/sudoers -p wa -k privilege
+          -w /etc/sudoers.d/ -p wa -k privilege
+
+          ## SSH trust changes (attacker persistence)
+          {% if deploy_authkeys.stat.exists %}
+          -w /home/{{ deploy_user }}/.ssh/authorized_keys -p wa -k ssh_trust
+          {% endif %}
+          -w /root/.ssh/ -p wa -k ssh_trust
+
+          ## Scheduled task persistence
+          -w /etc/crontab -p wa -k cron
+          -w /etc/cron.d/ -p wa -k cron
+          -w /var/spool/cron/ -p wa -k cron
+
+          ## Binary tampering
+          -w /usr/bin/ -p wa -k bin_tamper
+          -w /usr/sbin/ -p wa -k bin_tamper
+
+          ## Record all executed commands per session (feeds the watcher)
+          -a always,exit -F arch=b64 -S execve -k exec_log
+
+          ## Shell spawns get their own key for fast forensic lookup
+          ## (ausearch -k shell_exec) when the reverse-shell scanner fires
+          -w /bin/bash -p x -k shell_exec
+          -w /bin/sh -p x -k shell_exec
+          -w /bin/dash -p x -k shell_exec

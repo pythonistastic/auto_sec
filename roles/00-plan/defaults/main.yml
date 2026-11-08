@@ -1,0 +1,70 @@
+---
+# Role 00 (the run plan) defaults.
+#
+# The two public settings are documented in group_vars/all.yml, which
+# site.yml reads and which beats these defaults. The same values stay here
+# for playbooks without group_vars (tests/site). CI checks that both files
+# hold the same values.
+
+# true: every run that would change this server needs your OK, given as
+# -e autosec_approve=<plan id> (the id the plan prints). A run that changes
+# nothing on the server needs no OK. Recommended for servers already in use.
+autosec_require_approval: false
+
+# One-off switch: pass with -e on one run, never in host_vars. true prints
+# the plan and stops before anything changes.
+autosec_plan_only: false
+
+# --- Role-internal constants. These are not settings: do not override. ---
+
+# The "do" words of the plan contract (one per item).
+_plan_do_words:
+  - write
+  - replace
+  - install
+  - start
+  - restart
+  - reload
+  - daemon-reload
+  - enable
+  - add-rule
+  - policy
+  - firewall-on
+  - user
+  - sudoers
+  - cron
+  - timer
+  - network-call
+  - local-file
+
+# How the totals line counts the items. local-file is a file on this
+# computer (the report), so it is not a server change.
+_plan_count_files: [write, replace, sudoers, cron]
+_plan_count_services: [start, restart, reload, daemon-reload, enable, timer]
+_plan_count_rules: [add-rule, policy]
+
+# One line per role, in run order.
+#   sel:  facts or play vars that say the tags select the role (any of them)
+#   cfg:  the play var that says the layer is configured (site.yml _layer_NN)
+#   off_text: the line when it is not configured
+#   managed: false for roles that change nothing in 0.6
+_plan_roles:
+  - {id: "01", name: base, sel: [_base_role_runs]}
+  - {id: "02", name: ssh, sel: [_ssh_role_runs], cfg: _ssh_enabled, off_text: "off (ssh_hardening_enabled: false)"}
+  - {id: "03", name: firewall, sel: [_fw_role_runs, _f2b_role_runs]}
+  - {id: "04", name: fwknop, sel: [_sel_04], cfg: _layer_04, off_text: "skipped (paranoia_level is not high)"}
+  - {id: "05", name: app, sel: [_sel_05], cfg: _layer_05, off_text: "skipped (app_type is not set)"}
+  - {id: "06", name: database, sel: [_sel_06], cfg: _layer_06, off_text: "skipped (db_engine is not set)"}
+  - {id: "07", name: backups, sel: [_sel_07], cfg: _layer_07, off_text: "skipped (b2_bucket is not set)"}
+  - {id: "08", name: detection, sel: [_l08_role_runs], managed: false}
+  - {id: "09", name: watcher, sel: [_l09_role_runs], managed: false}
+  - {id: "10", name: report, sel: [_sel_10], cfg: _layer_10}
+  - {id: "11", name: cve, sel: [_sel_11], cfg: _layer_11, off_text: "skipped (cve_watch_enabled: false)"}
+
+_plan_yes_words: ["true", "yes", "1", "on"]
+_plan_bool_words: ["true", "false", "yes", "no", "1", "0", "on", "off"]
+_plan_id_re: '^[0-9a-f]{12}$'
+
+# The release this plan is for; part of the plan id, so an id never carries
+# over to another release.
+_plan_version_file: "{{ role_path }}/../../VERSION"

@@ -1,0 +1,69 @@
+---
+# Roles 08 and 09 of auto_sec 0.6, wired the way site.yml wires them, run
+# unprivileged against a lab tree instead of /:
+#   pre_tasks  09-watcher legacy_active (R00-3, before fact gathering),
+#              08-detection legacy and 09-watcher legacy (tags always)
+#   tasks      the layer 08 and 09 includes (tags detection and watcher);
+#              they must do nothing, the pre_tasks pass already ran
+# Play vars point the roles' path constants into <lab_root>. run.sh puts a
+# copy of stubs/systemctl first in PATH and sets ANSIBLE_ROLES_PATH. Facts go
+# to <lab_out> as JSON (only when the play gets that far):
+#   ansible-playbook -i localhost, lab.yml -e lab_root=<dir> -e lab_out=<file>
+#     [--tags ...] [--check]
+- name: Roles 08 and 09 (auto_sec 0.6) against a lab tree
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    _l08_rules_dir: "{{ lab_root }}/etc/audit/rules.d"
+    _l09_watcher_dir: "{{ lab_root }}/opt/watcher"
+    _l09_detect_dir: "{{ lab_root }}/opt/detect"
+    _l09_unit_dir: "{{ lab_root }}/etc/systemd/system"
+    _l09_crontab: "{{ lab_root }}/var/spool/cron/crontabs/root"
+  pre_tasks:
+    - name: "Pre-task 3: auto_sec 0.1-0.5's detectors in active mode (R00-3)"
+      ansible.builtin.import_role:
+        name: 09-watcher
+        tasks_from: legacy_active
+      tags: [always]
+
+    - name: "Pre-task 6: role 08, auto_sec 0.1-0.5's audit rules (W08-1)"
+      ansible.builtin.import_role:
+        name: 08-detection
+        tasks_from: legacy
+      tags: [always]
+
+    - name: "Pre-task 6: role 09, auto_sec 0.1-0.5's detectors (W09-1, N09-1)"
+      ansible.builtin.import_role:
+        name: 09-watcher
+        tasks_from: legacy
+      tags: [always]
+
+  tasks:
+    - name: "Layer 08: detection (not managed in 0.6)"
+      ansible.builtin.include_role:
+        name: 08-detection
+        tasks_from: legacy
+        apply: { tags: ["detection"] }
+      tags: ["detection"]
+
+    - name: "Layer 09: watcher (not managed in 0.6)"
+      ansible.builtin.include_role:
+        name: 09-watcher
+        tasks_from: legacy
+        apply: { tags: ["watcher"] }
+      tags: ["watcher"]
+
+  post_tasks:
+    - name: "Lab: write the facts"
+      tags: [always]
+      check_mode: false
+      ansible.builtin.copy:
+        dest: "{{ lab_out }}"
+        mode: "0600"
+        content: >-
+          {{ {'plan_08': _plan_08, 'plan_09': _plan_09,
+              'l08_role_runs': _l08_role_runs, 'l08_legacy': _l08_legacy, 'l08_report': _l08_report,
+              'l09_role_runs': _l09_role_runs, 'l09_found': _l09_found, 'l09_report': _l09_report}
+             | to_nice_json }}

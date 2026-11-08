@@ -1,0 +1,272 @@
+---
+# roles/03-firewall/tasks/ufw-decide.yml - refuse, note, or plan the turn-on.
+#
+# Included right after ufw-check.yml, by ufw-preflight.yml (_fw_stage
+# preflight) and ufw.yml (_fw_stage apply). Reads _fw_turnon (host data;
+# the helper has filtered every host string and replaced "{" and "}").
+# Every refusal leaves ufw off. Sets _fw_will_turn_on and _fw_add.
+
+- name: "ufw decide: what the helper found"
+  ansible.builtin.set_fact:
+    _fw_v: "{{ _fw_turnon.verdicts | default([]) }}"
+    _fw_n: "{{ _fw_turnon.notes | default([]) }}"
+    _fw_nothing: >-
+      {{ 'Nothing has been changed.' if _fw_stage == 'preflight'
+         else ('Nothing has been added to ufw, and ufw is still off'
+               ~ ('' if (_fw_installed | bool) else ' (role 03 installed ufw in this run)')
+               ~ '. Roles that ran before role 03 may have changed other things.') }}
+
+- name: "ufw decide R03-W1: ufw's own configuration must be readable"
+  vars:
+    _fw_x: "{{ _fw_v | selectattr('id', 'equalto', 'R03-W1') | list }}"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_x | length == 0
+    fail_msg: >-
+      ufw's own configuration on {{ inventory_hostname }} cannot be read
+      ({{ _fw_x | map(attribute='error') | join('; ') }}). auto_sec changes nothing in ufw until
+      "sudo ufw status verbose" works. {{ _fw_nothing }}
+
+- name: "ufw decide R03-W2: every rule must be one auto_sec can check"
+  vars:
+    _fw_x: "{{ _fw_v | selectattr('id', 'equalto', 'R03-W2') | map(attribute='lines') | flatten }}"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_x | length == 0
+    fail_msg: >-
+      ufw on {{ inventory_hostname }} is off and has rules auto_sec cannot check
+      ({{ _fw_x | join('; ') | truncate(600) }}). auto_sec turns ufw on only when it can check
+      every rule (allow/limit for ports, optionally from one address). Turn ufw on yourself
+      (sudo ufw enable), or keep firewall_state: keep. {{ _fw_nothing }}
+
+- name: "ufw decide R03-W3: a planned rule must not replace one of yours"
+  vars:
+    _fw_x: "{{ _fw_v | selectattr('id', 'equalto', 'R03-W3') | map(attribute='conflicts') | flatten }}"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_x | length == 0
+    fail_msg: >-
+      {% for c in _fw_x %}auto_sec would add '{{ c.want }}' on {{ inventory_hostname }}, but your rule
+      '{{ c.line }}' is for the same port. {% endfor %}ufw would replace yours. Remove the item
+      (firewall_inbound, egress_allow_extra, office_static_ip or firewall_ssh_rule), or change
+      your rule yourself. {{ _fw_nothing }}
+
+- name: "ufw decide R03-W4b: firewall_ssh_rule must not widen an SSH rule you restricted"
+  vars:
+    _fw_x: "{{ _fw_v | selectattr('id', 'equalto', 'R03-W4b') | list | first | default({}) }}"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_x | length == 0
+    fail_msg: >-
+      SSH (port {{ _fw_x.port | default('?') }}) on {{ inventory_hostname }} is open only to
+      {{ _fw_x.sources | default([]) | join(', ') }} in your ufw rules; firewall_ssh_rule:
+      {{ _fw_x.rule | default('?') }} would open it to every address. Set firewall_ssh_rule: keep.
+      ufw stays off. {{ _fw_nothing }}
+
+- name: "ufw decide R03-W4: a rule must let SSH in"
+  vars:
+    _fw_x: "{{ _fw_v | selectattr('id', 'equalto', 'R03-W4') | list | first | default({}) }}"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_x | length == 0
+    fail_msg: >-
+      Refusing to turn ufw on for {{ inventory_hostname }}: {% if _fw_x.why | default('') == 'controller' %}no
+      rule lets SSH (port {{ _fw_x.port | default('?') }}) in from your computer
+      ({{ _ssh_controller_ip | default('?') }}): the SSH rules are limited to other sources, and
+      firewall_ssh_rule is keep{% else %}no rule lets SSH (port {{ _fw_x.port | default('?') }}) in,
+      and firewall_ssh_rule is keep{% endif %}. Set firewall_ssh_rule: limit, or add your own rule
+      first. ufw stays off. {{ _fw_nothing }}
+
+- name: "ufw decide R03-W5: every listening port is let in, or on firewall_closed_ok"
+  vars:
+    _fw_x: "{{ _fw_v | selectattr('id', 'equalto', 'R03-W5') | map(attribute='ports') | flatten }}"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_x | length == 0
+    fail_msg: >-
+      Refusing to turn ufw on for {{ inventory_hostname }}: these ports listen now and no rule
+      would let traffic in: {{ _fw_x | join(', ') }}. Add each to firewall_inbound to keep it
+      open, or to firewall_closed_ok to accept that it closes. ufw stays off. {{ _fw_nothing }}
+
+- name: "ufw decide R03-W6a: no other firewall manager"
+  vars:
+    _fw_x: "{{ _fw_v | selectattr('id', 'equalto', 'R03-W6a') | map(attribute='managers') | flatten }}"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_x | length == 0
+    fail_msg: >-
+      Refusing to turn ufw on for {{ inventory_hostname }}: {{ _fw_x | join(', ') }}. Two firewall
+      managers overwrite each other. Turn that one off yourself, or keep firewall_state: keep.
+      {{ _fw_nothing }}
+
+- name: "ufw decide R03-W6b: ufw.service must be enabled at boot"
+  vars:
+    _fw_x: "{{ _fw_v | selectattr('id', 'equalto', 'R03-W6b') | list | first | default({}) }}"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_x | length == 0
+    fail_msg: >-
+      ufw.service is not enabled on {{ inventory_hostname }} ({{ _fw_x.state | default('?') }}), so ufw
+      would be off again after a reboot. auto_sec does not enable units. Run sudo systemctl
+      enable ufw yourself, or keep firewall_state: keep. {{ _fw_nothing }}
+
+- name: "ufw decide R03-W7a: no forwarded traffic may be cut"
+  vars:
+    _fw_x: "{{ _fw_v | selectattr('id', 'equalto', 'R03-W7a') | map(attribute='what') | flatten }}"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_x | length == 0
+    fail_msg: >-
+      {{ inventory_hostname }} forwards traffic ({{ _fw_x | join(', ') }}), and ufw's
+      DEFAULT_FORWARD_POLICY is DROP: turning ufw on would cut VPN clients, containers or routed
+      networks. Turn ufw on yourself after setting the forward policy and rules. {{ _fw_nothing }}
+
+- name: "ufw decide R03-W7b: no WireGuard interface"
+  vars:
+    _fw_x: "{{ _fw_v | selectattr('id', 'equalto', 'R03-W7b') | map(attribute='ifaces') | flatten }}"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_x | length == 0
+    fail_msg: >-
+      {{ inventory_hostname }} has a WireGuard interface ({{ _fw_x | join(', ') }}). auto_sec cannot
+      check that its port stays open. Turn ufw on yourself. {{ _fw_nothing }}
+
+- name: "ufw decide R03-W8: ufw's kernel settings must not loosen yours"
+  vars:
+    _fw_x: "{{ _fw_v | selectattr('id', 'equalto', 'R03-W8') | list | first | default({}) }}"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_x | length == 0
+    fail_msg: >-
+      {% if _fw_x.bad_file | default(false) %}ufw's IPT_SYSCTL ({{ _fw_x.file | default('?') }}) on
+      {{ inventory_hostname }} is not a regular file under /etc/ufw/, so auto_sec cannot tell what
+      ufw would set at every start. Change IPT_SYSCTL in /etc/default/ufw yourself, then run
+      again.{% else %}{% for c in _fw_x.changes | default([]) %}ufw's {{ _fw_x.file }} would set
+      {{ c.key }} {{ c.live }} -> {{ c.value }} at every start on {{ inventory_hostname }}, which
+      loosens your setting (or is a key auto_sec does not know). {% endfor %}Change that line (or
+      IPT_SYSCTL in /etc/default/ufw) yourself, then run again.{% endif %} ufw stays off.
+      {{ _fw_nothing }}
+
+- name: "ufw decide R03-W9a: ufw's incoming policy must deny"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_v | selectattr('id', 'equalto', 'R03-W9a') | list | length == 0
+    fail_msg: >-
+      ufw's default incoming policy on {{ inventory_hostname }} is ACCEPT, so turning it on would
+      block nothing. auto_sec does not change ufw's defaults. Run sudo ufw default deny incoming
+      (ufw is off, nothing restarts), then run again. {{ _fw_nothing }}
+
+- name: "ufw decide R03-W9b: ufw's outgoing policy must not block apt, DNS and certbot"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_v | selectattr('id', 'equalto', 'R03-W9b') | list | length == 0
+    fail_msg: >-
+      ufw's files on {{ inventory_hostname }} deny outgoing traffic, so turning it on would block
+      apt, DNS and certbot. Set egress_lockdown: true (auto_sec adds its outbound rules), or
+      change DEFAULT_OUTPUT_POLICY yourself. {{ _fw_nothing }}
+
+- name: "ufw decide R03-W9c: ufw must not flush the built-in chains"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_v | selectattr('id', 'equalto', 'R03-W9c') | list | length == 0
+    fail_msg: >-
+      ufw's MANAGE_BUILTINS is yes on {{ inventory_hostname }}: turning ufw on would flush the
+      built-in chains, including rules other tools put there (fail2ban, Docker). Turn ufw on
+      yourself, or set MANAGE_BUILTINS=no in /etc/default/ufw, then run again. {{ _fw_nothing }}
+
+# Anything the helper refuses that has no check above (a newer helper):
+# never turn ufw on past an unknown refusal.
+- name: "ufw decide: no other refusal"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_v | map(attribute='id') | reject('in', _fw_known) | list | length == 0
+    fail_msg: >-
+      The ufw turn-on check on {{ inventory_hostname }} refused with
+      {{ _fw_v | map(attribute='id') | reject('in', _fw_known) | join(', ') }} (auto_sec bug: no
+      message for it). ufw stays off. {{ _fw_nothing }}
+  vars:
+    _fw_known: [R03-W1, R03-W2, R03-W3, R03-W4, R03-W4b, R03-W5, R03-W6a, R03-W6b, R03-W7a, R03-W7b,
+                R03-W8, R03-W9a, R03-W9b, R03-W9c]
+
+# --- Notes (the run goes on) ------------------------------------------------
+# Shown once: by the preflight, or by the apply stage on a host where role
+# 03 has just installed ufw (the preflight could not read its files).
+
+- name: "ufw decide N03-W1: ports that close, or open only to some sources"
+  when:
+    - _fw_stage == 'preflight' or not (_fw_installed | bool)
+    - _fw_x | length > 0
+  vars:
+    _fw_x: "{{ _fw_n | selectattr('id', 'equalto', 'N03-W1') | list | first | default({}) }}"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: turning ufw on for {{ inventory_hostname }}
+      {%- if _fw_x.closing | default([]) | length > 0 %} closes {{ _fw_x.closing | join(', ') }} (firewall_closed_ok){% endif %}
+      {%- if (_fw_x.closing | default([]) | length > 0) and (_fw_x.restricted | default([]) | length > 0) %};
+      it{% endif %}
+      {%- if _fw_x.restricted | default([]) | length > 0 %} lets {{ _fw_x.restricted | join(', ') }} in only from the
+      sources in your rules{% endif %}.
+
+- name: "ufw decide N03-W3: an office rule behind the SSH rate limit"
+  when:
+    - _fw_stage == 'preflight' or not (_fw_installed | bool)
+    - _fw_x | length > 0
+  vars:
+    _fw_x: "{{ _fw_n | selectattr('id', 'equalto', 'N03-W3') | list | first | default({}) }}"
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: the rate limit still applies to {{ _fw_x.office }} on {{ inventory_hostname }}: your rule
+      '{{ _fw_x.first }}' comes first. To fix it: sudo ufw delete allow from {{ _fw_x.office }} to
+      any port {{ _fw_x.port }} proto tcp && sudo ufw prepend allow from {{ _fw_x.office }} to any
+      port {{ _fw_x.port }} proto tcp comment {{ _fw_comment }}
+
+- name: "ufw decide N03-W5: Docker publishes ports past ufw"
+  when:
+    - _fw_stage == 'preflight' or not (_fw_installed | bool)
+    - _fw_n | selectattr('id', 'equalto', 'N03-W5') | list | length > 0
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: Docker runs on {{ inventory_hostname }}. Docker publishes container ports past ufw
+      (its own iptables rules come first), so ufw does not guard them.
+
+- name: "ufw decide N03-W6: IPV6=no on a host with an IPv6 address"
+  when:
+    - _fw_stage == 'preflight' or not (_fw_installed | bool)
+    - _fw_n | selectattr('id', 'equalto', 'N03-W6') | list | length > 0
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: ufw on {{ inventory_hostname }} has IPV6=no in /etc/default/ufw, but the server has a
+      global IPv6 address: ufw does not filter IPv6 at all.
+
+- name: "ufw decide N03-W7: ufw files you edited become active"
+  when:
+    - _fw_stage == 'preflight' or not (_fw_installed | bool)
+    - _fw_x | length > 0
+  vars:
+    _fw_x: "{{ _fw_n | selectattr('id', 'equalto', 'N03-W7') | map(attribute='files') | flatten }}"
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: these ufw files on {{ inventory_hostname }} are not the package's:
+      {{ _fw_x | join(', ') }}. Turning ufw on makes your edits active.
+
+- name: "ufw decide N03-W8: kernel values ufw sets at every start"
+  when:
+    - _fw_stage == 'preflight' or not (_fw_installed | bool)
+    - _fw_x | length > 0
+  vars:
+    _fw_x: "{{ _fw_n | selectattr('id', 'equalto', 'N03-W8') | list | first | default({}) }}"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: ufw's {{ _fw_x.file }} sets these kernel values at every start on {{ inventory_hostname }}:
+      {% for c in _fw_x.changes %}{{ c.key }} {{ c.live }} -> {{ c.value }}{{ ', ' if not loop.last else '' }}{% endfor %}.
+      They are stricter than now. If the turn-on is undone, they stay until the next reboot.
+
+# --- Plan ---------------------------------------------------------------------
+
+- name: "ufw decide: plan"
+  ansible.builtin.set_fact:
+    _fw_will_turn_on: true
+    _fw_add: >-
+      {{ _fw_items | selectattr('id', 'in', _fw_turnon['items'] | default([])
+                                 | selectattr('status', 'equalto', 'add') | map(attribute='id') | list) | list }}
+    _fw_out_policy: "{{ (_fw_turnon.policies | default({})).default_output_policy | default('ACCEPT') | upper }}"

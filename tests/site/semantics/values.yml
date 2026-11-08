@@ -1,0 +1,17 @@
+---
+# One TEST-NET-1 host (RFC 5737) per autosec_server value; run.sh picks one
+# with -l. Nothing answers on these addresses.
+all:
+  vars:
+    ansible_user: autosec-lab
+    ansible_ssh_private_key_file: /dev/null
+    ansible_ssh_common_args: "-o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    ansible_python_interpreter: /usr/bin/python3
+    ssh_permit_root_login: keep
+    ssh_password_authentication: keep
+  hosts:
+    v-missing: {ansible_host: 192.0.2.11}
+    v-yes: {ansible_host: 192.0.2.12, autosec_server: yes}  # yamllint disable-line rule:truthy
+    v-cap: {ansible_host: 192.0.2.13, autosec_server: New}
+    v-existing: {ansible_host: 192.0.2.14, autosec_server: existing}
+    v-new: {ansible_host: 192.0.2.15, autosec_server: new}

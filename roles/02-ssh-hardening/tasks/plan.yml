@@ -1,0 +1,110 @@
+---
+# roles/02-ssh-hardening/tasks/plan.yml - role 02's lines of the run plan.
+#
+# site.yml imports this file in pre_tasks (tags always), after the role 01
+# preflight: a key for deploy_user waits for the account role 01 creates.
+# Read-only; also runs in --check. It reads one thing more than the
+# preflight: whether each key is already in its account's authorized_keys
+# (the same check as main.yml step 2; only its exit code comes back).
+#
+# Sets:
+#   _plan_02        list  plan items {role, part, do, what, note}; [] = no change
+#   _plan_02_notes  list  shown under the role 02 line, not part of the plan id
+# "what" holds your values and constant names only (the lines of
+# 00-autosec.conf come from your variables). The keys of sshd -T that
+# change were read from the host: they go in "note".
+
+- name: "SSH plan: start from no change"
+  ansible.builtin.set_fact:
+    _plan_02: []
+    _plan_02_notes: []
+
+- name: "SSH plan: is each key already in its account's authorized_keys?"
+  when:
+    - _ssh_enabled | bool
+    - _ssh_role_runs | bool
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - |
+        h=$(getent passwd "$1" | cut -d: -f6)
+        [ -n "$h" ] || exit 3
+        d=$h/.ssh f=$h/.ssh/authorized_keys
+        if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then exit 4; fi
+        if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then exit 4; fi
+        [ -f "$f" ] || exit 1
+        grep -qF -e "$2" -- "$f"
+      - sh
+      - "{{ item.0 }}"
+      - "{{ item.1.split()[1] }}"
+  loop: "{{ _ssh_plan_keys }}"
+  loop_control:
+    label: "{{ item.0 }}: {{ item.1 | truncate(50) }}"
+  register: _ssh_plan_keycheck
+  changed_when: false
+  failed_when: _ssh_plan_keycheck.rc not in [0, 1, 3, 4]
+  check_mode: false
+  vars:
+    _ssh_plan_keys: >-
+      {{ ((([_ssh_admin] * (_ssh_admin_keys | length)) | zip(_ssh_admin_keys) | list)
+          + (([deploy_user] * (_ssh_deploy_keys | length)) | zip(_ssh_deploy_keys) | list))
+         | map('list') | unique | list }}
+
+- name: "SSH plan: the plan items"
+  when:
+    - _ssh_enabled | bool
+    - _ssh_role_runs | bool
+  ansible.builtin.set_fact:
+    _plan_02: "{{ _ssh_plan_keys_items + _ssh_plan_sshd_items }}"
+    _plan_02_notes: "{{ _ssh_plan_notes }}"
+  vars:
+    _ssh_plan_r: "{{ _ssh_plan_keycheck.results | default([]) }}"
+    # deploy_user does not exist yet, but role 01 creates it earlier in this run.
+    _ssh_plan_created: >-
+      {{ (_base_role_runs | default(false) | bool) and (_base_user_plan | default('keep')) == 'create' }}
+    _ssh_plan_keys_items: >-
+      {%- set out = [] -%}
+      {%- for r in _ssh_plan_r if r.rc == 1 or (r.rc == 3 and r.item.0 == deploy_user and _ssh_plan_created | bool) -%}
+      {%- set _ = out.append({'role': '02', 'part': 'keys', 'do': 'write',
+                              'what': '~' ~ r.item.0 ~ '/.ssh/authorized_keys: add ' ~ r.item.1.split()[0] ~ ' key ...' ~ r.item.1.split()[1][-12:],
+                              'note': 'after role 01 creates the account' if r.rc == 3 else ''}) -%}
+      {%- endfor -%}
+      {{ out }}
+    _ssh_plan_lines: >-
+      {{ lookup('ansible.builtin.template', '00-autosec.conf.j2').splitlines() | map('trim')
+         | reject('match', '^(#|$)') | list }}
+    _ssh_plan_sshd_items: >-
+      {%- set out = [] -%}
+      {%- if _ssh_needs_write | bool -%}
+      {%- if _ssh_migrate_kind == 'stock' -%}
+      {%- set _ = out.append({'role': '02', 'part': 'sshd', 'do': 'replace',
+                              'what': "/etc/ssh/sshd_config: the distro's stock file back (ssh_migrate_sshd_config)", 'note': ''}) -%}
+      {%- elif _ssh_migrate_kind == 'include' -%}
+      {%- set _ = out.append({'role': '02', 'part': 'sshd', 'do': 'write',
+                              'what': '/etc/ssh/sshd_config: Include line added as line 1 (ssh_migrate_sshd_config)', 'note': ''}) -%}
+      {%- endif -%}
+      {%- set _ = out.append({'role': '02', 'part': 'sshd', 'do': 'write',
+                              'what': _ssh_dropin ~ ': ' ~ ((_ssh_plan_lines | join('; ')) if _ssh_plan_lines | length > 0 else 'comments only (every setting keep)'),
+                              'note': ('sshd -T changes ' ~ (_ssh_diff | join(', '))) if _ssh_diff | length > 0 else 'no effective sshd setting changes'}) -%}
+      {%- set _ = out.append({'role': '02', 'part': 'undo', 'do': 'write',
+                              'what': _ssh_guard_bin ~ ' and /etc/systemd/system/' ~ _ssh_guard_unit ~ ' (the automatic undo)',
+                              'note': 'written only where they differ from the files already there'}) -%}
+      {%- set _ = out.append({'role': '02', 'part': 'sshd', 'do': 'reload',
+                              'what': 'ssh.service (try-reload-or-restart), put back after ' ~ (ssh_revert_seconds | default(300) | int) ~ ' s unless a brand-new login works',
+                              'note': ''}) -%}
+      {%- endif -%}
+      {{ out }}
+    _ssh_plan_notes: >-
+      {%- set out = [] -%}
+      {%- if _ssh_deferred | bool -%}{%- set _ = out.append('login settings wait: ' ~ _ssh_deferred_reason) -%}{%- endif -%}
+      {%- for r in _ssh_plan_r if r.rc == 3 and not (r.item.0 == deploy_user and _ssh_plan_created | bool) -%}
+      {%- set _ = out.append(r.item.0 ~ ' does not exist; its key waits (deploy_user_account: create makes role 01 create deploy_user)') -%}
+      {%- endfor -%}
+      {%- for r in _ssh_plan_r if r.rc == 4 -%}
+      {%- set _ = out.append('~' ~ r.item.0 ~ '/.ssh or its authorized_keys is a link or not a plain file: the key is not added') -%}
+      {%- endfor -%}
+      {%- if not (_ssh_local_mode | bool) and _ssh_controller_ip | length > 0 -%}
+      {%- set _ = out.append("runtime only: fail2ban's sshd jail (if it runs) ignores this computer's address while the run lasts; removed at the end") -%}
+      {%- endif -%}
+      {{ out | unique | list }}

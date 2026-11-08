@@ -5,7 +5,30 @@ what has been **claimed but not yet proven**. auto_sec is early-stage; this
 document exists so anyone evaluating it can see the gaps as clearly as the
 features. If you only read the marketing, read this too.
 
-Last updated: 2026-07 (after the first real-hardware test on Ubuntu 22.04).
+Last updated: 2026-10 (0.6.0 work; the sections below 0.6 are older).
+
+---
+
+## Update: 0.6 (the detectors, and existing servers)
+
+- **Two detectors never worked as documented**
+  ([#18](https://github.com/pythonistastic/auto_sec/issues/18)). The
+  ransomware canary's `inotifywait` ran without `-m`, so it stopped after
+  the first event and never reached its threshold. The 5-minute audit
+  scan passed its saved time to `ausearch` in a format ausearch rejects,
+  and hid the error, so it found events only on its first run. The 2026-07
+  test below checked that detectors *write incident files*; it did not
+  check these two over time. The status table is corrected.
+- 0.6 therefore installs no detector at all, and no longer deletes an
+  operator's `/etc/audit/rules.d/hardening.rules` (0.3–0.5 did). A
+  rewritten, tested detection suite is planned for 0.7.
+- A full run on a server that was already in use changed far too much
+  (ufw rules, sudo, kernel settings, packages). 0.6 adds
+  `autosec_server: existing | new`, a plan before every run, and an
+  optional approval step; on an existing server it changes only what is
+  named.
+- auto_sec stays a personal research project. 0.4's and 0.5's live test
+  jobs ran on GitHub's runners; 0.6's have not run yet.
 
 ---
 
@@ -164,9 +187,11 @@ Confidence should read as "works on the box we tried," not "works everywhere."
 
 | Area | Status |
 |------|--------|
-| Base hardening, SSH lockdown, firewall, auditd tripwires | Validated on Ubuntu 22.04 |
-| Reverse-shell detector | Validated (fires, captures evidence) |
-| Recon-burst detector | Validated (fires, captures evidence) |
+| Base hardening, SSH lockdown, firewall | Validated on Ubuntu 22.04 (2026-07); the 0.4–0.6 changes are lab-tested only |
+| auditd tripwires: 5-minute audit scan | **Worked only on its first run (#18); not installed in 0.6** |
+| Ransomware canary | **Never alerted (#18); not installed in 0.6** |
+| Reverse-shell detector | Fired in the 2026-07 test; not installed in 0.6 |
+| Recon-burst detector | Fired in the 2026-07 test (and fires on every auto_sec run); not installed in 0.6 |
 | Wizard / onboarding, CI, docs | Working |
 | CVE scanner logic (role 11) | Validated locally: lockfile parsing, live OSV queries, dedupe, Tier-2 PR flow on a real repo |
 | CVE role *deployment* (systemd timer, `ProtectSystem=strict` sandbox) | **Units validated statically only — never installed on a real server** |

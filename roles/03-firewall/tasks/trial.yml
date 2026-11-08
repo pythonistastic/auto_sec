@@ -12,7 +12,7 @@
 # `-t`) what each copy means. Nothing under /etc changes, so this also runs
 # in --check. Sets _f2b_trial (the helper's JSON) and _f2b_nginx_ours.
 #
-# R6 is checked here, before the trial: a file auto_sec did not write must
+# R03-F6 is checked here, before the trial: a file auto_sec did not write must
 # never be treated as auto_sec's.
 
 - name: "fail2ban trial: auto_sec's file names and their first lines"
@@ -34,7 +34,7 @@
   changed_when: false
   check_mode: false
 
-- name: "fail2ban trial R6: a file with auto_sec's name must be auto_sec's own"
+- name: "fail2ban trial R03-F6: a file with auto_sec's name must be auto_sec's own"
   ansible.builtin.assert:
     quiet: true
     that: _f2b_foreign | length == 0
@@ -91,8 +91,27 @@
       check_mode: false
       diff: false
 
+    # For the plan: would the real file get new content? (The trial below
+    # says whether fail2ban's effective config changes.)
+    - name: "fail2ban trial: the candidate and the current file"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+        follow: false
+      loop:
+        - "{{ _f2b_sim_dir }}/candidate"
+        - "{{ _f2b_kinds[_f2b_kind].dest }}"
+      register: _f2b_cand_stat
+      check_mode: false
+
+    - name: "fail2ban trial: does the file change?"
+      ansible.builtin.set_fact:
+        _f2b_file_differs: >-
+          {{ not (_f2b_cand_stat.results[1].stat.exists | default(false))
+             or (_f2b_cand_stat.results[0].stat.checksum | default('a')) != (_f2b_cand_stat.results[1].stat.checksum | default('b')) }}
+
     # One argv list, no shell: python3 -I -c <helper> <options>. Every
-    # option value is a constant or a value preflight P1 has checked.
+    # option value is a constant or a value preflight PF1 has checked.
     - name: "fail2ban trial: ask fail2ban's own config reader (read-only)"
       ansible.builtin.command:
         argv: "{{ _f2b_argv }}"

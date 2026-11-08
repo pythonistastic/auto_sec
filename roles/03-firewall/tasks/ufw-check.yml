@@ -1,0 +1,43 @@
+---
+# roles/03-firewall/tasks/ufw-check.yml - run the read-only turn-on helper.
+#
+# Included by ufw-preflight.yml (stage preflight) and ufw.yml (stage apply)
+# when ufw is off and firewall_state is enabled. One argv list, no shell:
+# python3 -I -c <helper> <options>. --want holds only your variables (the
+# rules of _fw_items, without their command lines, firewall_ssh_rule,
+# firewall_closed_ok, egress_lockdown); --controller-ip is role 02's
+# checked _ssh_controller_ip (compare only, SECURITY.md). Sets _fw_turnon.
+
+- name: "ufw check: is ufw installed now?"
+  ansible.builtin.command:
+    argv: [dpkg-query, -W, "-f=${db:Status-Abbrev}|${Package}\n", ufw]
+  register: _fw_ck_pkg
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "ufw check: ask the turn-on helper (read-only)"
+  ansible.builtin.command:
+    argv: "{{ _fw_ck_argv }}"
+  register: _fw_ck_raw
+  changed_when: false
+  failed_when: _fw_ck_raw.rc != 0 or not (_fw_ck_raw.stdout | default('') is match('^\{'))
+  check_mode: false
+  vars:
+    _fw_ck_installed: "{{ _fw_ck_pkg.stdout_lines | default([]) | select('match', '^.i[^|]*[|]ufw$') | list | length > 0 }}"
+    _fw_ck_want:
+      items: "{{ _fw_items | map('dict2items') | map('rejectattr', 'key', 'equalto', 'argv') | map('items2dict') | list }}"
+      ssh_rule: "{{ firewall_ssh_rule }}"
+      closed_ok: "{{ firewall_closed_ok }}"
+      egress: "{{ _fw_egress | bool }}"
+    _fw_ck_argv: >-
+      {{ [_fw_python, '-I', '-c', lookup('ansible.builtin.file', 'auto-sec-ufw-turnon'),
+          '--want', _fw_ck_want | to_json,
+          '--ssh-port', ssh_port | int | string,
+          '--controller-ip', _ssh_controller_ip | default('', true) | string]
+         + ([] if (_fw_ck_installed | bool) else ['--no-ufw'])
+         + _fw_helper_lab_args }}
+
+- name: "ufw check: read the result"
+  ansible.builtin.set_fact:
+    _fw_turnon: "{{ _fw_ck_raw.stdout | from_json }}"

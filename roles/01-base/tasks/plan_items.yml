@@ -1,0 +1,48 @@
+---
+# roles/01-base/tasks/plan_items.yml - preflight B9: role 01's plan items
+# (_plan_01) for the plan summary (roles/00-plan). No host access; the
+# tests run it with lab values. Imported by preflight.yml only when role
+# 01 runs (otherwise _plan_01 stays []).
+#
+# One item per change main would make (plan contract: {role, part, do,
+# what, note}). "what" holds only your values and constant names, so the
+# plan id stays the same while the host does not change; what was read
+# from the host goes in "note", which is shown but not part of the id.
+- name: "Base B9: the plan items"
+  ansible.builtin.set_fact:
+    _plan_01: >-
+      {{ ([{'role': '01', 'part': 'packages', 'do': 'install', 'what': _base_pkgs_missing | join(' '),
+            'note': 'without recommended packages; needrestart held back'}]
+          if (_base_pkgs_missing | length > 0) else [])
+         + ([{'role': '01', 'part': 'updates', 'do': 'replace',
+              'what': _base_uu_dist_file ~ ': the distro file back (apt_migrate_unattended_upgrades)',
+              'note': 'a copy goes to ' ~ _base_backup_file}] if (_base_uu_restore | bool) else [])
+         + ([{'role': '01', 'part': 'updates', 'do': 'write', 'what': 'write ' ~ _base_uu_file ~ ': ' ~ _base_uu_what,
+              'note': (_base_uu_diff_lines | join('; ')) if (_base_uu_diff | length > 0) else 'apt reads the same'}]
+            if _base_uu_file_change == 'write' else [])
+         + ([{'role': '01', 'part': 'updates', 'do': 'write', 'what': 'remove ' ~ _base_uu_file,
+              'note': (_base_uu_diff_lines | join('; ')) if (_base_uu_diff | length > 0) else 'apt reads the same'}]
+            if _base_uu_file_change == 'remove' else [])
+         + ([{'role': '01', 'part': 'updates', 'do': 'install', 'what': 'apt-get dist-upgrade (apt_full_upgrade)',
+              'note': ((_base_pending_upgrades ~ ' updates waiting') if (_base_pending_upgrades | int) >= 0
+                       else 'unknown number of updates') ~ ('; a new kernel' if (_base_pending_kernel | bool) else '')}]
+            if (_base_full_upgrade | bool) else [])
+         + ([{'role': '01', 'part': 'account', 'do': 'user', 'what': 'create ' ~ deploy_user,
+              'note': 'home, shell /bin/bash, password locked (key login only), no extra groups'}]
+            if _base_user_plan == 'create' else [])
+         + ([{'role': '01', 'part': 'sudo', 'do': 'sudoers', 'what': 'write ' ~ _base_sudo_file,
+              'note': 'passwordless sudo for ' ~ deploy_user}] if (_base_sudo_write | bool) else [])
+         + ([{'role': '01', 'part': 'hostname', 'do': 'write', 'what': 'hostname ' ~ _base_hostname_want,
+              'note': 'now ' ~ (_base_hostname_now | default('?', true))}] if (_base_hostname_change | bool) else [])
+         + ([{'role': '01', 'part': 'timezone', 'do': 'write', 'what': 'timezone ' ~ _base_tz_want,
+              'note': 'now ' ~ (_base_tz_now | default('?', true))}] if (_base_tz_change | bool) else []) }}
+  vars:
+    # What the file says, from your values only (the template's inputs),
+    # so a changed value changes the plan id.
+    _base_uu_what: >-
+      {{ ((['updates on (Update-Package-Lists 1, Unattended-Upgrade 1)'] if (_base_uu_write_periodic | bool) else [])
+          + (['Automatic-Reboot true at ' ~ _base_uu_reboot_time] if _base_uu_reboot == 'on' else [])
+          + (['Automatic-Reboot false'] if _base_uu_reboot == 'off' else [])
+          + (['blacklist ' ~ (_base_uu_blacklist | join(' '))] if (_base_uu_blacklist | length > 0) else [])
+          + (['origins security'] if _base_uu_origins == 'security' else []))
+         | join('; ') | default('comments only', true) }}

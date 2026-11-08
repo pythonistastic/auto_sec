@@ -1,17 +1,70 @@
 ---
-- name: Install Nginx and certbot
-  ansible.builtin.apt:
-    name: [nginx, certbot, python3-certbot-nginx]
-    state: present
+# Layer 05: app runtime (Node/Docker + nginx + TLS), only when app_type is
+# set. 0.6: follows plan.yml (site.yml pre_tasks), which refuses a host
+# whose nginx is not auto_sec's (R05-1), whose deploy_user is missing for
+# the docker group (R05-2), whose account app is not a system account
+# without login (R05-3) or whose app_dir is not app's (R05-4); checked
+# again here (M05-1). apt installs go through the package guard. Layer 05
+# creates no login account and changes no existing account or folder.
 
+- name: "App: the plan must have run in this play"
+  ansible.builtin.assert:
+    quiet: true
+    that: _l05_planned | default(false) | bool
+    fail_msg: >-
+      Role 05 needs its plan (site.yml includes roles/05-app-runtime/tasks/plan.yml in
+      pre_tasks). Nothing has been changed.
+
+- name: "App: nginx, the vhost, app and app_dir again, right before the change"
+  ansible.builtin.command:
+    argv: "{{ ['sh', '-c', _l05_read_sh, 'sh', _l05_header, '/etc/nginx/sites-available/' ~ client_domain, deploy_user, app_dir] }}"
+  environment:
+    LC_ALL: C
+  register: _l05_again
+  changed_when: false
+  check_mode: false
+
+- name: "App M05-1: nginx, app and app_dir are as the plan saw them"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _l05_again_now.nginx == _l05_plan_snapshot.nginx
+      - _l05_again_now.vhost == _l05_plan_snapshot.vhost
+      - _l05_again_now.app == _l05_plan_snapshot.app
+      - _l05_again_now.appdir == _l05_plan_snapshot.appdir
+    fail_msg: >-
+      nginx, the account app or app_dir on {{ inventory_hostname }} changed during this run. Nothing
+      was changed by layer 05. Run again.
+  vars:
+    _l05_again_now: >-
+      {%- set out = {} -%}
+      {%- for ln in _l05_again.stdout_lines | select('match', '^(nginx|vhost|app|appdir) ') -%}
+      {%- set f = ln.split(' ', 1) -%}
+      {%- set _ = out.update({f[0]: (f[1] if f | length > 1 else '')}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: "App: install nginx and certbot (package guard)"
+  when: not ansible_check_mode
+  ansible.builtin.include_role:
+    name: autosec-apt
+    tasks_from: install
+  vars:
+    _aptg_want: "{{ _l05_pkg_want }}"
+    _aptg_who: role 05 (app)
+
+# Only when missing (plan R05-3): an existing account is never changed.
 - name: Create app service user (non-root, no login shell)
+  when: (_l05_plan_snapshot.app | default('absent')) == 'absent'
   ansible.builtin.user:
     name: app
     shell: /usr/sbin/nologin
     system: true
     create_home: false
 
+# Only when missing (plan R05-4): an existing app_dir already belongs to app.
 - name: Create app directory
+  when: (_l05_plan_snapshot.appdir | default('absent')) == 'absent'
   ansible.builtin.file:
     path: "{{ app_dir }}"
     state: directory
@@ -49,11 +102,16 @@
             argv: [/bin/bash, /opt/nodesource_setup.sh]
             creates: /etc/apt/sources.list.d/nodesource.list
 
-        - name: Install Node.js
-          ansible.builtin.apt:
-            name: nodejs
-            state: present
-            update_cache: true
+        # NodeSource's repository is new, so this is a second guarded
+        # install (it refreshes the package lists itself).
+        - name: Install Node.js (package guard)
+          when: not ansible_check_mode
+          ansible.builtin.include_role:
+            name: autosec-apt
+            tasks_from: install
+          vars:
+            _aptg_want: [nodejs]
+            _aptg_who: role 05 (NodeSource)
 
     - name: Install PM2 globally
       community.general.npm:
@@ -77,11 +135,33 @@
       args:
         creates: /usr/bin/docker
 
-    - name: Add deploy user to docker group
+    # Docker group membership is root-equivalent (the plan says so). The
+    # user module would CREATE a missing account: layer 05 only adds an
+    # existing one to the group.
+    - name: Does deploy_user exist?
+      ansible.builtin.command:
+        argv: [getent, passwd, "{{ deploy_user }}"]
+      register: _l05_getent
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Add deploy user to docker group (existing account only)
+      when: _l05_getent.rc == 0
       ansible.builtin.user:
         name: "{{ deploy_user }}"
         groups: docker
         append: true
+
+    - name: "App M05-2: deploy_user must exist for the docker group (outside --check)"
+      when: _l05_getent.rc != 0
+      ansible.builtin.assert:
+        quiet: true
+        that: ansible_check_mode
+        fail_msg: >-
+          {{ deploy_user }} does not exist on {{ inventory_hostname }}, so it was not added to the
+          docker group. Layer 05 creates no account: set deploy_user_account: create (role 01),
+          then run again.
 
 - name: Hardened Nginx reverse proxy vhost
   ansible.builtin.template:

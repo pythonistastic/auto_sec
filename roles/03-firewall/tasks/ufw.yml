@@ -1,0 +1,330 @@
+---
+# roles/03-firewall/tasks/ufw.yml - role 03's ufw part (tags firewall, ufw).
+#
+# It does something only when the preflight planned a turn-on: ufw is off
+# (or missing) and firewall_state is enabled. On an active ufw, or with
+# firewall_state: keep, it runs no ufw command at all (#8).
+#
+#   U0  the preflight must have run
+#   U1  ufw missing: install it through the package guard (autosec-apt)
+#   U2  the turn-on check again, on the real ufw files; M03-W1 if ufw
+#       changed since the preflight, M03-W4 if ufw is on now
+#   U3  --check: stop here (the plan was printed)
+#   U4  role 02's undo guard: fresh, install, arm --ufw on ufw's 4 files
+#   U5-U7 add the planned rules (ufw-add.yml); the rule list must then be
+#       exactly the planned one (M03-W2)
+#   U8  the undo must still be armed (read-only status), with time left
+#       for the login test; ufw --force enable; then check, which records
+#       all four files as written by this run (a late undo puts all four
+#       back together)
+#   U9  a brand-new SSH login (role 02 tasks_from prove), retried once
+#   U10 ufw active and the SSH rule loaded, then keep (disarm); otherwise
+#       the guard turns ufw off and puts the 4 files back (M03-W3)
+# On any failure the rescue (ufw-undo.yml) reads the guard and ufw again:
+# if the undo's timer had already run before ufw was turned on, ufw would
+# stay on with the old rule files, so the rescue turns it off itself.
+#
+# Kernel values ufw's own sysctl file tightens at start stay after an
+# undo until the next reboot (the plan says so).
+
+- name: "ufw U0: the preflight must have run in this play"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _fw_will_turn_on is defined
+      - _fw_items is defined
+      - _fw_role_runs | default(false) | bool
+    fail_msg: >-
+      Role 03's ufw part needs its preflight, and the role must be tagged "firewall".
+      site.yml runs the preflight in pre_tasks (import_role name=03-firewall
+      tasks_from=preflight, tags always). Do the same in any other playbook that uses
+      role 03. Nothing has been changed in ufw.
+
+- name: "ufw: turn ufw on"
+  when: _fw_will_turn_on | bool
+  block:
+    - name: "ufw U1: install ufw (package guard)"
+      when:
+        - not (_fw_installed | bool)
+        - not ansible_check_mode
+      ansible.builtin.include_role:
+        name: autosec-apt
+        tasks_from: install
+      vars:
+        _aptg_want: "{{ _fw_pkg_want }}"
+        _aptg_who: role 03 (ufw)
+
+    - name: "ufw U1: is ufw installed now?"
+      ansible.builtin.command:
+        argv: [dpkg-query, -W, "-f=${db:Status-Abbrev}|${Package}\n", ufw]
+      register: _fw_u1_pkg
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "ufw U1: ufw must be installed now (outside --check)"
+      ansible.builtin.assert:
+        quiet: true
+        that: ansible_check_mode or (_fw_u1_now | bool)
+        fail_msg: >-
+          The package guard reported ufw as installed, but dpkg says it is not on
+          {{ inventory_hostname }}. ufw has not been configured.
+      vars:
+        _fw_u1_now: "{{ _fw_u1_pkg.stdout_lines | default([]) | select('match', '^.i[^|]*[|]ufw$') | list | length > 0 }}"
+
+    - name: "ufw U3: check mode on a host without ufw"
+      when: _fw_u1_pkg.stdout_lines | default([]) | select('match', '^.i[^|]*[|]ufw$') | list | length == 0
+      ansible.builtin.debug:
+        msg: >-
+          Check mode: ufw is not installed on {{ inventory_hostname }} yet. The real run installs
+          it, checks its files and your rules again, then {{ _fw_plan }}.
+
+    - name: "ufw: check, add, turn on, prove"
+      when: _fw_u1_pkg.stdout_lines | default([]) | select('match', '^.i[^|]*[|]ufw$') | list | length > 0
+      block:
+        - name: "ufw U2: the turn-on check again, on ufw's real files"
+          ansible.builtin.set_fact:
+            _fw_stage: apply
+
+        - name: "ufw U2: ask the turn-on helper again (read-only)"
+          ansible.builtin.include_tasks:
+            file: ufw-check.yml
+
+        # A ufw that was there at the preflight must be exactly as it was.
+        # One that this run installed gets its first full check here.
+        - name: "ufw U2 M03-W1: ufw must not have changed since the preflight"
+          when: _fw_installed | bool
+          ansible.builtin.assert:
+            quiet: true
+            that:
+              - _fw_turnon.ufw_lines == _fw_turnon_pf.ufw_lines
+              - _fw_turnon.default_sha256 == _fw_turnon_pf.default_sha256
+              - _fw_turnon.enabled_conf == _fw_turnon_pf.enabled_conf
+              - _fw_turnon.verdicts | map(attribute='id') | list == _fw_turnon_pf.verdicts | map(attribute='id') | list
+              - _fw_turnon['items'] | map(attribute='status') | list == _fw_turnon_pf['items'] | map(attribute='status') | list
+            fail_msg: >-
+              ufw on {{ inventory_hostname }} changed during this run. Nothing was added to ufw.
+              Run again.
+
+        # The same rule as the preflight: no ufw command on an active ufw.
+        # Something may have turned ufw on while roles 01 and 02 ran (you in
+        # another session, cloud-init, a provisioning script).
+        - name: "ufw U2: ufw status (read-only)"
+          ansible.builtin.command:
+            argv: "{{ _fw_ufw_argv + ['status'] }}"
+          environment:
+            LANG: C
+            LC_ALL: C
+          register: _fw_u2_status
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: "ufw U2 M03-W4: ufw must still be off"
+          ansible.builtin.assert:
+            quiet: true
+            that:
+              - "'Status: inactive' in (_fw_u2_status.stdout_lines | default([]))"
+              - (_fw_turnon.enabled_conf | default('') | lower) != 'yes'
+            fail_msg: >-
+              ufw on {{ inventory_hostname }} is {{ 'on' if 'Status: active' in (_fw_u2_status.stdout_lines | default([]))
+              else 'not readable' }} now{{ ', and ufw.conf says ENABLED=yes' if (_fw_turnon.enabled_conf | default('') | lower) == 'yes'
+              else '' }}; it was off when this run started. auto_sec runs no ufw command on an
+              active ufw. Nothing was added to ufw. Run again: the next run leaves an active ufw
+              alone.
+
+        - name: "ufw U2: refuse or go on"
+          ansible.builtin.include_tasks:
+            file: ufw-decide.yml
+
+        - name: "ufw U3: what the real run does (check mode)"
+          when: ansible_check_mode
+          ansible.builtin.debug:
+            msg: >-
+              Check mode: {{ _fw_plan }} on {{ inventory_hostname }}:
+              {{ (_fw_add | map(attribute='argv') | map('join', ' ') | map('regex_replace', '^', 'ufw ') | list
+                  + (['ufw default deny outgoing'] if ((_fw_egress | bool) and _fw_out_policy not in ['DROP', 'REJECT']) else [])
+                  + ['ufw --force enable']) | join('; ') }}.
+
+        - name: "ufw U4-U10: the change, under the automatic undo"
+          when: not ansible_check_mode
+          block:
+            - name: "ufw U4: name this change"
+              ansible.builtin.set_fact:
+                _ssh_guard_id: "autosec-{{ '%012x' | format(281474976710655 | random) }}"
+                _fw_armed: false
+                _fw_kept: false
+                _fw_u8_ran: false
+
+            - name: "ufw U4: no undo pending, and sshd runs the files on disk"
+              ansible.builtin.include_role:
+                name: 02-ssh-hardening
+                tasks_from: guard
+              vars:
+                _ssh_guard_action: fresh
+
+            - name: "ufw U4: install the automatic undo"
+              ansible.builtin.include_role:
+                name: 02-ssh-hardening
+                tasks_from: guard
+              vars:
+                _ssh_guard_action: install
+
+            # The deadline is computed from the server's own clock. --ufw:
+            # the undo runs `ufw --force disable`, then puts ufw's 4 files
+            # back byte-for-byte (role 02's guard).
+            - name: "ufw U4: arm the automatic undo (--ufw)"
+              ansible.builtin.command:
+                argv: >-
+                  {{ ['sh', '-c', 'set -eu; d=$(( $(date +%s) + $1 )); echo "deadline=$d"; b=$2; i=$3; shift 3; exec "$b" arm "$i" "$d" --ufw -- "$@"',
+                      'sh', firewall_revert_seconds | int | string, _ssh_guard_bin, _ssh_guard_id] + _fw_guard_paths }}
+              register: _fw_arm
+              changed_when: _fw_arm.rc == 0
+              failed_when: false
+
+            - name: "ufw U4: arming must succeed"
+              ansible.builtin.assert:
+                quiet: true
+                that: _fw_arm.rc == 0
+                fail_msg: >-
+                  Could not arm the automatic undo on {{ inventory_hostname }} (rc {{ _fw_arm.rc }}):
+                  {{ {7: 'another auto_sec change is still pending (sudo auto-sec-ssh-guard status)',
+                      9: 'the undo deadline is out of range (check the server clock)',
+                      2: 'bad arguments (auto_sec bug)'}[_fw_arm.rc | int] | default('see the error output') }}.
+                  {{ _fw_arm.stderr | default('') | regex_replace('[{}]', '?') | trim }} Nothing has been added to ufw.
+
+            - name: "ufw U4: the undo is armed"
+              ansible.builtin.set_fact:
+                _fw_armed: true
+
+            - name: "ufw U5-U10: add, turn on, prove (undone on any failure)"
+              block:
+                - name: "ufw U5-U7: add the planned rules"
+                  ansible.builtin.include_tasks:
+                    file: ufw-add.yml
+
+                - name: "ufw U8: the undo is still armed, with time left (read-only)"
+                  ansible.builtin.include_tasks:
+                    file: ufw-armed.yml
+
+                - name: "ufw U8: ufw goes on now"
+                  ansible.builtin.set_fact:
+                    _fw_u8_ran: true
+
+                - name: "ufw U8: turn ufw on"
+                  ansible.builtin.command:
+                    argv: "{{ _fw_ufw_argv + ['--force', 'enable'] }}"
+                  environment:
+                    LANG: C
+                    LC_ALL: C
+                  changed_when: true
+
+                # Records all four files at once (the rules and ufw.conf's
+                # ENABLED=yes) as written by this run: an undo after the grace
+                # time (a reboot long after the deadline) then still puts all
+                # of them back together.
+                - name: "ufw U8: the undo is still armed, and knows what this run wrote"
+                  ansible.builtin.include_role:
+                    name: 02-ssh-hardening
+                    tasks_from: guard
+                  vars:
+                    _ssh_guard_action: check
+
+                - name: "ufw U9: brand-new SSH login"
+                  ansible.builtin.include_role:
+                    name: 02-ssh-hardening
+                    tasks_from: prove
+                  vars:
+                    _ssh_prove_mode: normal
+                    _ssh_prove_label: after ufw was turned on
+                    _ssh_prove_delay: 0
+
+                - name: "ufw U9: brand-new SSH login, once more after 10 s"
+                  when: not (_ssh_prove_ok | bool)
+                  ansible.builtin.include_role:
+                    name: 02-ssh-hardening
+                    tasks_from: prove
+                  vars:
+                    _ssh_prove_mode: normal
+                    _ssh_prove_label: after ufw was turned on (retry)
+                    _ssh_prove_delay: 10
+
+                # CI only (full-new-live): the login test counts as failed,
+                # so the undo path runs on a real runner.
+                - name: "ufw U9: CI-only injected login failure"
+                  when: autosec_ci_inject_ufw_fail | default(false) | bool
+                  ansible.builtin.set_fact:
+                    _ssh_prove_ok: false
+                    _ssh_prove_msg: injected by autosec_ci_inject_ufw_fail (CI only)
+
+                - name: "ufw U9 M03-W3: the brand-new SSH login must work"
+                  ansible.builtin.assert:
+                    quiet: true
+                    that: _ssh_prove_ok | bool
+                    fail_msg: "A brand-new SSH login to {{ inventory_hostname }} failed after ufw was turned on: {{ _ssh_prove_msg }}"
+
+                - name: "ufw U10: ufw status verbose"
+                  ansible.builtin.command:
+                    argv: "{{ _fw_ufw_argv + ['status', 'verbose'] }}"
+                  environment:
+                    LANG: C
+                    LC_ALL: C
+                  register: _fw_u10_status
+                  changed_when: false
+
+                - name: "ufw U10: the SSH rule in the running firewall"
+                  ansible.builtin.command:
+                    argv: [iptables, -S, ufw-user-input]
+                  register: _fw_u10_ipt
+                  changed_when: false
+                  failed_when: false
+
+                # The expected line is built from ssh_port, never read from the host.
+                - name: "ufw U10: ufw is active and lets SSH in"
+                  ansible.builtin.assert:
+                    quiet: true
+                    that:
+                      - "'Status: active' in _fw_u10_status.stdout_lines"
+                      - >-
+                        _fw_u10_ipt.stdout_lines | default([])
+                        | select('search', '-p tcp .*--dport ' ~ (ssh_port | int) ~ '( |$)')
+                        | reject('search', '-j (DROP|REJECT|ufw-user-limit)( |$)') | list | length > 0
+                    fail_msg: >-
+                      ufw on {{ inventory_hostname }} is not active with an SSH rule for port
+                      {{ ssh_port | int }} loaded after `ufw --force enable`.
+
+                - name: "ufw U10: keep the change (disarm the undo)"
+                  ansible.builtin.include_role:
+                    name: 02-ssh-hardening
+                    tasks_from: guard
+                  vars:
+                    _ssh_guard_action: disarm
+
+                - name: "ufw U10: kept"
+                  ansible.builtin.set_fact:
+                    _fw_kept: true
+
+              rescue:
+                - name: "ufw: undo the turn-on and stop this host"
+                  ansible.builtin.include_tasks:
+                    file: ufw-undo.yml
+
+    - name: "ufw: state after this run"
+      when: not ansible_check_mode
+      ansible.builtin.command:
+        argv: "{{ _fw_ufw_argv + ['status', 'verbose'] }}"
+      environment:
+        LANG: C
+        LC_ALL: C
+      register: _fw_end_status
+      changed_when: false
+      failed_when: false
+
+    - name: "ufw: one line for the report"
+      when: not ansible_check_mode
+      ansible.builtin.set_fact:
+        _fw_report: >-
+          {{ 'ufw is on (turned on by this run). ' ~ (_fw_end_lines | select('match', '^Default: ') | first | default(''))
+             if 'Status: active' in _fw_end_lines else 'ufw is off' }}
+      vars:
+        _fw_end_lines: "{{ _fw_end_status.stdout_lines | default([]) | map('regex_replace', '[^ -~]', '?') | map('regex_replace', '[{}]', '?') | list }}"

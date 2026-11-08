@@ -1,0 +1,131 @@
+---
+# Runs role 01's account, sudo and kernel-settings pieces on localhost,
+# unprivileged, against a lab tree:
+#   plan.yml        (B1: deploy_user_account, R01-A0, R01-A1)
+#   account.yml     (B2, B3, B5b: the account, auto_sec's sudo file, sudo's
+#                   configuration, R01-A2 to R01-A5, the packages wanted)
+#   admin.yml       (B12: the account role 02 logs in as, R01-A6, R01-A7)
+#   kernel.yml      (B13: /etc/sysctl.conf, N01-K1, N01-K2)
+#   plan_items.yml  (B9: _plan_01)
+# and, with -e lab_mutate=<text>, main step 6b's check before the write
+# (sudo.yml again, then sudo_check.yml: M01-A1): the lab's sudo file is
+# changed after the preflight.
+# run.sh puts fake getent, id and dpkg-query first in PATH; visudo is the
+# real one, pointed at the lab with -f. The lab directory holds sudoers,
+# sudoers.d/, sysctl.conf and sysctl.d/.
+#   ansible-playbook account.yml -e lab_dir=<dir> -e lab_out=<facts.json>
+#     [-e lab_render=<file>] [-e lab_mutate=<text> [-e lab_mutate_file=<name>]]
+#     [-e lab_role_runs=false]
+#     [-e lab_uu_install=true] [role 01 and role 02 variables...]
+# A refusal makes the play fail (non-zero rc); run.sh checks the message.
+- name: Role 01 account, sudo and kernel pieces against a lab tree
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _role_dir: "{{ playbook_dir }}/../../../roles/01-base"
+    # Play vars beat the role defaults: point the role at the lab.
+    _base_sudoers: "{{ lab_dir }}/sudoers"
+    _base_sudo_dir: "{{ lab_dir }}/sudoers.d"
+    _base_run_dir: "{{ lab_dir }}/run"
+    _base_sudo_candidate: "{{ lab_dir }}/run/sudoers-candidate"
+    _base_visudo_check: [visudo, -c, -f, "{{ lab_dir }}/sudoers"]
+    _base_sysctl_conf: "{{ lab_dir }}/sysctl.conf"
+    _base_sysctl_link: "{{ lab_dir }}/sysctl.d/99-sysctl.conf"
+  tasks:
+    - name: "B1: check the variables and make the plan (role 01 plan.yml)"
+      ansible.builtin.include_role:
+        name: 01-base
+        tasks_from: plan
+        public: true
+
+    - name: "What the rest of the preflight would have set"
+      ansible.builtin.set_fact:
+        _base_role_runs: "{{ lab_role_runs | default(true) | bool }}"
+        _base_uu_install: "{{ lab_uu_install | default(false) | bool }}"
+        _base_user_plan: keep
+        _base_sudo_write: false
+        _base_pkgs_missing: []
+        _base_sudo_pf: {state: absent, sha256: "", checked: false}
+
+    - name: "B2, B3, B5b (role 01 account.yml)"
+      when: _base_role_runs | bool
+      ansible.builtin.include_role:
+        name: 01-base
+        tasks_from: account
+
+    - name: "B12 (role 01 admin.yml)"
+      ansible.builtin.include_role:
+        name: 01-base
+        tasks_from: admin
+
+    - name: "B13 (role 01 kernel.yml)"
+      ansible.builtin.include_role:
+        name: 01-base
+        tasks_from: kernel
+
+    - name: "Keep a copy of auto_sec's sudo file as it would be written"
+      when: lab_render is defined
+      ansible.builtin.template:
+        src: "{{ _role_dir }}/templates/sudoers-autosec.j2"
+        dest: "{{ lab_render }}"
+        mode: "0644"
+
+    - name: "Main 6b: the sudo file changes after the preflight"
+      when: lab_mutate is defined
+      block:
+        - name: "Something else writes the sudo file (or lab_mutate_file there)"
+          ansible.builtin.copy:
+            content: "{{ lab_mutate }}\n"
+            dest: "{{ _base_sudo_dir }}/{{ lab_mutate_file | default(deploy_user) }}"
+            mode: "0644"
+
+        - name: "Main 6b: read again (role 01 sudo.yml)"
+          ansible.builtin.include_role:
+            name: 01-base
+            tasks_from: sudo
+          vars:
+            _base_sudo_scan: "{{ _base_sudo_installed | bool }}"
+
+        - name: "Main 6b: compare and check (role 01 sudo_check.yml)"
+          ansible.builtin.include_role:
+            name: 01-base
+            tasks_from: sudo_check
+          vars:
+            _base_sudo_cmp: true
+            _base_sudo_end: Nothing in sudo has been changed.
+
+    - name: "What the rest of the preflight would have set for the plan"
+      ansible.builtin.set_fact:
+        _base_uu_restore: "{{ lab_uu_restore | default(false) | bool }}"
+        _base_uu_file_change: "{{ lab_uu_change | default('none') }}"
+        _base_uu_write_periodic: "{{ lab_uu_periodic | default(false) | bool }}"
+        _base_uu_diff: "{{ lab_uu_diff | default([]) }}"
+        _base_uu_diff_lines: "{{ lab_uu_diff | default([]) | map('regex_replace', '$', ': a -> b') | list }}"
+        _base_pending_upgrades: "{{ lab_pending | default(-1) }}"
+        _base_pending_kernel: false
+        _base_hostname_change: "{{ (server_hostname | default('keep')) != 'keep' }}"
+        _base_hostname_now: lab
+        _base_tz_change: "{{ (timezone | default('keep')) != 'keep' }}"
+        _base_tz_now: "{{ lab_tz_now | default('UTC') }}"
+
+    - name: "B9 (role 01 plan_items.yml)"
+      when: _base_role_runs | bool
+      ansible.builtin.include_role:
+        name: 01-base
+        tasks_from: plan_items
+
+    - name: Write the facts
+      ansible.builtin.copy:
+        dest: "{{ lab_out }}"
+        mode: "0644"
+        content: >-
+          {{ {'account_mode': _base_account_mode, 'uu_enabled': unattended_upgrades_enabled | string,
+              'user_plan': _base_user_plan, 'user_exists': _base_user_exists | default(none),
+              'user_shell': _base_user_shell | default(none), 'sudo_write': _base_sudo_write,
+              'pkg_want': _base_pkg_want | default(none), 'pkgs_missing': _base_pkgs_missing,
+              'sudo_installed': _base_sudo_installed | default(none), 'sudo': _base_sudo_pf,
+              'legacy_sha256': _base_sudo_legacy_sha256, 'b12': _base_b12 | bool,
+              'sysctl_lines': _base_sysctl_lines | default(none), 'sysctl_legacy': _base_sysctl_legacy | default(none),
+              'sysctl_unread': _base_sysctl_unread | default(none), 'plan': _plan_01 | default(none),
+              'candidate_left': (_base_sudo_candidate is exists)} | to_nice_json }}

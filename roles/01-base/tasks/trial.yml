@@ -10,11 +10,14 @@
 #
 # Sets _base_uu_sim_after (effective managed keys after the change),
 # _base_uu_sim_s (lines that set them, in read order), _base_uu_diff and
-# _base_uu_diff_lines, and finishes _base_uu_off_on_purpose. Refuses when
+# _base_uu_diff_lines, _base_uu_file_change (write | remove | none: what
+# main step 3 does to auto_sec's file, for the plan), and finishes
+# _base_uu_off_on_purpose. Refuses when
 # auto_sec's file would break apt (exit 92), when 50unattended-upgrades is
 # auto_sec 0.1-0.4's file and -e apt_migrate_unattended_upgrades=true was
-# not given (or was given with nothing to migrate), or when a file read
-# after auto_sec's would cancel what you chose (verify.yml).
+# not given (or was given with nothing to migrate), when keep would change
+# the update switches (R01-U1), or when a file read after auto_sec's would
+# cancel what you chose (verify.yml).
 
 # The play runs as root (become) and only root can create anything in
 # /run, so the folder and the candidate are root-owned anyway. They set no
@@ -41,6 +44,27 @@
       check_mode: false
       diff: false
 
+    # For the plan: does main step 3 change auto_sec's file at all? With
+    # nothing to write, auto_sec's file from an earlier run goes only in
+    # auto mode (0.5's rule). keep leaves it as it is: an earlier
+    # unattended_upgrades_enabled: true may have put the update switches
+    # there, and removing it could turn the updates off.
+    - name: "Base B5: the candidate file's checksum"
+      when: not (_base_uu_plan_empty | bool)
+      ansible.builtin.stat:
+        path: "{{ _base_candidate }}"
+        checksum_algorithm: sha256
+      register: _base_cand_stat
+
+    - name: "Base B5: does main step 3 change auto_sec's apt file?"
+      ansible.builtin.set_fact:
+        _base_uu_file_change: >-
+          {{ ('remove' if (_base_uu_file_state == 'ours' and _base_uu_enabled_mode == 'auto') else 'none')
+             if (_base_uu_plan_empty | bool)
+             else ('none' if (_base_uu_file_state == 'ours'
+                              and (_base_cand_stat.stat.checksum | default('-')) == (_base_uu_file_sha256 | default('')))
+                   else 'write') }}
+
     - name: "Base B5: let apt read the copy with auto_sec's change"
       ansible.builtin.command:
         argv:
@@ -50,7 +74,9 @@
           - sh
           - "{{ _base_apt_parts }}"
           - "{{ _base_sim_dir }}"
-          - "{{ '-' if (_base_uu_plan_empty | bool) else _base_candidate }}"
+          # nothing to write: the copy keeps auto_sec's file unless main removes it
+          - "{{ (_base_uu_file if (_base_uu_file_state == 'ours' and _base_uu_file_change == 'none') else '-')
+                if (_base_uu_plan_empty | bool) else _base_candidate }}"
           - "{{ _base_uu_file | basename }}"
           - "{{ _base_uu_pristine if (_base_uu_trial_pristine | bool) else '-' }}"
       environment:
@@ -153,6 +179,23 @@
           back. Reinstall unattended-upgrades (apt-get install --reinstall unattended-upgrades) and run
           again.
           {% endif %}Nothing has been changed.
+
+    # keep means "leave the updates as they are". auto_sec's file from an
+    # earlier run (unattended_upgrades_enabled: true) may hold the update
+    # switches; rewriting it for a reboot, origins or blacklist value would
+    # drop them.
+    - name: "Base B6 R01-U1: keep never changes the update switches"
+      when: _base_uu_enabled_mode == 'keep'
+      ansible.builtin.assert:
+        quiet: true
+        that: _base_uu_diff | select('match', '^APT::Periodic::') | list | length == 0
+        fail_msg: >-
+          [R01-U1] unattended_upgrades_enabled is keep, but this run would change the automatic update
+          switches on {{ inventory_hostname }}: {{ _base_uu_diff_lines | select('match', '^APT::Periodic::') | join('; ') }}.
+          auto_sec's {{ _base_uu_file | basename }} from an earlier run (unattended_upgrades_enabled: true)
+          holds them, and the file this run would write for your other unattended_* settings does
+          not. Set unattended_upgrades_enabled: true to keep them in auto_sec's file, or auto to let
+          the distro's 20auto-upgrades decide. Nothing has been changed.
 
     - name: "Base B6: what you chose takes effect"
       ansible.builtin.import_tasks: verify.yml

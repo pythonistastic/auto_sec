@@ -1,5 +1,20 @@
 ---
-# Per-client configuration. Copy to host_vars/<client>.yml and fill in.
+# Per-server configuration. Copy to host_vars/<server>.yml and fill in.
+# This example is a NEW server with a web app, a database and backups.
+# For a server that already runs something, see "An existing server" at
+# the end of this file.
+
+# --- The one required line --------------------------------------------------
+#   existing: a server that already runs something. auto_sec changes
+#             nothing unless you name it below.
+#   new:      a brand-new server. auto_sec turns on ufw (with the ports in
+#             firewall_inbound), fail2ban and automatic updates, and creates
+#             the admin account (deploy_user) with passwordless sudo.
+autosec_server: new
+
+# Every run prints a plan first. With true, a run that would change this
+# server needs your OK: -e autosec_approve=<plan id from the plan>.
+autosec_require_approval: false
 
 client_name: "Example Client LLC"
 client_domain: "app.example.com"
@@ -7,29 +22,54 @@ client_domain: "app.example.com"
 # run if this is left as the CHANGE_ME default.
 letsencrypt_email: "ops@example.com"
 
-# standard | high. high adds fwknop; in 0.4.0 SSH stays visible
-# (rate-limited) in both modes. Hiding SSH returns in a later release.
+# standard | high. high adds fwknop and needs fwknop_pcap_intf. SSH stays
+# visible (rate-limited) in both modes. Hiding SSH returns in a later release.
 paranoia_level: "high"
+# The network interface fwknopd listens on (`ip route` shows it after "dev").
+fwknop_pcap_intf: "eth0"
 
-# Break-glass: the fixed IP you connect FROM (office/home). It keeps
-# direct SSH access and is never banned by fail2ban. Never the server's
-# own IP (the run refuses that). "" = off.
+# Break-glass: the fixed IP you connect FROM (office/home). On this new
+# server it reaches SSH without the rate limit (when auto_sec turns ufw on)
+# and auto_sec's fail2ban file never bans it. On an existing server with
+# keep, add it to your own rules. Never the server's own IP (the run
+# refuses that). "" = off.
 office_static_ip: ""
 # More fixed IPs/CIDRs fail2ban must never ban.
 # fail2ban_ignore_ips: ["198.51.100.7"]
 
+# --- Firewall: ufw (role 03) ---------------------------------------------
+# With autosec_server: new, auto_sec turns an inactive ufw on: incoming
+# traffic is denied except SSH and the ports below. It runs no ufw command
+# on a ufw that is already on. A web app needs 80 and 443:
+firewall_inbound:
+  - { port: 80 }
+  - { port: 443 }
+# A mail server would add, for example:
+#  - { port: 25 }
+#  - { port: 587 }
+#  - { port: 993 }
+# A port that listens now but may close when ufw comes on (the run stops
+# and names any other listening port):
+firewall_closed_ok: ["3000/tcp"]   # the app itself; nginx serves it on 443
+# firewall_ssh_rule: limit          # limit (default) | allow | keep
+# firewall_state: enabled           # the default with new; keep = leave ufw alone
+
+# Egress lockdown: default-deny outbound when ufw is turned on. Off unless
+# you know the app's outbound needs.
+egress_lockdown: false
+# egress_allow_extra:
+#   - { port: 587, proto: tcp }
+
 # --- fail2ban (role 03) ------------------------------------------------
 # auto_sec writes only /etc/fail2ban/jail.d/00-autosec.conf. Your own
 # jail.local is never touched, and every value it sets wins.
+# fail2ban_hardening_enabled: true    # the default with new; keep = leave it alone
 # fail2ban_defaults: {}               # auto_sec sets no fail2ban values
-# fail2ban_hardening_enabled: false   # leave fail2ban alone entirely
 
-# --- Updates, reboots, hostname, timezone (role 01) --------------------
-# By default auto_sec leaves all of these as the server has them and
-# writes no apt file. It only installs unattended-upgrades if it is
-# missing (its own setup turns the updates on), unless it was removed on
-# purpose.
-# unattended_upgrades_enabled: true  # auto (default) | true | keep
+# --- Account, updates, reboots, hostname, timezone (role 01) ------------
+# deploy_user_account: create        # the default with new (deploy_user
+#                                    # is the admin); keep = no account
+# unattended_upgrades_enabled: auto  # the default with new; true | keep
 # server_hostname: app.example.com   # default keep
 # timezone: "UTC"                    # default keep
 # Automatic reboot when an update needs one. Off unless you choose it:
@@ -65,7 +105,8 @@ ssh_password_authentication: keep
 # ssh_extra_settings: { MaxAuthTries: 4, X11Forwarding: "no" }
 # ssh_port: 22                        # the port sshd ALREADY uses; never moved
 
-# App runtime: node | docker
+# App runtime: node | docker (layer 05 sets up a NEW web server; on a
+# server whose nginx was installed before, the run stops)
 app_type: "node"
 app_dir: "/opt/app"
 app_port: 3000
@@ -92,36 +133,35 @@ fwknop_key: "CHANGE_ME_USE_VAULT"
 fwknop_hmac_key: "CHANGE_ME_USE_VAULT"
 fwknop_open_seconds: 30
 
-# Watcher behavioral pattern: first command a valid user must run
-# within watcher_window_seconds of login. Keep unique per client,
-# rotate quarterly, never commit real values.
-watcher_pattern: "cd /opt/app/logs"
-watcher_mode: "alert"         # alert | active (applies to ALL detectors)
-# Trusted source IPs/CIDRs that never trigger any detector, e.g. your
-# office or CI runner. office_static_ip is included automatically.
-watcher_whitelist_ips: []
-
-# Detection suite toggles
-revshell_enabled: true        # reverse-shell / unexpected-shell scanner
-recon_enabled: true           # recon-command burst detector
-# SSH login-pattern watcher: experimental, off by default (racy under
-# concurrent same-IP logins). See README. Enable at your own risk.
-ssh_pattern_watcher_enabled: false
-# Users the app runs as - a shell owned by these is treated as a breach.
-# revshell_app_users: "app,www-data"
-# If your Node app legitimately shells out via a known wrapper, exempt it:
-# revshell_allowed_parent_cmdlines: "/opt/app/bin/deploy-hook"
-
-# CVE watch: daily dependency + OS vulnerability scan (role 11).
-# Detection only - it never upgrades anything by itself. Use
-# scripts/cve-pr.sh to turn findings into a PR against your repo.
+# CVE watch (role 11). Off by default. When on, it adds a daily root
+# timer that reads the lockfiles in app_dir (which must exist, or be
+# created by layer 05 in the same run, as here) and sends the package
+# names and versions to api.osv.dev. It never upgrades anything;
+# scripts/cve-pr.sh turns findings into a PR against your repo.
 cve_watch_enabled: true
 cve_watch_min_severity: "high"   # low | moderate | high | critical
 # cve_watch_include_dev: false   # dev-only deps are not shipped
 # cve_watch_hour: 6              # daily scan hour (local time)
 
-# Egress lockdown: default-deny outbound. Off unless you know the app's
-# outbound needs. Add non-standard ports here when you enable it.
-egress_lockdown: false
-# egress_allow_extra:
-#   - { port: 587, proto: tcp }
+# Detection (roles 08/09) is not managed in 0.6 (issue #18), so there are
+# no watcher_* or revshell_* settings here any more.
+
+# --- An existing server ---------------------------------------------------
+# A server that already runs something (the auto_sec canary, for example)
+# starts like this. Every value "existing" picks is written out, so the
+# choice is visible:
+#
+#   autosec_server: existing
+#   autosec_require_approval: true    # a run that would change something
+#                                     # needs -e autosec_approve=<id>
+#   deploy_user_account: keep         # no deploy account; root is the admin
+#   unattended_upgrades_enabled: keep
+#   fail2ban_hardening_enabled: keep  # your jail.local stays in charge
+#   firewall_state: keep              # auto_sec runs no ufw command
+#   cve_watch_enabled: false
+#   ssh_admin_user: root
+#   ssh_admin_public_keys: ["ssh-ed25519 AAAA... you@laptop"]
+#   ssh_permit_root_login: keep
+#   ssh_password_authentication: keep
+#
+# Then: ansible-playbook -i inventory/<server>.yml site.yml -l <server> -e autosec_plan_only=true

@@ -1,0 +1,15 @@
+---
+# roles/10-report/tasks/plan.yml - role 10's lines of the run plan.
+#
+# site.yml includes this in pre_tasks (tags always). Role 10 changes nothing
+# on the server: it reads `ufw status verbose` and `fail2ban-client status`
+# and writes one file on this computer (the controller), never in --check.
+
+- name: "Report plan: one local file, nothing on the server"
+  ansible.builtin.set_fact:
+    _plan_10:
+      - role: "10"
+        part: report
+        do: local-file
+        what: "reports/security-report-{{ inventory_hostname }}.md on this computer; nothing on the server"
+        note: ""

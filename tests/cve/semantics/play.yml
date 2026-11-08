@@ -1,0 +1,18 @@
+---
+# LAB ONLY (tests/cve/semantics/lab.py). Runs role 11's own plan.yml,
+# unchanged, as the current user: lab.py points the role's file constants
+# (_cve_targets, _cve_dir, _cve_sim_dir, _cve_timer_link) into its work
+# directory and puts a systemctl stub first in PATH.
+- name: Role 11 plan lab
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Role 11 plan, as site.yml runs it
+      ansible.builtin.include_role:
+        name: 11-cve-watch
+        tasks_from: plan
+
+    - name: "LAB: the plan"
+      ansible.builtin.debug:
+        msg: "LAB write={{ _cve_plan.write }} reload={{ _cve_plan.reload }} link={{ _cve_plan.link }} start={{ _cve_plan.start }} items={{ _plan_11 | map(attribute='do') | list }}"

@@ -1,0 +1,206 @@
+---
+# roles/00-plan/tasks/summary.yml - the run plan (pre-task 8 of site.yml).
+#
+# Runs after every role's preflight or plan.yml and after the package
+# check. No host access; also runs in --check. It prints one line per
+# role, the totals and the plan id. Then:
+#   - autosec_plan_only: true stops the host here (meta: end_host);
+#   - with autosec_require_approval: true, a run that would change the
+#     server needs -e autosec_approve=<plan id> (R00-4 when it is missing,
+#     R00-5 when it is another id). A run that changes nothing needs no
+#     approval, and neither does --check (it changes nothing).
+#
+# Plan contract (every role): _plan_NN is a list of
+#   {role: "NN", part, do, what, note}
+# "do" is one of _plan_do_words (defaults/main.yml). "what" is built from
+# your values and constant names only; what was read from the host goes in
+# "note", which is shown but is not part of the plan id. [] means "no
+# change". A role may also set _plan_NN_notes, a list of strings shown under
+# its line. A selected role that sets no _plan_NN at all prints "NO PLAN"
+# and counts as a change (it needs approval).
+#
+# Plan id: the first 12 hex digits of sha256 over the sorted
+# [role, part, do, what] items (as JSON), the inventory name and VERSION.
+# The packages the guard would install (_aptg_pf_missing) count as one
+# more item, also when no role lists them. So the same plan gives the same
+# id at any time, and a changed note does not change it.
+
+- name: "Plan: what each role does in this run"
+  ansible.builtin.set_fact:
+    _plan_rows: >-
+      {%- set rows = [] -%}
+      {%- for r in _plan_roles -%}
+      {%- set ns = namespace(sel=false) -%}
+      {%- for s in r.sel -%}
+      {%- if lookup('ansible.builtin.vars', s, default=false) | string | lower in _plan_yes_words -%}{%- set ns.sel = true -%}{%- endif -%}
+      {%- endfor -%}
+      {%- set on = (lookup('ansible.builtin.vars', r.cfg, default=false) | string | lower in _plan_yes_words) if (r.cfg is defined) else true -%}
+      {%- set items = lookup('ansible.builtin.vars', '_plan_' ~ r.id, default='NO PLAN') -%}
+      {%- set notes = lookup('ansible.builtin.vars', '_plan_' ~ r.id ~ '_notes', default=[]) -%}
+      {%- if not on -%}
+      {%- set row = {'id': r.id, 'name': r.name, 'state': 'off', 'text': r.off_text | default('off'), 'entries': [], 'notes': []} -%}
+      {%- elif not ns.sel -%}
+      {%- set row = {'id': r.id, 'name': r.name, 'state': 'unselected', 'text': 'not selected by --tags', 'entries': [], 'notes': []} -%}
+      {%- elif items is string -%}
+      {%- set row = {'id': r.id, 'name': r.name, 'state': 'noplan', 'text': 'NO PLAN: its changes are not listed', 'entries': [], 'notes': notes} -%}
+      {%- elif items | length == 0 -%}
+      {%- set row = {'id': r.id, 'name': r.name, 'state': 'nochange',
+                     'text': 'not managed in 0.6 (no change)' if (r.managed | default(true)) == false else 'no change',
+                     'entries': [], 'notes': notes} -%}
+      {%- else -%}
+      {%- set row = {'id': r.id, 'name': r.name, 'state': 'items', 'text': '', 'entries': items, 'notes': notes} -%}
+      {%- endif -%}
+      {%- set _ = rows.append(row) -%}
+      {%- endfor -%}
+      {{ rows }}
+
+- name: "Plan: every item follows the plan contract"
+  ansible.builtin.assert:
+    quiet: true
+    that: _plan_bad | length == 0
+    fail_msg: >-
+      auto_sec bug: these plan items do not follow the plan contract ({role, part, do, what, note},
+      do one of {{ _plan_do_words | join(', ') }}): {{ _plan_bad | map('string') | map('regex_replace', '[{}]', '?')
+      | map('truncate', 160) | list }}. Nothing has been changed.
+  vars:
+    _plan_bad: >-
+      {%- set bad = [] -%}
+      {%- for row in _plan_rows if row.state == 'items' -%}
+      {%- for it in row['entries'] -%}
+      {%- if it is not mapping or (it.role | default('') | string) != row.id or (it.do | default('')) not in _plan_do_words
+            or (it.part | default('') | string | length) == 0 or (it.what | default('') | string | length) == 0 -%}
+      {%- set _ = bad.append(it) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {{ bad }}
+
+- name: "Plan: plan id, totals and approval"
+  ansible.builtin.set_fact:
+    _plan_items: "{{ _plan_rows | selectattr('state', 'equalto', 'items') | map(attribute='entries') | flatten(levels=1) }}"
+    _plan_noplan: "{{ _plan_rows | selectattr('state', 'equalto', 'noplan') | map(attribute='id') | list }}"
+    _plan_canon: >-
+      {%- set canon = [] -%}
+      {%- for row in _plan_rows if row.state == 'items' -%}
+      {%- for it in row['entries'] -%}
+      {%- set _ = canon.append([it.role | string, it.part | string, it.do | string, it.what | string]) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- for id in _plan_rows | selectattr('state', 'equalto', 'noplan') | map(attribute='id') -%}
+      {%- set _ = canon.append([id, 'NO PLAN', '', '']) -%}
+      {%- endfor -%}
+      {%- if _aptg_pf_missing | default([]) | length > 0 -%}
+      {%- set _ = canon.append(['packages', 'packages', 'install', _aptg_pf_missing | map('string') | sort | join(' ')]) -%}
+      {%- endif -%}
+      {{ canon | sort }}
+    _plan_version: "{{ (lookup('ansible.builtin.file', _plan_version_file, errors='ignore') | default('', true) | string | trim) or 'unknown' }}"
+    _plan_only: "{{ (autosec_plan_only | default(false) | string | lower) in _plan_yes_words }}"
+    _plan_require: "{{ (autosec_require_approval | default(false) | string | lower) in _plan_yes_words }}"
+    _plan_approved_ids: "{{ ((autosec_approve | string).split(',') | map('trim') | select | list) if autosec_approve is defined else [] }}"
+
+- name: "Plan: the plan id"
+  ansible.builtin.set_fact:
+    _plan_id: "{{ (((_plan_canon | to_json) ~ inventory_hostname ~ _plan_version) | hash('sha256'))[:12] }}"
+    _plan_server_changes: >-
+      {{ (_plan_items | rejectattr('do', 'equalto', 'local-file') | list | length) + (_plan_noplan | length)
+         + (1 if (_aptg_pf_missing | default([]) | length > 0) else 0) }}
+
+- name: "Plan: decide whether this run needs your approval"
+  ansible.builtin.set_fact:
+    _plan_need_approval: >-
+      {{ (_plan_require | bool) and (_plan_server_changes | int) > 0 and not (_plan_only | bool) and not ansible_check_mode }}
+    _plan_status: >-
+      {%- if (_plan_server_changes | int) == 0 -%}no server change: approval not needed
+      {%- elif _plan_only | bool -%}plan only: nothing changes in this run
+      {%- elif ansible_check_mode -%}--check: nothing changes, approval not needed
+      {%- elif not (_plan_require | bool) -%}autosec_require_approval is false: no approval asked
+      {%- elif _plan_id in _plan_approved_ids -%}approved
+      {%- else -%}needs your approval: -e autosec_approve={{ _plan_id }}
+      {%- endif -%}
+
+- name: "Plan: the lines of the plan"
+  ansible.builtin.set_fact:
+    _plan_lines: "{{ _plan_t_lines }}"
+    _plan_notes: "{{ _plan_t_notes }}"
+  vars:
+    _plan_cnt_files: "{{ _plan_items | selectattr('do', 'in', _plan_count_files) | list | length }}"
+    _plan_cnt_services: "{{ _plan_items | selectattr('do', 'in', _plan_count_services) | list | length }}"
+    _plan_cnt_rules: "{{ _plan_items | selectattr('do', 'in', _plan_count_rules) | list | length }}"
+    _plan_cnt_users: "{{ _plan_items | selectattr('do', 'equalto', 'user') | list | length }}"
+    _plan_cnt_calls: "{{ _plan_items | selectattr('do', 'equalto', 'network-call') | list | length }}"
+    _plan_cnt_fwon: "{{ _plan_items | selectattr('do', 'equalto', 'firewall-on') | list | length }}"
+    _plan_cnt_pkgs: "{{ _aptg_pf_missing | default([]) | length }}"
+    _plan_l0407: "{{ _plan_rows | selectattr('id', 'in', ['04', '05', '06', '07']) | list }}"
+    _plan_t_lines: >-
+      {%- set out = ['auto_sec ' ~ _plan_version ~ ' plan for ' ~ inventory_hostname ~ ' (autosec_server: ' ~ (autosec_server | default('?') | string) ~ ')'] -%}
+      {%- set compress = (_plan_l0407 | selectattr('state', 'equalto', 'off') | list | length) == 4 -%}
+      {%- for row in _plan_rows -%}
+      {%- if compress and row.id in ['04', '05', '06', '07'] -%}
+      {%- if row.id == '04' -%}{%- set _ = out.append('  ' ~ ('%-14s' | format('04-07:')) ~ 'skipped (not configured)') -%}{%- endif -%}
+      {%- else -%}
+      {%- set label = '  ' ~ ('%-14s' | format(row.id ~ ' ' ~ row.name ~ ':')) -%}
+      {%- set first = [] -%}
+      {%- if row.id == '03' and row.state in ['items', 'nochange'] -%}
+      {%- set _ = first.append(_fw_plan | default('?') ~ '; fail2ban: ' ~ (_f2b_plan | default('?'))) -%}
+      {%- endif -%}
+      {%- if row.state != 'items' and not (row.id == '03' and row.state == 'nochange') -%}
+      {%- set _ = first.append(row.text) -%}
+      {%- endif -%}
+      {%- for it in row['entries'] -%}
+      {%- set _ = first.append(('writes ' if it.do == 'local-file' else (it.do ~ ': ')) ~ it.what) -%}
+      {%- endfor -%}
+      {%- for line in first -%}
+      {%- set _ = out.append((label if loop.first else ('  ' ~ ('%-14s' | format('')))) ~ line) -%}
+      {%- endfor -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- set _ = out.append('  ' ~ ('%-14s' | format('packages:')) ~ (_aptg_plan_line | default('not checked'))) -%}
+      {%- set extra = [] -%}
+      {%- if (_plan_cnt_users | int) > 0 -%}{%- set _ = extra.append(_plan_cnt_users ~ ' account(s)') -%}{%- endif -%}
+      {%- if (_plan_cnt_fwon | int) > 0 -%}{%- set _ = extra.append('ufw turned on') -%}{%- endif -%}
+      {%- if (_plan_cnt_calls | int) > 0 -%}{%- set _ = extra.append(_plan_cnt_calls ~ ' outside service(s) called') -%}{%- endif -%}
+      {%- if _plan_noplan | length > 0 -%}{%- set _ = extra.append('NO PLAN for role(s) ' ~ (_plan_noplan | join(', '))) -%}{%- endif -%}
+      {%- set _ = out.append('  server: ' ~ _plan_cnt_files ~ ' files, ' ~ _plan_cnt_pkgs ~ ' packages, ' ~ _plan_cnt_services
+                              ~ ' services (re)started, ' ~ _plan_cnt_rules ~ ' firewall rules'
+                              ~ ((', ' ~ (extra | join(', '))) if extra | length > 0 else '')) -%}
+      {%- set _ = out.append('  Plan id: ' ~ _plan_id ~ '  (' ~ _plan_status ~ ')') -%}
+      {{ out }}
+    _plan_t_notes: >-
+      {%- set out = [] -%}
+      {%- for row in _plan_rows -%}
+      {%- for it in row['entries'] if (it.note | default('') | string | length) > 0 -%}
+      {%- set _ = out.append('  ' ~ row.id ~ ' ' ~ (it.part | default('')) ~ ': ' ~ (it.note | string | regex_replace('[{}]', '?'))) -%}
+      {%- endfor -%}
+      {%- for n in row.notes -%}
+      {%- set _ = out.append('  ' ~ row.id ~ ' ' ~ row.name ~ ': ' ~ (n | string | regex_replace('[{}]', '?'))) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: "Plan: the plan for this host"
+  ansible.builtin.debug:
+    msg: "{{ _plan_lines + ((['Notes (not part of the plan id):'] + _plan_notes) if _plan_notes | length > 0 else []) }}"
+
+- name: "Plan: stop here (autosec_plan_only), nothing has been changed"
+  when: _plan_only | bool
+  ansible.builtin.meta: end_host
+
+- name: "Plan R00-4: a run that changes this server needs your approval"
+  when: _plan_need_approval | bool
+  ansible.builtin.assert:
+    quiet: true
+    that: _plan_approved_ids | length > 0
+    fail_msg: >-
+      [R00-4] This plan changes {{ inventory_hostname }} and needs your approval
+      (autosec_require_approval: true). Check the plan above, then run again with
+      -e autosec_approve={{ _plan_id }}. Nothing has been changed.
+
+- name: "Plan R00-5: the approved plan must be this plan"
+  when: _plan_need_approval | bool
+  ansible.builtin.assert:
+    quiet: true
+    that: _plan_id in _plan_approved_ids
+    fail_msg: >-
+      [R00-5] The plan for {{ inventory_hostname }} changed since you approved it (approved
+      {{ _plan_approved_ids | join(', ') }}, now {{ _plan_id }}). Check the plan above.
+      Nothing has been changed.

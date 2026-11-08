@@ -863,7 +863,8 @@
       dropped, and the change undone. Typical cause: a high-mode host set up by
       auto_sec 0.1-0.3, whose fwknop role deleted the SSH rule. Add the rule first,
       from a session that is already open: `sudo ufw limit {{ ssh_port | int }}/tcp`
-      (or run --tags firewall). Then run again. Nothing has been changed.
+      (auto_sec runs no ufw command on an active ufw). Then run again. Nothing has been
+      changed.
   vars:
     _ssh_ufw_rules: "{{ _ssh_pf_ufw.stdout_lines | default([]) | select('match', '^ufw ') | map('regex_replace', '[{}]', '?') | list }}"
     _ssh_ufw_in: >-

@@ -181,6 +181,7 @@ host_vars() { # hostname extra-lines: one inventory host with the shared test va
       paranoia_level: standard
       office_static_ip: ""
       autosec_ci: true
+      autosec_server: existing
 $2
 EOF
 }
@@ -279,16 +280,10 @@ setup() {
 case_i() {
   local rc tags found
   # --tags ssh is the canary's first command; ssh,firewall adds role 03 on a
-  # host where ufw is off. Role 03 in --check needs ufw already installed
-  # (community.general.ufw needs the ufw binary, also in --check; a
-  # limitation older than 0.4.0), so that variant only runs when ufw is
-  # present. fail2ban is not needed: in --check without fail2ban, role 03
-  # only says that the real run installs it.
+  # host where ufw is off. 0.6's role 03 runs no ufw module, so this works
+  # with or without ufw on the runner (autosec_server: existing, so ufw and
+  # fail2ban stay as they are: keep).
   for tags in ssh ssh,firewall; do
-    if [ "$tags" = ssh,firewall ] && ! [ -x /usr/sbin/ufw ]; then
-      info i "--check --tags $tags skipped: ufw is not installed on this runner"
-      continue
-    fi
     rc=0
     touch "$WORK/stamp"
     sleep 1.2
@@ -352,7 +347,9 @@ case_g() {
 
 case_l() {
   local rc=0
-  play l-hostcap -l live,live2 -f 1 -e "@$STAGE2" -e ssh_max_hosts_per_run=1 || rc=$?
+  # site.yml runs one host at a time (0.6); the cap counts the hosts of one
+  # batch, so both hosts go in one batch here.
+  play l-hostcap -l live,live2 -f 1 -e "@$STAGE2" -e ssh_max_hosts_per_run=1 -e autosec_serial=2 || rc=$?
   expect_refused l "$rc"
   log_has l l-hostcap ssh_max_hosts_per_run "the refusal names ssh_max_hosts_per_run"
   unchanged l absent "$BASE_EFF"

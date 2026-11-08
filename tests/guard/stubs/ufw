@@ -1,0 +1,12 @@
+#!/bin/sh
+# Test stub for ufw: logs the call and exits with the code stored in
+# ../ufw_rc. "--force disable" writes "ENABLED=no" to ../etc/ufw.conf when
+# that file exists (as ufw does), so a test can see whether the guard puts
+# ufw's files back AFTER turning ufw off.
+d=$(dirname "$(dirname "$(readlink -f "$0")")")
+echo "$(date +%s) ufw $*" >> "$d/calls"
+rc=$(cat "$d/ufw_rc" 2>/dev/null || echo 0)
+if [ "$rc" = 0 ] && [ "$*" = "--force disable" ] && [ -f "$d/etc/ufw.conf" ]; then
+  echo "ENABLED=no" > "$d/etc/ufw.conf"
+fi
+exit "$rc"

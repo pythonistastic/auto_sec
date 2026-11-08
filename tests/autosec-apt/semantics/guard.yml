@@ -1,0 +1,116 @@
+---
+# Runs the shared package guard (roles/autosec-apt) on localhost,
+# unprivileged. run.sh puts fake dpkg-query, apt-get and systemctl first in
+# PATH; they print canned output (fixtures/: real `apt-get -s` output) and
+# keep a fake dpkg database in $LAB_STATE.
+#   ansible-playbook guard.yml -e lab_out=<facts.json> -e lab_mode=<mode> ...
+# Modes:
+#   plan       tasks/plan.yml with -e lab_req=[{who, pkgs}] [-e lab_ctx=main]
+#              [-e lab_allow=true] [-e lab_units=true]
+#   preflight  tasks/preflight.yml; the roles' wants come as -e
+#              (_base_pkg_want, _f2b_pkg_want, ...), and the run's
+#              --tags/--skip-tags select them
+#   install    tasks/install.yml with -e lab_want=[...] [-e lab_who=...]
+#   upgrade    tasks/upgrade.yml
+#   keepall    role 01's preflight pieces with every choice keep
+#              (autosec_server: existing), then tasks/preflight.yml
+# A refusal makes the play fail (non-zero rc); run.sh checks the message.
+- name: The package guard against fake dpkg-query, apt-get and systemctl
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: "plan.yml"
+      when: lab_mode == 'plan'
+      ansible.builtin.include_role:
+        name: autosec-apt
+        tasks_from: plan
+        apply: {tags: [always]}
+      tags: [always]
+      vars:
+        _aptg_req: "{{ lab_req }}"
+        _aptg_ctx: "{{ lab_ctx | default('preflight') }}"
+        _aptg_allow_changes: "{{ lab_allow | default(false) }}"
+        _aptg_check_units: "{{ lab_units | default(false) }}"
+
+    - name: "preflight.yml"
+      when: lab_mode == 'preflight'
+      ansible.builtin.include_role:
+        name: autosec-apt
+        tasks_from: preflight
+        apply: {tags: [always]}
+      tags: [always]
+
+    - name: "install.yml"
+      when: lab_mode == 'install'
+      ansible.builtin.include_role:
+        name: autosec-apt
+        tasks_from: install
+        apply: {tags: [always]}
+      tags: [always]
+      vars:
+        _aptg_want: "{{ lab_want }}"
+        _aptg_who: "{{ lab_who | default('role 01 (base)') }}"
+        _aptg_allow_changes: "{{ lab_allow | default(false) }}"
+
+    - name: "upgrade.yml"
+      when: lab_mode == 'upgrade'
+      ansible.builtin.include_role:
+        name: autosec-apt
+        tasks_from: upgrade
+        apply: {tags: [always]}
+      tags: [always]
+
+    - name: "Every choice keep: role 01's wants, then the guard's preflight"
+      when: lab_mode == 'keepall'
+      tags: [always]
+      block:
+        - name: "Role 01 B1 (plan.yml)"
+          ansible.builtin.include_role:
+            name: 01-base
+            tasks_from: plan
+            public: true
+            apply: {tags: [always]}
+
+        - name: "What role 01's preflight B2 would have read"
+          ansible.builtin.set_fact:
+            _base_role_runs: true
+            _base_uu_installed: true
+            _base_uu_removed: false
+            _base_uu_dist_sha256: ""
+            _base_uu_pristine_md5: ""
+            _base_uu_dpkg_md5: ""
+            _base_hostname_static: lab
+            _base_hostname_transient: lab
+            _base_tz_now: UTC
+
+        - name: "Role 01 B4 (decide.yml)"
+          ansible.builtin.include_role:
+            name: 01-base
+            tasks_from: decide
+            apply: {tags: [always]}
+
+        - name: "Role 01 B2, B3, B5b (account.yml)"
+          ansible.builtin.include_role:
+            name: 01-base
+            tasks_from: account
+            apply: {tags: [always]}
+
+        - name: "The guard's preflight"
+          ansible.builtin.include_role:
+            name: autosec-apt
+            tasks_from: preflight
+            apply: {tags: [always]}
+
+    - name: Write the facts
+      tags: [always]
+      ansible.builtin.copy:
+        dest: "{{ lab_out }}"
+        mode: "0644"
+        content: >-
+          {{ {'missing': _aptg_missing | default(none), 'removed': _aptg_removed | default(none),
+              'side': _aptg_side | default(none), 'new': _aptg_new | default(none), 'deps': _aptg_deps | default(none),
+              'units': _aptg_units | default(none), 'by_who': _aptg_by_who | default(none),
+              'pf_req': _aptg_pf_req | default(none), 'pf_missing': _aptg_pf_missing | default(none),
+              'pf_by_who': _aptg_pf_by_who | default(none), 'plan_line': _aptg_plan_line | default(none),
+              'base_want': _base_pkg_want | default(none), 'todo': _aptg_todo | default(none)} | to_nice_json }}

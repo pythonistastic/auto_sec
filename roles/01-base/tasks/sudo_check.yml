@@ -1,0 +1,87 @@
+---
+# roles/01-base/tasks/sudo_check.yml - the refusals before auto_sec adds its
+# sudo rule (deploy_user_account: create), on what sudo.yml read. No host
+# access. Imported by the preflight (B3) and by main (step 1 when it
+# installed sudo, and step 6b right before the write).
+#
+# Inputs: _base_sudo_now  sudo.yml's reads
+#         _base_sudo_end  the last sentence of a refusal: "Nothing has been
+#                         changed." in the preflight, what this run already
+#                         did in main
+#         _base_sudo_cmp  main step 6b: the reads must equal the
+#                         preflight's (_base_sudo_pf), or M01-A1
+
+# A change between the preflight and the write (another tool, a person)
+# stops the run: auto_sec writes only on what it checked.
+- name: "Base 6b: nothing changed since the preflight (M01-A1)"
+  when: _base_sudo_cmp | default(false) | bool
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _base_sudo_now.state == _base_sudo_pf.state
+      - _base_sudo_now.sha256 == _base_sudo_pf.sha256
+      - >-
+        not (_base_sudo_pf.checked | bool)
+        or ((_base_sudo_now.includedir | bool) == (_base_sudo_pf.includedir | bool)
+            and (_base_sudo_now.visudo_rc | int) == (_base_sudo_pf.visudo_rc | int)
+            and _base_sudo_now.user_lines == _base_sudo_pf.user_lines
+            and _base_sudo_now.group_lines == _base_sudo_pf.group_lines
+            and (_base_sudo_now.netgroup_lines | default([])) == (_base_sudo_pf.netgroup_lines | default([])))
+    fail_msg: >-
+      [M01-A1] {{ _base_sudo_file }} on {{ inventory_hostname }} changed during this run, so
+      auto_sec leaves it alone. Nothing in sudo has been changed. Run again.
+
+- name: "Base B3: auto_sec never replaces a sudo file it did not write (R01-A2)"
+  ansible.builtin.assert:
+    quiet: true
+    that: _base_sudo_now.state in ['absent', 'legacy', 'ours']
+    fail_msg: >-
+      [R01-A2] {{ _base_sudo_file }} on {{ inventory_hostname }} {% if _base_sudo_now.state == 'other' %}is
+      not a regular file{% else %}was not written by auto_sec (it is not 0.1-0.5's exact file and its
+      first line is not "{{ _base_sudo_header }}"){% endif %}. auto_sec never replaces a sudo file it did
+      not write. Set deploy_user_account: keep, or move your rules to another file
+      name. {{ _base_sudo_end }}
+
+- name: "Base B3: sudo can read its configuration now (R01-A5)"
+  when: _base_sudo_now.checked | bool
+  ansible.builtin.assert:
+    quiet: true
+    that: (_base_sudo_now.visudo_rc | int) == 0
+    fail_msg: >-
+      [R01-A5] sudo cannot read its configuration on {{ inventory_hostname }} now (visudo -c:
+      {{ _base_sudo_now.visudo_err }}). Fix it with visudo first. {{ _base_sudo_end }}
+
+- name: "Base B3: /etc/sudoers reads /etc/sudoers.d (R01-A4)"
+  when: _base_sudo_now.checked | bool
+  ansible.builtin.assert:
+    quiet: true
+    that: _base_sudo_now.includedir | bool
+    fail_msg: >-
+      [R01-A4] {{ _base_sudoers }} on {{ inventory_hostname }} does not read {{ _base_sudo_dir }} (no
+      @includedir line), so auto_sec's sudo file would have no effect. Set deploy_user_account: keep,
+      or add "@includedir {{ _base_sudo_dir }}" with visudo. {{ _base_sudo_end }}
+
+# sudo uses the last rule that matches: a rule of auto_sec's read after
+# yours could change what yours allows.
+- name: "Base B3: no sudo rule of yours names the account or its groups (R01-A3)"
+  when: _base_sudo_now.checked | bool
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _base_sudo_now.user_lines | length == 0
+      - _base_sudo_now.group_lines | length == 0
+      - _base_sudo_now.netgroup_lines | default([]) | length == 0
+      - _base_sudo_now.unreadable | length == 0
+      - _base_sudo_now.bad_groups | length == 0
+    fail_msg: >-
+      [R01-A3] {% if (_base_sudo_now.user_lines + _base_sudo_now.group_lines + _base_sudo_now.netgroup_lines | default([])) | length > 0 %}Your sudo
+      configuration already names {{ deploy_user }} or a group of {{ deploy_user }}{{ ' (or uses a netgroup, which
+      auto_sec cannot check)' if (_base_sudo_now.netgroup_lines | default([]) | length > 0) else '' }}:
+      {{ (_base_sudo_now.user_lines + _base_sudo_now.group_lines + _base_sudo_now.netgroup_lines | default([])) | join(', ') | truncate(600) }}. sudo uses
+      the last rule that matches, so auto_sec's rule could override yours (for example make a password
+      rule passwordless). auto_sec does not add a rule next to yours.
+      {% else %}auto_sec cannot check all of your sudo configuration on {{ inventory_hostname }}
+      ({{ ((['cannot read: ' ~ (_base_sudo_now.unreadable | join(', '))] if (_base_sudo_now.unreadable | length > 0) else [])
+      + (['groups of ' ~ deploy_user ~ ' with unusual names: ' ~ (_base_sudo_now.bad_groups | join(', '))]
+      if (_base_sudo_now.bad_groups | length > 0) else [])) | join('; ') | truncate(400) }}), so it does not
+      add a rule. {% endif %}Set deploy_user_account: keep, or change those lines. {{ _base_sudo_end }}

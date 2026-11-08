@@ -1,0 +1,79 @@
+---
+# roles/09-watcher/tasks/legacy_active.yml
+#
+# R00-3: stop the run when auto_sec 0.1-0.5's detectors run in active
+# mode. site.yml imports this file as pre-task 3, with tags [always] and
+# BEFORE fact gathering. In active mode those detectors end SSH sessions
+# that look like reconnaissance (fact gathering alone runs lsb_release, id,
+# uname, ip a and lsblk) and kill shells started by python3 (the role 01
+# and role 03 trials). So the refusal must come first.
+#
+# Reads only: a stat of watcher.conf; when it is there, a grep for its
+# mode line and `systemctl is-active` of the three detectors that act.
+# None of these is a command the old recon detector counts (tests/legacy
+# proves it with strace). Also runs in --check. Without watcher.conf it is
+# one stat and nothing else.
+#
+# The detectors read `mode` from section [watcher] (Python configparser)
+# and act only on exactly "active". This check is wider on purpose (any
+# section, any spacing, `=` or `:`): a wrong refusal costs you one edit, a
+# missed one can stop the run halfway. A watcher.conf that cannot be read
+# counts as active while a detector runs.
+#
+# Trust boundary (SECURITY.md): watcher.conf holds the Telegram token.
+# grep returns only yes or no, so nothing of the file leaves the host.
+# Unit states are compared with fixed words.
+
+- name: "Old detectors R00-3: is there a 0.1-0.5 watcher.conf?"
+  ansible.builtin.stat:
+    path: "{{ _l09_watcher_conf }}"
+    follow: true
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  register: _l09_ac_conf
+
+- name: "Old detectors R00-3: does it set mode = active?"
+  when: _l09_ac_conf.stat.isreg | default(false)
+  ansible.builtin.command:
+    argv: [grep, -Eq, -e, "{{ _l09_mode_active_re }}", --, "{{ _l09_watcher_conf }}"]
+  register: _l09_ac_mode
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Old detectors R00-3: which of the acting detectors run?"
+  when: _l09_ac_conf.stat.exists | default(false)
+  ansible.builtin.command:
+    argv: "{{ ['systemctl', 'is-active'] + _l09_active_units }}"
+  register: _l09_ac_units
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Old detectors R00-3: refuse while they run in active mode"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (_l09_ac_running | length == 0) or not (_l09_ac_active | bool)
+    fail_msg: >-
+      {% if _l09_ac_unreadable | bool %}auto_sec 0.1-0.5's detectors run on {{ inventory_hostname }}
+      (running: {{ _l09_ac_running | join(', ') }}), and auto_sec cannot read their mode in
+      {{ _l09_watcher_conf }} ({{ 'not a regular file' if not (_l09_ac_conf.stat.isreg | default(false))
+      else 'grep cannot read it' }}). In active mode they end SSH sessions that look like
+      reconnaissance and kill shells started by python3, which this run does next.
+      {% else %}auto_sec 0.1-0.5's detectors run in active mode on {{ inventory_hostname }}
+      ({{ _l09_watcher_conf }}: mode = active; running: {{ _l09_ac_running | join(', ') }}). They
+      end SSH sessions that look like reconnaissance and kill shells started by python3, which this
+      run does next. {% endif %}Stop them first (sudo systemctl stop recon-watch revshell-scan
+      login-watcher), or set mode = alert in that file and restart them. Then run again. Nothing
+      has been changed.
+  vars:
+    _l09_ac_states: "{{ _l09_ac_units.stdout_lines | default([]) }}"
+    _l09_ac_running: >-
+      {{ _l09_active_units | zip(_l09_ac_states) | rejectattr('1', 'in', _l09_stopped_words)
+         | map('first') | map('regex_replace', '\.service$', '') | list }}
+    _l09_ac_unreadable: >-
+      {{ (_l09_ac_conf.stat.exists | default(false))
+         and ((not (_l09_ac_conf.stat.isreg | default(false))) or ((_l09_ac_mode.rc | default(1)) not in [0, 1])) }}
+    _l09_ac_active: "{{ (_l09_ac_unreadable | bool) or ((_l09_ac_mode.rc | default(1)) == 0) }}"

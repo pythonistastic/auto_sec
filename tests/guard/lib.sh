@@ -70,6 +70,7 @@ rewrite_paths() {  # <src> <dst> <instance dir>
       printf "readonly SYSTEMD_RUN=%s/bin/systemd-run\n", d
       printf "readonly F2B=%s/bin/fail2ban-client\n", d
       printf "readonly LOGGER=%s/bin/logger\n", d
+      printf "readonly UFW=%s/bin/ufw\n", d
       next
     }
     /^# --- end paths ---$/ { skip = 0 }
@@ -84,10 +85,11 @@ rewrite_paths() {  # <src> <dst> <instance dir>
 #   sshd_t_rc    exit code of "sshd -t" (0 valid, 1 broken)
 #   reload_rc    exit code of "systemctl try-reload-or-restart ssh.service"
 #   systemd_run_rc  nonzero: systemd-run fails without starting a timer
+#   ufw_rc       exit code of "ufw ..." (the --ufw revert)
 new_instance() {
   local d="$W/$1" s
   mkdir -p "$d/bin" "$d/etc"
-  for s in sshd systemctl systemd-run fail2ban-client logger; do
+  for s in sshd systemctl systemd-run fail2ban-client logger ufw; do
     cp "$HERE/stubs/$s" "$d/bin/$s"
     chmod 0755 "$d/bin/$s"
   done

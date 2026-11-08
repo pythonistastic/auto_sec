@@ -1,0 +1,60 @@
+---
+# roles/autosec-apt/vars/main.yml - constants of the shared package guard.
+#
+# Every package auto_sec installs goes through this role (no role uses the
+# apt module). A helper role: never in the `roles:` list. site.yml imports
+# tasks/preflight.yml in pre_tasks; each role installs with
+#   include_role: {name: autosec-apt, tasks_from: install,
+#                  apply: {tags: [<the role's tag>]}}
+#   vars: {_aptg_want: [...], _aptg_who: "role NN (...)"}
+# These are not settings: do not override.
+
+# Environment of every apt-get run that can install (install, update, the
+# full upgrade). needrestart's apt hook (/etc/apt/apt.conf.d/99needrestart)
+# runs apt-pinvoke after dpkg; with NEEDRESTART_SUSPEND set it prints
+# "needrestart is suspended" and exits before needrestart starts (jammy,
+# noble and bookworm source). It leaves /run/needrestart/unpacked, so
+# needrestart runs at the next apt run outside auto_sec. auto_sec never
+# runs needrestart itself (older builds carry CVE-2024-48990).
+_aptg_env:
+  NEEDRESTART_SUSPEND: "1"         # apt-pinvoke exits before needrestart (jammy, noble, bookworm source)
+  NEEDRESTART_MODE: "l"            # second layer: any needrestart run only lists
+  APT_LISTCHANGES_FRONTEND: "none"
+  DEBIAN_FRONTEND: "noninteractive"
+  LC_ALL: "C"
+_aptg_pkg_re: '^[a-z0-9][a-z0-9+.-]{1,99}$'
+_aptg_dpkg_opts: [-o, DPkg::Lock::Timeout=300, -o, "Dpkg::Options::=--force-confdef", -o, "Dpkg::Options::=--force-confold"]
+
+# A systemd unit name is shown (P4) only if it has this shape.
+_aptg_unit_re: '^[-A-Za-z0-9@._:\\]{1,128}$'
+
+# Where the wanted packages come from (tasks/preflight.yml). Each role's
+# preflight or plan.yml sets its own list (role constants, never host
+# values); a role that is off, or not selected by the tags, leaves it
+# empty. The guard adds its own tag check: a source counts only when the
+# run's tags select one of its tags and skip none of them. allow names a
+# fact that lets this source's install upgrade or remove packages (only
+# role 01's apt_full_upgrade).
+_aptg_sources:
+  - {var: _base_pkg_want, who: "role 01 (base)", tags: [base], allow: _base_full_upgrade}
+  - {var: _fw_pkg_want, who: "role 03 (ufw)", tags: [firewall, ufw]}
+  - {var: _f2b_pkg_want, who: "role 03 (fail2ban)", tags: [firewall, fail2ban]}
+  - {var: _l04_pkg_want, who: "role 04 (fwknop)", tags: [fwknop]}
+  - {var: _l05_pkg_want, who: "role 05 (app)", tags: [app]}
+  - {var: _l06_pkg_want, who: "role 06 (database)", tags: [database]}
+  - {var: _l07_pkg_want, who: "role 07 (backups)", tags: [backups]}
+
+# P1: how to turn off the feature that wants a package you removed. A role
+# can pass its own text as _aptg_off (one string for all its packages).
+_aptg_off_by_pkg:
+  unattended-upgrades: "set unattended_upgrades_enabled: keep"
+  sudo: "set deploy_user_account: keep"
+  ufw: "set firewall_state: keep"
+  fail2ban: "set fail2ban_hardening_enabled: keep"
+  python3-systemd: "set fail2ban_hardening_enabled: keep"
+_aptg_off_default: "turn off the setting that needs it"
+
+# The E: lines of `apt-get -s install` that a refresh of the package lists
+# may fix (a new server often has no lists yet). In the preflight they only
+# give a NOTE; the install checks again after `apt-get update`.
+_aptg_nolist_re: "^E: (Unable to locate package |Package '?[^ ']+'? has no installation candidate|Couldn't find any package by)"

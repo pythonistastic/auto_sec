@@ -1,0 +1,631 @@
+#!/usr/bin/python3
+"""auto-sec-ufw-turnon: read-only checks before auto_sec turns an OFF ufw on.
+
+Role 03 runs it as root, only when firewall_state is enabled and ufw is off:
+
+    /usr/bin/python3 -I -c "<this file>" --want JSON --ssh-port N
+        [--controller-ip IP] [--no-ufw]
+
+It changes nothing. It runs `ufw show added` (that command makes no
+iptables call and no capability probe), reads /etc/default/ufw, ufw's rule
+and sysctl files, /proc and /sys, and asks `systemctl is-active` /
+`is-enabled` and `ss -Hlntup`. It prints one JSON object.
+
+Trust boundary (SECURITY.md): everything read from the host is only
+compared, or shown after filtering (printable ASCII, "{" and "}" become
+"?"). The ufw commands themselves are built by Ansible from your variables;
+this helper only says which of them are already covered, what `ufw show
+added` must print after them, and why ufw must stay off. --want is built
+from your variables only. --controller-ip is compared, never used in a
+command.
+
+--no-ufw: ufw is not installed yet. Only the checks that do not need ufw's
+files run (listeners, forwarding, other firewall managers, WireGuard); the
+existing rule list counts as empty and ufw's package defaults are assumed.
+Role 03 runs the full check again after the install, before any ufw command.
+
+Lab-only flags (tests/ufw/semantics): --root DIR (read DIR/etc/... and
+DIR/sys/... instead of /etc and /sys), --proc DIR (instead of /proc),
+--ufw JSON (argv that runs ufw), --systemctl PATH, --ss PATH.
+
+Python 3.10 syntax (Ubuntu 22.04), standard library only.
+"""
+
+import argparse
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+
+# ufw's package defaults (0.36.x), used with --no-ufw.
+PKG_DEFAULTS = {"IPV6": "yes", "DEFAULT_INPUT_POLICY": "DROP", "DEFAULT_OUTPUT_POLICY": "ACCEPT",
+                "DEFAULT_FORWARD_POLICY": "DROP", "MANAGE_BUILTINS": "no",
+                "IPT_SYSCTL": "/etc/ufw/sysctl.conf"}
+
+# The rule lines auto_sec can check (`ufw show added` prints canonical
+# forms). Anything else stops a turn-on (R03-W2).
+_C = r"( comment '[^']*')?"
+_ADDR = r"[0-9A-Fa-f:.]{2,45}(/[0-9]{1,3})?"
+FORMS = [
+    re.compile(r"^ufw (allow|limit)( in)? [0-9]{1,5}(/(tcp|udp))?" + _C + "$"),
+    re.compile(r"^ufw allow( in)? [0-9]{1,5}:[0-9]{1,5}/(tcp|udp)" + _C + "$"),
+    re.compile(r"^ufw (allow|limit)( in)? from " + _ADDR + r"( port [0-9]{1,5})? to any port "
+               r"([0-9]{1,5}|[0-9]{1,5}:[0-9]{1,5} proto (tcp|udp))( proto (tcp|udp))?" + _C + "$"),
+    re.compile(r"^ufw allow out [0-9]{1,5}(/(tcp|udp))?" + _C + "$"),
+]
+
+# ufw's sysctl file: values that only tighten a stock kernel. Any other
+# change (a loosening value, an unknown key, rp_filter, forwarding) stops a
+# turn-on (R03-W8).
+TIGHTEN = {
+    "net/ipv4/conf/all/accept_redirects": "0", "net/ipv4/conf/default/accept_redirects": "0",
+    "net/ipv6/conf/all/accept_redirects": "0", "net/ipv6/conf/default/accept_redirects": "0",
+    "net/ipv4/conf/all/send_redirects": "0", "net/ipv4/conf/default/send_redirects": "0",
+    "net/ipv4/conf/all/accept_source_route": "0", "net/ipv4/conf/default/accept_source_route": "0",
+    "net/ipv6/conf/all/accept_source_route": "0", "net/ipv6/conf/default/accept_source_route": "0",
+    "net/ipv4/conf/all/log_martians": "1", "net/ipv4/conf/default/log_martians": "1",
+    "net/ipv4/icmp_echo_ignore_broadcasts": "1", "net/ipv4/icmp_ignore_bogus_error_responses": "1",
+    "net/ipv4/icmp_echo_ignore_all": "1", "net/ipv4/tcp_syncookies": "1",
+}
+
+# UDP ports ufw's before.rules already let in, or that only a client uses:
+# DHCP client (68), DHCPv6 client (546), mDNS (5353), SSDP (1900).
+UDP_SKIP = {68, 546, 5353, 1900}
+
+RULE_FILES = ["before.rules", "after.rules", "before6.rules", "after6.rules"]
+
+
+def clean(s, limit=200):
+    """Host text for display: printable ASCII, no braces, bounded."""
+    s = "".join(c if 32 <= ord(c) < 127 else "?" for c in str(s))
+    return s.replace("{", "?").replace("}", "?")[:limit]
+
+
+def name_only(s):
+    return re.sub(r"[^A-Za-z0-9._-]", "", s)[:32]
+
+
+def run(argv, timeout=60):
+    env = dict(os.environ, LANG="C", LC_ALL="C")
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env,
+                           errors="replace", check=False)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, "", str(e)
+
+
+def read(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def norm_src(s):
+    """A source as ufw prints it: IPv4 networks are reduced to the network
+    address and /32 is dropped; IPv6 keeps the address (compressed,
+    lowercase) and drops only /128."""
+    if not s:
+        return ""
+    if ":" in s:
+        i = ipaddress.ip_interface(s)
+        return str(i.ip) if i.network.prefixlen == 128 else "%s/%d" % (i.ip, i.network.prefixlen)
+    n = ipaddress.ip_network(s, strict=False)
+    return str(n.network_address) if n.prefixlen == 32 else str(n)
+
+
+def fam_of(src):
+    return "" if not src else ("v6" if ":" in src else "v4")
+
+
+def ports_of(spec):
+    """'80', '1000:2000', '80,443' -> [(lo, hi), ...]; None if not a port spec."""
+    out = []
+    for part in spec.split(","):
+        m = re.fullmatch(r"([0-9]{1,5})(?::([0-9]{1,5}))?", part)
+        if not m:
+            return None
+        lo = int(m.group(1))
+        hi = int(m.group(2) or lo)
+        out.append((lo, hi))
+    return out
+
+
+class Rule:
+    """One `ufw show added` line (or a planned one) in a comparable shape."""
+
+    def __init__(self, action, direction, src, dport, proto, sport="", comment=None, line=""):
+        self.action, self.dir, self.src, self.dport = action, direction, src, dport
+        self.proto, self.sport, self.comment, self.line = proto, sport, comment, line
+        self.ranges = ports_of(dport) or []
+
+    @property
+    def family(self):
+        return fam_of(self.src)
+
+    def key(self):
+        return (self.action, self.dir, self.src, self.sport, self.dport, self.proto)
+
+    def canonical(self):
+        """The line `ufw show added` prints for this rule."""
+        c = "" if self.comment is None else " comment '%s'" % self.comment
+        d = " out" if self.dir == "out" else ""
+        if not self.src and not self.sport:
+            return "ufw %s%s %s%s%s" % (self.action, d, self.dport,
+                                         "" if self.proto == "any" else "/" + self.proto, c)
+        sp = " port %s" % self.sport if self.sport else ""
+        pr = "" if self.proto == "any" else " proto %s" % self.proto
+        return "ufw %s%s from %s%s to any port %s%s%s" % (self.action, d, self.src or "any", sp,
+                                                           self.dport, pr, c)
+
+    def overlaps(self, other):
+        if self.dir != other.dir:
+            return False
+        if "any" not in (self.proto, other.proto) and self.proto != other.proto:
+            return False
+        return any(a <= d and c <= b for a, b in self.ranges for c, d in other.ranges)
+
+    def contains(self, other):
+        """self lets in everything other lets in (same action and source)."""
+        if (self.action, self.dir, self.src, self.sport) != (other.action, other.dir, other.src, other.sport):
+            return False
+        if self.proto not in ("any", other.proto):
+            return False
+        return all(any(a <= c and d <= b for a, b in self.ranges) for c, d in other.ranges)
+
+    def admits(self, proto, port, family):
+        """An in-rule that lets a new connection to port/proto in, for family."""
+        if self.dir != "in" or self.action not in ("allow", "limit") or self.sport:
+            return False
+        if self.proto not in ("any", proto):
+            return False
+        if self.src and self.family != family:
+            return False
+        return any(a <= port <= b for a, b in self.ranges)
+
+
+def parse_line(line):
+    """Parse a `ufw show added` line. None: not a shape this helper reads
+    (interfaces, routes, applications, logging, destinations)."""
+    t = line.split(" ")
+    if len(t) < 3 or t[0] != "ufw":
+        return None
+    comment = None
+    m = re.search(r" comment '([^']*)'$", line)
+    if m:
+        comment = m.group(1)
+        t = line[:m.start()].split(" ")
+    action = t[1]
+    if action not in ("allow", "deny", "reject", "limit"):
+        return None
+    i, direction = 2, "in"
+    if i < len(t) and t[i] in ("in", "out"):
+        direction = t[i]
+        i += 1
+    rest = t[i:]
+    if len(rest) == 1:
+        m = re.fullmatch(r"([0-9,:]+)(?:/(tcp|udp))?", rest[0])
+        if not m or ports_of(m.group(1)) is None:
+            return None
+        return Rule(action, direction, "", m.group(1), m.group(2) or "any", comment=comment, line=line)
+    src, sport, dport, proto = "", "", "", "any"
+    j = 0
+    try:
+        while j < len(rest):
+            k = rest[j]
+            if k == "from":
+                src = rest[j + 1]
+                j += 2
+            elif k == "to":
+                if rest[j + 1] != "any":
+                    return None
+                j += 2
+            elif k == "port":
+                if not dport and "to" not in rest[:j]:
+                    sport = rest[j + 1]
+                else:
+                    dport = rest[j + 1]
+                j += 2
+            elif k == "proto":
+                proto = rest[j + 1]
+                j += 2
+            else:
+                return None
+    except IndexError:
+        return None
+    if src in ("any", "0.0.0.0/0", "::/0"):
+        src = ""
+    if not dport or ports_of(dport) is None or proto not in ("tcp", "udp", "any"):
+        return None
+    try:
+        src = norm_src(src)
+    except ValueError:
+        return None
+    return Rule(action, direction, src, dport, proto, sport=sport, comment=comment, line=line)
+
+
+def known_form(line):
+    return any(f.match(line) for f in FORMS)
+
+
+def shell_kv(data):
+    out = {}
+    for ln in data.decode("utf-8", "replace").splitlines():
+        m = re.match(r"^\s*([A-Z_][A-Z0-9_]*)=(.*)$", ln)
+        if m:
+            out[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+    return out
+
+
+def hex_addr(h):
+    if len(h) == 8:
+        return str(ipaddress.IPv4Address(bytes.fromhex(h)[::-1]))
+    raw = b"".join(bytes.fromhex(h[i:i + 8])[::-1] for i in range(0, 32, 8))
+    return str(ipaddress.IPv6Address(raw))
+
+
+def listeners(proc):
+    """Listening TCP sockets and unconnected UDP sockets, any port."""
+    out = []
+    for proto, fname, state in (("tcp", "tcp", "0A"), ("tcp", "tcp6", "0A"),
+                                ("udp", "udp", "07"), ("udp", "udp6", "07")):
+        data = read(os.path.join(proc, "net", fname))
+        if data is None:
+            continue
+        for ln in data.decode("ascii", "replace").splitlines()[1:]:
+            p = ln.split()
+            if len(p) < 4 or p[3] != state:
+                continue
+            try:
+                lh, lp = p[1].split(":")
+                rh, rp = p[2].split(":")
+                addr = ipaddress.ip_address(hex_addr(lh))
+                port = int(lp, 16)
+            except ValueError:
+                continue
+            if proto == "udp" and (int(rp, 16) != 0 or int(rh, 16) != 0):
+                continue  # a connected UDP socket is a client
+            mapped = getattr(addr, "ipv4_mapped", None)
+            if addr.is_loopback or (mapped is not None and mapped.is_loopback):
+                continue
+            if mapped is not None:
+                fams = ["v4"]
+            elif addr.version == 4:
+                fams = ["v4"]
+            elif addr.is_unspecified:
+                fams = ["v4", "v6"]  # [::] may also take IPv4 (dual stack)
+            else:
+                fams = ["v6"]
+            out.append({"proto": proto, "port": port, "fams": fams, "addr": str(addr)})
+    return out
+
+
+def ss_names(ss):
+    names = {}
+    rc, out, _ = run([ss, "-Hlntup"])
+    if rc != 0:
+        return names
+    for ln in out.splitlines():
+        p = ln.split()
+        if len(p) < 5 or p[0] not in ("tcp", "udp"):
+            continue
+        m = re.search(r":([0-9]{1,5})$", p[4])
+        if not m:
+            continue
+        for n in re.findall(r'\("([^"]*)"', ln):
+            n = name_only(n)
+            if n:
+                names.setdefault((p[0], int(m.group(1))), set()).add(n)
+    return names
+
+
+def unit_state(systemctl, verb, unit):
+    rc, out, _ = run([systemctl, verb, unit], timeout=30)
+    return (out.strip().splitlines() or [""])[0].strip()
+
+
+def plain(v):
+    return " ".join(v.split())
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--want", required=True)
+    ap.add_argument("--ssh-port", required=True, type=int)
+    ap.add_argument("--controller-ip", default="")
+    ap.add_argument("--no-ufw", action="store_true")
+    ap.add_argument("--root", default="/")
+    ap.add_argument("--proc", default="/proc")
+    ap.add_argument("--ufw", default='["ufw"]')
+    ap.add_argument("--systemctl", default="systemctl")
+    ap.add_argument("--ss", default="ss")
+    a = ap.parse_args()
+    want = json.loads(a.want)
+    root = a.root
+
+    def R(*p):
+        return os.path.join(root, *p)
+
+    res = {"version": 1, "mode": "no-ufw" if a.no_ufw else "full", "ufw_lines": [],
+           "default_sha256": "", "enabled_conf": "", "policies": {}, "items": [],
+           "expected_after": [], "verdicts": [], "notes": [], "sysctl_changes": [], "listeners": []}
+    verdict = res["verdicts"].append
+    note = res["notes"].append
+
+    # --- 1. ufw's own files and rule list --------------------------------
+    existing = []
+    unknown = []
+    if a.no_ufw:
+        pol = dict(PKG_DEFAULTS)
+    else:
+        raw = read(R("etc/default/ufw"))
+        if raw is None:
+            verdict({"id": "R03-W1", "error": "/etc/default/ufw cannot be read"})
+            pol = dict(PKG_DEFAULTS)
+        else:
+            res["default_sha256"] = hashlib.sha256(raw).hexdigest()
+            pol = dict(PKG_DEFAULTS)
+            pol.update(shell_kv(raw))
+        conf = read(R("etc/ufw/ufw.conf"))
+        res["enabled_conf"] = clean(shell_kv(conf or b"").get("ENABLED", ""), 10)
+        rc, out, err = run(json.loads(a.ufw) + ["show", "added"])
+        lines = out.splitlines()
+        if rc != 0 or not lines or not lines[0].startswith("Added user rules"):
+            verdict({"id": "R03-W1", "error": clean(((err or out).strip().splitlines() or ["rc %d" % rc])[0])})
+        else:
+            for ln in lines[1:]:
+                ln = ln.rstrip()
+                if not ln or ln == "(None)":
+                    continue
+                res["ufw_lines"].append(clean(ln, 400))
+                r = parse_line(ln)
+                if r is not None:
+                    existing.append(r)
+                if r is None or not known_form(ln):
+                    unknown.append(clean(ln, 400))
+        if unknown:
+            verdict({"id": "R03-W2", "lines": unknown})
+    res["policies"] = {k.lower(): clean(pol.get(k, ""), 40) for k in
+                       ("IPV6", "DEFAULT_INPUT_POLICY", "DEFAULT_OUTPUT_POLICY", "DEFAULT_FORWARD_POLICY",
+                        "MANAGE_BUILTINS")}
+    ipv6 = pol.get("IPV6", "yes").lower() == "yes"
+    fams_on = ["v4", "v6"] if ipv6 else ["v4"]
+    ssh_port = a.ssh_port
+
+    # --- 2. planned items: covered, conflicting or to add -----------------
+    ex_in = [r for r in existing if r.dir == "in"]
+    any_ssh = [r for r in ex_in if not r.src and r.admits("tcp", ssh_port, "v4")]
+    restricted_ssh = [r for r in ex_in if r.src and r.admits("tcp", ssh_port, r.family)]
+    conflicts = []
+    planned = []
+    for it in want.get("items", []):
+        try:
+            src = norm_src(it.get("src", ""))
+        except ValueError:
+            verdict({"id": "R03-W2", "lines": ["planned item %s has a bad address" % clean(it.get("id"))]})
+            continue
+        pr = Rule(it["action"], it.get("dir", "in"), src, str(it["port"]), it.get("proto", "tcp"),
+                  comment="auto_sec")
+        st = {"id": it["id"], "status": "add", "by": "", "line": pr.canonical()}
+        if src and fam_of(src) == "v6" and not ipv6:
+            st["status"], st["by"] = "skip", "IPV6=no: ufw does not filter IPv6"
+        elif it["kind"] == "ssh" and any_ssh:
+            st["status"], st["by"] = "covered", clean(any_ssh[0].line, 400)
+        else:
+            for r in existing:
+                if r.contains(pr):
+                    st["status"], st["by"] = "covered", clean(r.line, 400)
+                    break
+            if st["status"] == "add":
+                for r in existing:
+                    if not r.overlaps(pr):
+                        continue
+                    same_src = (r.src, r.sport) == (pr.src, pr.sport)
+                    if it["kind"] in ("inbound", "egress"):
+                        bad = r.action != pr.action or not same_src
+                    else:
+                        bad = same_src and r.action != pr.action
+                    if bad:
+                        conflicts.append({"want": pr.canonical(), "line": clean(r.line, 400)})
+            if st["status"] == "covered" and it["kind"] == "office":
+                first = next((r for r in ex_in if r.admits("tcp", ssh_port, fam_of(src))), None)
+                if first is not None and first.src != src and first.action == "limit":
+                    note({"id": "N03-W3", "office": src, "port": ssh_port, "first": clean(first.line, 400)})
+        res["items"].append(st)
+        if st["status"] == "add":
+            planned.append((it["kind"], pr))
+    if conflicts:
+        verdict({"id": "R03-W3", "conflicts": conflicts})
+
+    # --- 3. SSH -----------------------------------------------------------
+    ssh_rule = want.get("ssh_rule", "limit")
+    pl_in = [p for _, p in planned if p.dir == "in"]
+    if not any_ssh and restricted_ssh and ssh_rule != "keep":
+        verdict({"id": "R03-W4b", "port": ssh_port, "rule": ssh_rule,
+                 "sources": sorted({clean(r.src) for r in restricted_ssh})})
+    after_in = ex_in + pl_in
+    if not any(r.admits("tcp", ssh_port, f) for r in after_in for f in fams_on):
+        verdict({"id": "R03-W4", "port": ssh_port, "why": "no-rule"})
+    elif not any(not r.src and r.admits("tcp", ssh_port, "v4") for r in after_in) and a.controller_ip:
+        try:
+            cip = ipaddress.ip_address(a.controller_ip)
+        except ValueError:
+            cip = None
+        if cip is not None and not any(r.src and r.admits("tcp", ssh_port, r.family)
+                                       and cip in ipaddress.ip_network(r.src, strict=False)
+                                       for r in after_in):
+            verdict({"id": "R03-W4", "port": ssh_port, "why": "controller"})
+
+    # --- 4. what `ufw show added` must print afterwards --------------------
+    v4 = [r.line for r in existing if r.family != "v6"]
+    v6 = [r.line for r in existing if r.family == "v6"]
+    if not unknown:
+        for kind, pr in planned:
+            line = pr.canonical()
+            if kind == "office":
+                (v6 if pr.family == "v6" else v4).insert(0, line)
+            elif pr.family == "v6":
+                v6.append(line)
+            else:
+                v4.append(line)
+        seen = []
+        for ln in v4 + v6:
+            if ln not in seen:
+                seen.append(ln)
+        res["expected_after"] = [clean(x, 400) for x in seen]
+
+    # --- 5. policies ------------------------------------------------------
+    if pol.get("DEFAULT_INPUT_POLICY", "").upper() == "ACCEPT":
+        verdict({"id": "R03-W9a"})
+    if pol.get("DEFAULT_OUTPUT_POLICY", "").upper() in ("DROP", "REJECT") and not want.get("egress"):
+        verdict({"id": "R03-W9b"})
+    if pol.get("MANAGE_BUILTINS", "no").lower() == "yes":
+        verdict({"id": "R03-W9c"})
+    inet6 = read(os.path.join(a.proc, "net", "if_inet6")) or b""
+    global6 = [ln for ln in inet6.decode("ascii", "replace").splitlines()
+               if len(ln.split()) >= 4 and ln.split()[3] == "00"]
+    if not ipv6 and global6:
+        note({"id": "N03-W6"})
+
+    # --- 6. listeners -----------------------------------------------------
+    closed_ok = set(want.get("closed_ok", []))
+    names = ss_names(a.ss)
+    blocked, restricted, closing = [], [], []
+    seen = set()
+    for li in listeners(a.proc):
+        p, port = li["proto"], li["port"]
+        if (p == "udp" and port in UDP_SKIP) or (p == "tcp" and port == ssh_port):
+            continue
+        fams = [f for f in li["fams"] if f in fams_on]
+        if not fams or (p, port) in seen:
+            continue
+        label = "%d/%s" % (port, p)
+        nm = sorted(names.get((p, port), []))
+        shown = label + (" (%s)" % ", ".join(nm) if nm else "")
+        full = all(any(not r.src and r.admits(p, port, f) for r in after_in) for f in fams)
+        part = all(any(r.admits(p, port, f) for r in after_in) for f in fams)
+        status = "admitted"
+        if not full:
+            if label in closed_ok:
+                status = "closed_ok"
+                closing.append(shown)
+            elif part:
+                status = "restricted"
+                restricted.append(shown)
+            else:
+                status = "blocked"
+                blocked.append(shown)
+        seen.add((p, port))
+        res["listeners"].append({"port": port, "proto": p, "names": nm, "status": status})
+    if blocked:
+        verdict({"id": "R03-W5", "ports": blocked})
+    if closing or restricted:
+        note({"id": "N03-W1", "closing": closing, "restricted": restricted})
+
+    # --- 7. forwarding and WireGuard ---------------------------------------
+    fwd = []
+    for key, label in (("sys/net/ipv4/ip_forward", "ip_forward=1"),
+                       ("sys/net/ipv6/conf/all/forwarding", "ipv6 forwarding=1")):
+        v = read(os.path.join(a.proc, key))
+        if v is not None and v.strip() == b"1":
+            fwd.append(label)
+    if fwd and pol.get("DEFAULT_FORWARD_POLICY", "DROP").upper() in ("DROP", "REJECT"):
+        verdict({"id": "R03-W7a", "what": fwd})
+    wg = []
+    netdir = R("sys/class/net")
+    for ifn in sorted(os.listdir(netdir)) if os.path.isdir(netdir) else []:
+        ue = read(os.path.join(netdir, ifn, "uevent")) or b""
+        if b"DEVTYPE=wireguard" in ue:
+            wg.append(name_only(ifn))
+    if wg:
+        verdict({"id": "R03-W7b", "ifaces": wg})
+    if os.path.exists(os.path.join(netdir, "docker0")):
+        note({"id": "N03-W5"})
+
+    # --- 8. other firewall managers ----------------------------------------
+    mgr = []
+    if unit_state(a.systemctl, "is-active", "firewalld.service") == "active":
+        mgr.append("firewalld is active")
+    for u in ("nftables.service", "netfilter-persistent.service"):
+        if unit_state(a.systemctl, "is-enabled", u) == "enabled":
+            mgr.append("%s is enabled" % u)
+    if mgr:
+        verdict({"id": "R03-W6a", "managers": mgr})
+    if not a.no_ufw:
+        st = unit_state(a.systemctl, "is-enabled", "ufw.service")
+        if st != "enabled":
+            verdict({"id": "R03-W6b", "state": clean(st or "unknown", 40)})
+
+    # --- 9. ufw's kernel settings (IPT_SYSCTL) ------------------------------
+    if not a.no_ufw:
+        f = pol.get("IPT_SYSCTL", "")
+        if f:
+            path = R(f.lstrip("/"))
+            etc_ufw = os.path.realpath(R("etc/ufw")) + os.sep
+            real = os.path.realpath(path)
+            if os.path.lexists(path) and (not real.startswith(etc_ufw) or os.path.islink(path)
+                                          or not os.path.isfile(real)):
+                verdict({"id": "R03-W8", "file": clean(f), "bad_file": True, "changes": []})
+            elif os.path.isfile(real) and os.path.getsize(real) > 0:
+                bad, tight = [], []
+                for ln in (read(real) or b"").decode("utf-8", "replace").splitlines():
+                    ln = ln.strip()
+                    if not ln or ln[0] in "#;":
+                        continue
+                    m = re.match(r"^-?\s*([^=\s]+)\s*=\s*(.*)$", ln)
+                    if not m:
+                        continue
+                    key = m.group(1).replace(".", "/") if "/" not in m.group(1) else m.group(1)
+                    key = key.strip("/")
+                    val = plain(m.group(2))
+                    live = read(os.path.join(a.proc, "sys", key))
+                    if live is None or ".." in key:
+                        continue
+                    live = plain(live.decode("ascii", "replace"))
+                    if live == val:
+                        continue
+                    ch = {"key": clean(key, 120), "live": clean(live, 40), "value": clean(val, 40)}
+                    if TIGHTEN.get(key) == val:
+                        ch["kind"] = "tighten"
+                        tight.append(ch)
+                    else:
+                        ch["kind"] = "loosen"
+                        bad.append(ch)
+                    res["sysctl_changes"].append(ch)
+                if bad:
+                    verdict({"id": "R03-W8", "file": clean(f), "bad_file": False, "changes": bad})
+                if tight:
+                    note({"id": "N03-W8", "file": clean(f), "changes": tight})
+
+    # --- 10. rule files you edited ----------------------------------------
+    if not a.no_ufw:
+        edited = []
+        for fn in RULE_FILES:
+            cur = read(R("etc/ufw", fn))
+            if cur is None:
+                edited.append("/etc/ufw/%s (missing)" % fn)
+                continue
+            # md5 only because ufw's package lists its stock files that way.
+            md5 = hashlib.md5(cur, usedforsecurity=False).hexdigest()
+            stock = read(R("usr/share/ufw/iptables", fn))
+            sums = (read(R("usr/share/ufw", fn + ".md5sum")) or b"").decode("ascii", "replace").split()
+            if (stock is None or hashlib.md5(stock, usedforsecurity=False).hexdigest() != md5) and md5 not in sums:
+                edited.append("/etc/ufw/%s" % fn)
+        for fn in ("before.init", "after.init"):
+            p = R("etc/ufw", fn)
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                edited.append("/etc/ufw/%s (runs at every start)" % fn)
+        if edited:
+            note({"id": "N03-W7", "files": edited})
+
+    print(json.dumps(res, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

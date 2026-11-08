@@ -1,0 +1,5 @@
+## Lab fixture: an operator's own audit.rules.
+-D
+-b 8192
+-f 1
+--backlog_wait_time 60000

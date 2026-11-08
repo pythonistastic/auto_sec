@@ -1,0 +1,329 @@
+---
+# roles/03-firewall/tasks/ufw-preflight.yml - the ufw part of role 03's
+# preflight (U2, U3). Imported by preflight.yml (site.yml pre_tasks, tags
+# always) before the fail2ban part. Read-only; also runs in --check.
+#
+#   ufw active                   no ufw command at all; notes only (#8)
+#   ufw off or missing, keep     nothing (N03-W10)
+#   ufw off or missing, enabled  the turn-on checks: files/auto-sec-ufw-turnon
+#
+# `ufw status verbose` and `ufw show added` only read: they run no ufw
+# capability probe (that probe creates chains). Neither runs on a host
+# without ufw.
+#
+# Trust boundary (SECURITY.md): what is read from the host is shown to you
+# (filtered: printable ASCII, braces become "?"), compared, or used to
+# refuse. The rules auto_sec would add (_fw_items) are built from your
+# variables only; the helper only says which of them are already covered.
+#
+# Facts:
+#   _fw_role_runs    bool  the tags select role 03's ufw part ("firewall" or "ufw")
+#   _fw_installed    bool  ufw was installed when the run started
+#   _fw_active       bool  `ufw status verbose` said "Status: active"
+#   _fw_status       list  its lines (filtered)
+#   _fw_added        list  `ufw show added` rule lines (filtered)
+#   _fw_items        list  rules this run would add, {id, kind, action, dir, src, port, proto, argv}
+#   _fw_turnon       dict  the helper's answer (turn-on path only)
+#   _fw_will_turn_on bool  role 03 main turns ufw on
+#   _fw_add          list  the _fw_items main adds, in order
+#   _fw_pkg_want     list  [ufw] when the turn-on installs it (autosec-apt)
+#   _fw_plan         str   one line for the plan summary
+#   _fw_report       str   one line for the report (role 10)
+
+- name: "ufw preflight: start every ufw fact from a safe value"
+  ansible.builtin.set_fact:
+    _fw_role_runs: >-
+      {{ (('all' in ansible_run_tags) or ('tagged' in ansible_run_tags)
+          or ('firewall' in ansible_run_tags) or ('ufw' in ansible_run_tags))
+         and ('firewall' not in ansible_skip_tags) and ('ufw' not in ansible_skip_tags)
+         and ('tagged' not in ansible_skip_tags) and ('all' not in ansible_skip_tags) }}
+    _fw_installed: false
+    _fw_active: false
+    _fw_status: []
+    _fw_added: []
+    _fw_turnon: {}
+    _fw_turnon_pf: {}
+    _fw_will_turn_on: false
+    _fw_add: []
+    _fw_pkg_want: []
+    _fw_plan: "not checked (ufw is not selected by --tags)"
+    _fw_report: ufw was not checked in this run
+    _fw_stage: preflight
+
+# Every rule this run could add, in the order ufw gets them: the office
+# break-glass rule first (prepend: above every other rule), then SSH, your
+# firewall_inbound items, and the outbound rules of egress_lockdown. Built
+# from your variables only. The helper decides which are already covered.
+- name: "ufw preflight: the rules a turn-on would add (from your variables)"
+  ansible.builtin.set_fact:
+    _fw_items: >-
+      {%- set out = [] -%}
+      {%- set c = _fw_comment -%}
+      {%- set p = ssh_port | int | string -%}
+      {%- set office = office_static_ip | default('') | string | trim -%}
+      {%- if office | length > 0 -%}
+      {%- set _ = out.append({'id': 'office', 'kind': 'office', 'action': 'allow', 'dir': 'in', 'src': office,
+                              'port': p, 'proto': 'tcp',
+                              'argv': ['prepend', 'allow', 'from', office, 'to', 'any', 'port', p, 'proto', 'tcp', 'comment', c]}) -%}
+      {%- endif -%}
+      {%- if firewall_ssh_rule != 'keep' -%}
+      {%- set _ = out.append({'id': 'ssh', 'kind': 'ssh', 'action': firewall_ssh_rule, 'dir': 'in', 'src': '',
+                              'port': p, 'proto': 'tcp', 'argv': [firewall_ssh_rule, p ~ '/tcp', 'comment', c]}) -%}
+      {%- endif -%}
+      {%- for it in _fw_inbound -%}
+      {%- set argv = ([it.rule, it.port ~ '/' ~ it.proto] if it['from'] | length == 0
+                      else [it.rule, 'from', it['from'], 'to', 'any', 'port', it.port, 'proto', it.proto]) + ['comment', c] -%}
+      {%- set _ = out.append({'id': 'in' ~ loop.index, 'kind': 'inbound', 'action': it.rule, 'dir': 'in',
+                              'src': it['from'], 'port': it.port, 'proto': it.proto, 'argv': argv}) -%}
+      {%- endfor -%}
+      {%- if _fw_egress | bool -%}
+      {%- for it in _fw_egress_base + _fw_egress_extra -%}
+      {%- set _ = out.append({'id': 'out' ~ loop.index, 'kind': 'egress', 'action': 'allow', 'dir': 'out', 'src': '',
+                              'port': it.port | string, 'proto': it.proto,
+                              'argv': ['allow', 'out', (it.port | string) ~ '/' ~ it.proto, 'comment', c]}) -%}
+      {%- endfor -%}
+      {%- endif -%}
+      {{ out }}
+
+# --- U2. Is ufw installed, and is it on? (read-only) ----------------------
+
+- name: "ufw preflight U2: reads"
+  when: _fw_role_runs | bool
+  block:
+    # Prints "<status>|<name>". A host without ufw prints nothing for it.
+    - name: "ufw preflight U2: installed ufw package"
+      ansible.builtin.command:
+        argv: [dpkg-query, -W, "-f=${db:Status-Abbrev}|${Package}\n", ufw]
+      register: _fw_pf_pkg
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "ufw preflight U2: remember whether ufw is installed"
+      ansible.builtin.set_fact:
+        _fw_installed: "{{ _fw_pf_pkg.stdout_lines | default([]) | select('match', '^.i[^|]*[|]ufw$') | list | length > 0 }}"
+
+    - name: "ufw preflight U2: ufw status verbose (read-only)"
+      when: _fw_installed | bool
+      ansible.builtin.command:
+        argv: "{{ _fw_ufw_argv + ['status', 'verbose'] }}"
+      environment:
+        LANG: C
+        LC_ALL: C
+      register: _fw_pf_status
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "ufw preflight U2: ufw show added (read-only)"
+      when: _fw_installed | bool
+      ansible.builtin.command:
+        argv: "{{ _fw_ufw_argv + ['show', 'added'] }}"
+      environment:
+        LANG: C
+        LC_ALL: C
+      register: _fw_pf_added
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "ufw preflight R03-W1: ufw's own configuration must be readable"
+      when: _fw_installed | bool
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _fw_pf_status.rc == 0
+          - "_fw_pf_status.stdout_lines | default([]) | select('match', '^Status: (active|inactive)$') | list | length == 1"
+          - _fw_pf_added.rc == 0
+          - (_fw_pf_added.stdout_lines | default(['']))[0:1] | select('match', '^Added user rules') | list | length == 1
+        fail_msg: >-
+          ufw's own configuration on {{ inventory_hostname }} cannot be read
+          ({{ ((_fw_pf_status.stderr | default('') or _fw_pf_added.stderr | default('') or _fw_pf_status.stdout | default(''))
+               | string).splitlines()[0:1] | join('') | regex_replace('[^ -~]', '?') | regex_replace('[{}]', '?') | truncate(200) }}).
+          auto_sec changes nothing in ufw until "sudo ufw status verbose" works.
+          Nothing has been changed.
+
+    - name: "ufw preflight U2: remember what ufw said"
+      when: _fw_installed | bool
+      ansible.builtin.set_fact:
+        _fw_status: "{{ _fw_pf_status.stdout_lines | map('regex_replace', '[^ -~]', '?') | map('regex_replace', '[{}]', '?') | list }}"
+        _fw_added: >-
+          {{ _fw_pf_added.stdout_lines[1:] | select('match', '^ufw ')
+             | map('regex_replace', '[^ -~]', '?') | map('regex_replace', '[{}]', '?') | list }}
+        _fw_active: "{{ 'Status: active' in _fw_pf_status.stdout_lines }}"
+
+# --- U3. ufw is on: no ufw command, notes only ----------------------------
+
+- name: "ufw preflight U3: ufw is active"
+  when:
+    - _fw_role_runs | bool
+    - _fw_active | bool
+  vars:
+    _fw_default_line: "{{ _fw_status | select('match', '^Default: ') | first | default('Default: ?') }}"
+    _fw_out_denied: "{{ _fw_default_line is search('(deny|reject) \\(outgoing\\)') }}"
+    _fw_line_of: >-
+      {{ dict(_fw_items | map(attribute='id')
+              | zip(_fw_items | map(attribute='argv') | map('reject', 'equalto', 'prepend') | map('join', ' ')
+                    | map('regex_replace', '^', 'ufw ') | map('regex_replace', ' comment ' ~ _fw_comment ~ '$', ''))) }}
+    _fw_added_bare: "{{ _fw_added | map('regex_replace', \" comment '[^']*'$\", '') | list }}"
+  block:
+    - name: "ufw preflight R03-W13: egress_lockdown on an active ufw that allows outgoing traffic"
+      ansible.builtin.assert:
+        quiet: true
+        that: not (_fw_egress | bool) or (_fw_out_denied | bool)
+        fail_msg: >-
+          egress_lockdown is true, but ufw on {{ inventory_hostname }} is active with outgoing
+          allowed. auto_sec 0.6 runs no command on an active ufw. Run yourself:
+          {% for it in _fw_items | selectattr('kind', 'equalto', 'egress') %}sudo ufw {{ it.argv | join(' ') }}; {% endfor %}sudo ufw default deny outgoing.
+          Or set egress_lockdown: false. Nothing has been changed.
+
+    - name: "ufw preflight N03-W2: items of yours that an active ufw does not have"
+      when: _fw_missing | length > 0
+      ansible.builtin.debug:
+        msg: >-
+          NOTE: ufw on {{ inventory_hostname }} is active, so auto_sec adds nothing to it.
+          {{ 'These items are' if _fw_missing | length > 1 else 'This item is' }} not in its rules exactly as
+          written; to add {{ 'them' if _fw_missing | length > 1 else 'it' }} yourself:
+          {% for it in _fw_missing %}sudo ufw {{ it.argv | join(' ') }}{{ '; ' if not loop.last else '' }}{% endfor %}
+      vars:
+        _fw_found_ids: "{{ _fw_line_of | dict2items | selectattr('value', 'in', _fw_added_bare) | map(attribute='key') | list }}"
+        _fw_missing: "{{ _fw_items | selectattr('kind', 'in', ['inbound', 'egress']) | rejectattr('id', 'in', _fw_found_ids) | list }}"
+
+    - name: "ufw preflight N03-W3: an office rule behind the SSH rate limit"
+      when:
+        - (office_static_ip | default('') | string | trim | length) > 0
+        - _fw_office_idx | int >= 0
+        - _fw_limit_idx | int >= 0
+        - _fw_limit_idx | int < _fw_office_idx | int
+      ansible.builtin.debug:
+        msg: >-
+          NOTE: the rate limit still applies to {{ _fw_office }} on {{ inventory_hostname }}: your
+          rule 'limit {{ ssh_port | int }}/tcp' comes first. To fix it: sudo ufw delete allow
+          from {{ _fw_office }} to any port {{ ssh_port | int }} proto tcp && sudo ufw prepend allow
+          from {{ _fw_office }} to any port {{ ssh_port | int }} proto tcp comment {{ _fw_comment }}
+      vars:
+        _fw_office: "{{ office_static_ip | default('') | string | trim }}"
+        _fw_office_line: "ufw allow from {{ _fw_office | regex_replace('/32$', '') }} to any port {{ ssh_port | int }} proto tcp"
+        _fw_office_idx: "{{ _fw_added_bare.index(_fw_office_line) if _fw_office_line in _fw_added_bare else -1 }}"
+        _fw_limit_line: "ufw limit {{ ssh_port | int }}/tcp"
+        _fw_limit_idx: "{{ _fw_added_bare.index(_fw_limit_line) if _fw_limit_line in _fw_added_bare else -1 }}"
+
+    - name: "ufw preflight N03-W4: outgoing deny kept"
+      when:
+        - _fw_out_denied | bool
+        - not (_fw_egress | bool)
+      ansible.builtin.debug:
+        msg: >-
+          NOTE: ufw denies outgoing traffic by default on {{ inventory_hostname }}; egress_lockdown
+          is false, so auto_sec 0.6 leaves that (0.1-0.5 set it back to allow).
+
+    - name: "ufw preflight N03-W9: no ufw rule mentions SSH"
+      when: _fw_added | select('search', '(^ufw (allow|limit) (in )?|port )' ~ (ssh_port | int) ~ '(/| |$)') | list | length == 0
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: no ufw rule on {{ inventory_hostname }} mentions SSH port {{ ssh_port | int }}, and ufw
+          is active: new SSH connections may be blocked. auto_sec adds nothing to an active ufw.
+          If you need it: sudo ufw limit {{ ssh_port | int }}/tcp
+
+    - name: "ufw preflight N03-W5: is Docker's bridge here?"
+      ansible.builtin.stat:
+        path: /sys/class/net/docker0
+        get_checksum: false
+      register: _fw_pf_docker
+
+    - name: "ufw preflight N03-W5: Docker publishes ports past ufw"
+      when: _fw_pf_docker.stat.exists | default(false)
+      ansible.builtin.debug:
+        msg: >-
+          NOTE: Docker runs on {{ inventory_hostname }}. Docker publishes container ports past
+          ufw (its own iptables rules come first), so ufw does not guard them.
+
+    - name: "ufw preflight: plan and report lines (active)"
+      ansible.builtin.set_fact:
+        _fw_plan: ufw active, kept (no ufw command)
+        _fw_report: "ufw is on. {{ _fw_default_line }}"
+
+# --- ufw is off (or missing) and stays off ---------------------------------
+
+- name: "ufw preflight N03-W10: ufw is off and firewall_state is keep"
+  when:
+    - _fw_role_runs | bool
+    - not (_fw_active | bool)
+    - _fw_state == 'keep'
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: ufw is {{ 'off' if (_fw_installed | bool) else 'not installed' }} on {{ inventory_hostname }}
+      and firewall_state is keep: auto_sec does not turn it on and adds no rules.
+
+- name: "ufw preflight: plan and report lines (off, kept)"
+  when:
+    - _fw_role_runs | bool
+    - not (_fw_active | bool)
+    - _fw_state == 'keep'
+  ansible.builtin.set_fact:
+    _fw_plan: "{{ 'ufw off, kept' if (_fw_installed | bool) else 'ufw not installed, kept' }}"
+    _fw_report: "{{ 'ufw is installed but off' if (_fw_installed | bool) else 'ufw is not installed' }}"
+
+# --- ufw is off and firewall_state is enabled: the turn-on checks ----------
+
+- name: "ufw preflight: turn-on checks"
+  when:
+    - _fw_role_runs | bool
+    - not (_fw_active | bool)
+    - _fw_state == 'enabled'
+  block:
+    - name: "ufw preflight R03-W10: turning ufw on needs a brand-new login from your computer"
+      ansible.builtin.assert:
+        quiet: true
+        that: not (_ssh_local_mode | default(false) | bool) and (not (_ssh_loopback_conn | default(false) | bool) or _fw_ci_loopback_ok)
+        fail_msg: >-
+          Refusing to turn ufw on for {{ inventory_hostname }} in local mode: auto_sec proves the
+          firewall with a brand-new SSH login from your computer{{ ', and this run reaches sshd from
+          the server itself (a loopback address)' if not (_ssh_local_mode | default(false) | bool) else '' }}.
+          Run from your computer. Nothing has been changed.
+      vars:
+        _fw_ci_loopback_ok: "{{ (autosec_ci | default(false) | bool) and lookup('ansible.builtin.env', 'GITHUB_ACTIONS') == 'true' }}"
+
+    # Role 02's preflight already refused this when it runs; this is the
+    # same check for role 03 (0.5's main.yml:131-143).
+    - name: "ufw preflight R03-W11: Ansible must reach sshd on ssh_port"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (_ssh_server_port | default(0) | int) in [0, ssh_port | int]
+        fail_msg: >-
+          Refusing to enable ufw: Ansible is connected to sshd on port
+          {{ _ssh_server_port | default('?') }}, but ssh_port is {{ ssh_port }} and only that
+          port gets a firewall rule. Set ssh_port to the port sshd really uses.
+          Nothing has been changed.
+
+    - name: "ufw preflight R03-W12: a web app needs 80/tcp and 443/tcp in firewall_inbound"
+      when: app_type is defined
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _fw_inbound | selectattr('port', 'equalto', '80') | selectattr('proto', 'equalto', 'tcp') | selectattr('from', 'equalto', '') | list | length > 0
+          - _fw_inbound | selectattr('port', 'equalto', '443') | selectattr('proto', 'equalto', 'tcp') | selectattr('from', 'equalto', '') | list | length > 0
+        fail_msg: |-
+          app_type is set, so ufw must let in 80/tcp and 443/tcp. Add to firewall_inbound:
+            - { port: 80 }
+            - { port: 443 }
+          Nothing has been changed.
+
+    - name: "ufw preflight: the turn-on checks (read-only helper)"
+      ansible.builtin.include_tasks:
+        file: ufw-check.yml
+
+    - name: "ufw preflight: refuse or go on"
+      ansible.builtin.include_tasks:
+        file: ufw-decide.yml
+
+    - name: "ufw preflight: remember the preflight's answer"
+      ansible.builtin.set_fact:
+        _fw_turnon_pf: "{{ _fw_turnon }}"
+        _fw_pkg_want: "{{ [] if (_fw_installed | bool) else ['ufw'] }}"
+
+- name: "ufw preflight: plan"
+  when: _fw_role_runs | bool
+  ansible.builtin.include_tasks:
+    file: ufw-plan.yml

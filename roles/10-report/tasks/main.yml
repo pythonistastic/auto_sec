@@ -1,30 +1,73 @@
 ---
-# Generates the client-facing security report. This is the commercial
-# deliverable that turns the script into a product.
+# roles/10-report/tasks/main.yml - the security report.
+#
+# Written only on this computer (the controller), in
+# <playbook dir>/reports/security-report-<host>.md (0600, folder 0700);
+# nothing is written on the server and nothing is fetched. Not written in
+# --check. It never fails because client_name, client_domain or ufw is
+# missing: lines without a value are left out.
+#
+# The report states only what this run measured (role 01's update reads,
+# role 02's `sshd -T`, role 03's fail2ban and ufw lines, and the two reads
+# below). Everything else says "not checked by auto_sec". Host output is
+# filtered (printable ASCII, backtick -> ', braces -> ?) before it reaches
+# the file. The local tasks set ansible_become: false as a task variable:
+# an inventory `ansible_become: true` would beat the keyword alone.
 
-- name: Gather UFW status
-  ansible.builtin.command: ufw status verbose
-  register: ufw_status
-  changed_when: false
-
-- name: Gather fail2ban status
-  ansible.builtin.command: fail2ban-client status
-  register: f2b_status
+- name: "Report: ufw status verbose (read-only)"
+  ansible.builtin.command:
+    argv: [ufw, status, verbose]
+  environment:
+    LANG: C
+    LC_ALL: C
+  register: _rep_ufw
   changed_when: false
   failed_when: false
+  check_mode: false
 
-- name: Render security report (Markdown)
+- name: "Report: fail2ban-client status (read-only)"
+  ansible.builtin.command:
+    argv: [fail2ban-client, status]
+  register: _rep_f2b
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Report: filter what the server printed"
+  ansible.builtin.set_fact:
+    _rep_ufw_text: >-
+      {{ (_rep_ufw.stdout | default('') | regex_replace('[^\n\t -~]', '?') | replace('`', "'") | regex_replace('[{}]', '?') | truncate(6000))
+         if (_rep_ufw.rc | default(1)) == 0 else '' }}
+    _rep_f2b_text: >-
+      {{ (_rep_f2b.stdout | default('') | regex_replace('[^\n\t -~]', '?') | replace('`', "'") | regex_replace('[{}]', '?') | truncate(3000))
+         if (_rep_f2b.rc | default(1)) == 0 else '' }}
+    _rep_ufw_missing: "{{ (_rep_ufw.rc | default(0)) != 0 and ((_rep_ufw.msg | default('')) is search('No such file') or (_rep_ufw.rc | default(0)) == 2) }}"
+
+- name: "Report: folder on this computer"
+  when: not ansible_check_mode
+  ansible.builtin.file:
+    path: "{{ playbook_dir }}/reports"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false
+
+- name: "Report: write it on this computer"
+  when: not ansible_check_mode
   ansible.builtin.template:
     src: report.md.j2
-    dest: "/root/security-report-{{ inventory_hostname }}.md"
+    dest: "{{ playbook_dir }}/reports/security-report-{{ inventory_hostname }}.md"
     mode: "0600"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false
 
-- name: Fetch report to workstation
-  ansible.builtin.fetch:
-    src: "/root/security-report-{{ inventory_hostname }}.md"
-    dest: "reports/"
-    flat: true
-
-# Convert the fetched Markdown to branded PDF locally with your own
-# tooling (pandoc with Coders Technologies letterhead template), then
-# send to the client.
+- name: "Report: check mode"
+  when: ansible_check_mode
+  ansible.builtin.debug:
+    msg: >-
+      Check mode: the real run writes reports/security-report-{{ inventory_hostname }}.md
+      on this computer. Nothing is written on the server.

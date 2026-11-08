@@ -1,0 +1,27 @@
+---
+# The defaults that follow autosec_server, as group_vars/all.yml renders
+# them. run.sh passes autosec_server (and ssh_admin_user, deploy_user)
+# with -e and compares the JSON written to <lab_out>.
+- name: Defaults lab
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../../../group_vars/all.yml
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  tasks:
+    - name: "Lab: write the rendered defaults"
+      check_mode: false
+      ansible.builtin.copy:
+        dest: "{{ lab_out }}"
+        mode: "0600"
+        content: >-
+          {{ {'deploy_user_account': deploy_user_account | string,
+              'unattended_upgrades_enabled': unattended_upgrades_enabled | string,
+              'fail2ban_hardening_enabled': fail2ban_hardening_enabled | string,
+              'firewall_state': firewall_state | string,
+              'cve_watch_enabled': cve_watch_enabled | string,
+              'autosec_require_approval': autosec_require_approval | string,
+              'egress_lockdown': egress_lockdown | string,
+              'firewall_inbound': firewall_inbound} | to_json }}

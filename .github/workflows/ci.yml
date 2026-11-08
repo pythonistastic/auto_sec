@@ -28,16 +28,31 @@ jobs:
           -e client=example-client --syntax-check
       - name: Syntax check the sshd-semantics render playbook
         run: ansible-playbook tests/sshd-semantics/render.yml --syntax-check
-      - name: Syntax check the role 01 and role 03 test playbooks
+      - name: Syntax check the test playbooks
         env:
           ANSIBLE_ROLES_PATH: ${{ github.workspace }}/roles
         run: |
-          for p in tests/base/semantics/lab.yml tests/base/semantics/pkg.yml tests/base/live/play.yml \
-                   tests/fail2ban/semantics/ansible-lab.yml tests/fail2ban/semantics/render.yml; do
+          for p in tests/base/semantics/lab.yml tests/base/semantics/account.yml tests/base/live/play.yml \
+                   tests/autosec-apt/semantics/guard.yml tests/autosec-apt/live/play.yml \
+                   tests/fail2ban/semantics/ansible-lab.yml tests/fail2ban/semantics/render.yml \
+                   tests/ufw/semantics/ansible-lab.yml tests/report/semantics/play.yml tests/cve/semantics/play.yml \
+                   tests/legacy/lab.yml tests/legacy/render.yml tests/site/semantics/plan.yml \
+                   tests/site/semantics/defaults.yml tests/site/semantics/plan02.yml \
+                   tests/full-legacy-live/install-old.yml; do
             ansible-playbook -i localhost, "$p" --syntax-check
           done
       - name: Lint
         run: ansible-lint
+
+      # 0.6.0 invariants (plan 4.3 and 6.1): every role sets its _plan_NN;
+      # refusal and note IDs live only in their role (so no two roles share
+      # one); no apt, ufw or sysctl module, no /etc/sysctl.conf write, no
+      # augenrules or auditd restart in commands, cron only in role 07, no
+      # state: absent in roles 08/09, sudoers.d only from role 01, systemd
+      # enabled: true only in roles 04-07. tests/site/semantics/run.sh also
+      # proves each check catches a planted violation.
+      - name: "Static: plan contract, refusal IDs, modules"
+        run: python tests/site/semantics/static.py
 
       # 0.4.0 invariants. Role 02 loads its one drop-in itself, at once and
       # under the undo guard; a handler would load it late, by surprise
@@ -86,19 +101,19 @@ jobs:
           fi
           exit "$bad"
 
-      # The public role 01 and role 03 variables are documented in
+      # The public role 00, 01, 03 and 11 variables are documented in
       # group_vars/all.yml, which site.yml reads and which wins. The role
       # defaults keep the same values for the tests that run the roles
       # without group_vars. They must never drift apart (0.4's
       # `timezone: "UTC"` in group_vars silently beat the role's keep).
-      - name: "group_vars/all.yml and the role 01/03 defaults hold the same values"
+      - name: "group_vars/all.yml and the role 00/01/03/11 defaults hold the same values"
         shell: python
         run: |
           import sys
           import yaml
           g = yaml.safe_load(open("group_vars/all.yml"))
           bad = 0
-          for role in ("01-base", "03-firewall"):
+          for role in ("00-plan", "01-base", "03-firewall", "11-cve-watch"):
               path = "roles/%s/defaults/main.yml" % role
               d = yaml.safe_load(open(path))
               for k, v in d.items():
@@ -137,12 +152,17 @@ jobs:
           -e client=example-client --syntax-check
       - name: Syntax check the sshd-semantics render playbook
         run: ansible-playbook tests/sshd-semantics/render.yml --syntax-check
-      - name: Syntax check the role 01 and role 03 test playbooks
+      - name: Syntax check the test playbooks
         env:
           ANSIBLE_ROLES_PATH: ${{ github.workspace }}/roles
         run: |
-          for p in tests/base/semantics/lab.yml tests/base/semantics/pkg.yml tests/base/live/play.yml \
-                   tests/fail2ban/semantics/ansible-lab.yml tests/fail2ban/semantics/render.yml; do
+          for p in tests/base/semantics/lab.yml tests/base/semantics/account.yml tests/base/live/play.yml \
+                   tests/autosec-apt/semantics/guard.yml tests/autosec-apt/live/play.yml \
+                   tests/fail2ban/semantics/ansible-lab.yml tests/fail2ban/semantics/render.yml \
+                   tests/ufw/semantics/ansible-lab.yml tests/report/semantics/play.yml tests/cve/semantics/play.yml \
+                   tests/legacy/lab.yml tests/legacy/render.yml tests/site/semantics/plan.yml \
+                   tests/site/semantics/defaults.yml tests/site/semantics/plan02.yml \
+                   tests/full-legacy-live/install-old.yml; do
             ansible-playbook -i localhost, "$p" --syntax-check
           done
 
@@ -153,23 +173,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Compile-check detector templates
-        run: |
-          mkdir -p /tmp/pyc
-          for f in roles/09-watcher/templates/*.py.j2; do
-            out="/tmp/pyc/$(basename "${f%.j2}")"
-            sed 's/{{[^}]*}}/PLACEHOLDER/g' "$f" > "$out"
-          done
-          python -m py_compile /tmp/pyc/*.py
-
+      # (The detector templates of roles 08/09 are gone in 0.6, #18.)
       - name: Compile-check the CVE scanner
         run: python -m py_compile roles/11-cve-watch/files/cve_watch.py
 
-      # Role 03 runs this helper on the managed host with its python3:
+      # Role 03 runs these helpers on the managed host with its python3:
       # Ubuntu 22.04 has Python 3.10, so newer syntax must not creep in.
-      - name: Compile-check the fail2ban trial helper (Python 3.10 syntax)
+      - name: Compile-check role 03's helpers (Python 3.10 syntax)
         run: |
-          python - roles/03-firewall/files/auto-sec-f2b-check <<'PY'
+          for f in roles/03-firewall/files/auto-sec-f2b-check roles/03-firewall/files/auto-sec-ufw-turnon; do
+            python - "$f" <<'PY'
           import ast
           import sys
           src = open(sys.argv[1]).read()
@@ -177,6 +190,7 @@ jobs:
           compile(src, sys.argv[1], "exec")
           print("ok:", sys.argv[1])
           PY
+          done
 
       - name: CVE scanner smoke test (lockfile parsing, offline)
         run: |
@@ -208,18 +222,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # Default severity, every shell file: scripts, all test suites (and the
-      # guard tests' stub commands), the SSH undo guard, which is installed
-      # as a root-run script, and role 01's apt trial-run script, which
-      # runs as root on the managed host (sh -c).
-      - name: ShellCheck scripts, tests, the SSH guard and the apt trial run
+      # test stub commands), the SSH undo guard, which is installed as a
+      # root-run script, and role 01's apt trial-run and sudo scan scripts,
+      # which run as root on the managed host (sh -c).
+      - name: ShellCheck scripts, tests, the SSH guard and role 01's scripts
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
           shopt -s globstar nullglob
-          shellcheck scripts/*.sh tests/**/*.sh tests/guard/stubs/* \
+          shellcheck -x scripts/*.sh tests/**/*.sh tests/guard/stubs/* tests/legacy/stubs/* \
             roles/02-ssh-hardening/files/auto-sec-ssh-guard \
-            roles/01-base/files/autosec-apt-sim
+            roles/01-base/files/autosec-apt-sim roles/01-base/files/autosec-sudo-scan
           bash -n roles/02-ssh-hardening/files/auto-sec-ssh-guard
           sh -n roles/01-base/files/autosec-apt-sim
+          sh -n roles/01-base/files/autosec-sudo-scan
 
       # The .sh.j2 templates become root-run scripts (cron, systemd). They
       # were never linted before, which is how unquoted interpolation reached
@@ -288,8 +303,8 @@ jobs:
   # --tags ssh,firewall): keep-everything, stage 2, refusals, the injected
   # login failure and a killed run undone by the timer. Service mode on
   # 22.04, ssh.socket mode on 24.04, and once more on ansible-core 2.16.
-  # UNVERIFIED until it has run green on GitHub: written and linted
-  # locally, never executed (it needs root on a throwaway VM).
+  # Ran on GitHub's runners for v0.4.0; 0.6's changes to it have not run
+  # yet (it needs root on a throwaway VM).
   role02-live:
     name: role02-live (${{ matrix.os }}, ${{ matrix.ssh_mode }}, ${{ matrix.ansible_core }})
     strategy:
@@ -412,8 +427,8 @@ jobs:
   # come through unchanged (same dump, PID, bans, firewall set; no reload),
   # refusals, and the migration of a 0.3 jail.local. 22.04 has fail2ban
   # 0.11.2 with iptables, 24.04 fail2ban 1.0.2 with nftables.
-  # UNVERIFIED until it has run green on GitHub: written and linted
-  # locally, never executed (it needs root on a throwaway VM).
+  # Ran on GitHub's runners for v0.5.0; 0.6's changes to it have not run
+  # yet (it needs root on a throwaway VM).
   fail2ban-live:
     name: fail2ban-live (${{ matrix.os }})
     strategy:
@@ -449,8 +464,8 @@ jobs:
   # is what unattended-upgrade really schedules; Docker exclusion; the
   # 0.1-0.4 restore (only with its -e switch); a package install never
   # upgrades an installed package; refusals. Once more on ansible-core 2.16.
-  # UNVERIFIED until it has run green on GitHub: written and linted
-  # locally, never executed (it needs root on a throwaway VM).
+  # Ran on GitHub's runners for v0.5.0; 0.6's changes to it have not run
+  # yet (it needs root on a throwaway VM).
   base-live:
     name: base-live (${{ matrix.os }}, ${{ matrix.ansible_core }})
     strategy:
@@ -485,4 +500,284 @@ jobs:
         with:
           name: base-live-${{ matrix.os }}-${{ strategy.job-index }}
           path: ${{ runner.temp }}/base-live/logs
+          if-no-files-found: ignore
+
+  # --- 0.6.0 -------------------------------------------------------------------
+
+  # site.yml's run-wide checks and the run plan without root: what refuses
+  # before the first connection (hosts in TEST-NET-1, nothing answers), the
+  # serial stop, R00-1/R00-2, the plan lines, the plan id (the same on both
+  # ansible-core versions), approval (R00-4/R00-5), the defaults that follow
+  # autosec_server, and the static checks with planted violations.
+  site-semantics:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core (current and 2.16)
+        run: |
+          pip install ansible-core
+          python -m venv "$RUNNER_TEMP/ac216"
+          "$RUNNER_TEMP/ac216/bin/pip" install -q "ansible-core>=2.16,<2.17"
+          ansible-galaxy collection install -r requirements.yml
+      - name: Run-wide checks and the plan
+        run: >
+          bash tests/site/semantics/run.sh
+          --ansible "$(command -v ansible-playbook)"
+          --ansible "$RUNNER_TEMP/ac216/bin/ansible-playbook"
+
+  # Role 03's ufw turn-on helper and task files against the REAL ufw code of
+  # pinned .debs (Ubuntu 22.04 and 24.04, Debian 12 and 13), unprivileged.
+  ufw-semantics:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core (current and 2.16)
+        run: |
+          pip install ansible-core
+          python -m venv "$RUNNER_TEMP/ac216"
+          "$RUNNER_TEMP/ac216/bin/pip" install -q "ansible-core>=2.16,<2.17"
+      - name: Cache the pinned ufw packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/auto-sec-ufw-semantics
+          key: ufw-debs-${{ hashFiles('tests/ufw/semantics/debs.txt') }}
+      - name: ufw lab tests
+        run: >
+          bash tests/ufw/semantics/run.sh
+          --cache ~/.cache/auto-sec-ufw-semantics
+          --ansible "$(command -v ansible-playbook)"
+          --ansible "$RUNNER_TEMP/ac216/bin/ansible-playbook"
+
+  # The shared package guard (roles/autosec-apt) with fake dpkg-query,
+  # apt-get and systemctl: P1-P5, the union of wants, the install proof,
+  # the needrestart environment.
+  autosec-apt-semantics:
+    name: autosec-apt-semantics (${{ matrix.ansible_core }})
+    strategy:
+      fail-fast: false
+      matrix:
+        ansible_core: ["ansible-core", "ansible-core>=2.16,<2.17"]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core and shellcheck
+        env:
+          ANSIBLE_CORE_SPEC: ${{ matrix.ansible_core }}
+        run: |
+          pip install "$ANSIBLE_CORE_SPEC"
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Package guard lab tests
+        shell: bash
+        run: |
+          bash tests/autosec-apt/semantics/run.sh | tee "$RUNNER_TEMP/apt.log"
+          if grep -q '^SKIP' "$RUNNER_TEMP/apt.log"; then
+            echo "::error::a check was skipped (a tool is missing on the runner)"
+            exit 1
+          fi
+
+  # Role 10: the report renders without client_name/client_domain or ufw,
+  # only on this computer, with none of the removed claims.
+  report-semantics:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core (current and 2.16)
+        run: |
+          pip install ansible-core
+          python -m venv "$RUNNER_TEMP/ac216"
+          "$RUNNER_TEMP/ac216/bin/pip" install -q "ansible-core>=2.16,<2.17"
+      - name: Report lab tests
+        run: >
+          bash tests/report/semantics/run.sh
+          --ansible "$(command -v ansible-playbook)"
+          --ansible "$RUNNER_TEMP/ac216/bin/ansible-playbook"
+
+  # Role 11 (opt-in): the 0.2-0.5 hashes against git history (needs the full
+  # history), its plan on lab folders, the scanner's OS count.
+  cve-semantics:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core (current and 2.16)
+        run: |
+          pip install ansible-core
+          python -m venv "$RUNNER_TEMP/ac216"
+          "$RUNNER_TEMP/ac216/bin/pip" install -q "ansible-core>=2.16,<2.17"
+      - name: CVE watch lab tests
+        run: >
+          bash tests/cve/semantics/run.sh
+          --ansible "$(command -v ansible-playbook)"
+          --ansible "$RUNNER_TEMP/ac216/bin/ansible-playbook"
+
+  # Roles 08/09 in 0.6 (#18): only warnings about 0.1-0.5's files, R00-3
+  # before fact gathering, and (with strace) no command that 0.5's recon
+  # detector counts. A SKIP line fails the job.
+  legacy-semantics:
+    name: legacy-semantics (${{ matrix.ansible_core }})
+    strategy:
+      fail-fast: false
+      matrix:
+        ansible_core: ["ansible-core", "ansible-core>=2.16,<2.17"]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core and strace
+        env:
+          ANSIBLE_CORE_SPEC: ${{ matrix.ansible_core }}
+        run: |
+          pip install "$ANSIBLE_CORE_SPEC"
+          sudo apt-get update -qq && sudo apt-get install -y -qq strace
+      - name: Legacy lab tests
+        shell: bash
+        run: |
+          bash tests/legacy/run.sh | tee "$RUNNER_TEMP/legacy.log"
+          if grep -q '^SKIP' "$RUNNER_TEMP/legacy.log"; then
+            echo "::error::a check was skipped (a tool is missing on the runner)"
+            exit 1
+          fi
+
+  # The goal test: a runner set up like a server already in use (the
+  # canary), a full site.yml run with autosec_server: existing (plan only,
+  # --check, twice for real) must leave it exactly as it was.
+  # UNVERIFIED until it has run green on GitHub.
+  full-adopt-live:
+    name: full-adopt-live (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core and the pinned collections
+        run: |
+          pip install ansible-core
+          ansible --version
+          ansible-galaxy collection install -r requirements.yml
+      - name: Full run on an existing server
+        run: bash tests/full-adopt-live/run.sh
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-adopt-live-${{ matrix.os }}
+          path: ${{ runner.temp }}/full-adopt-live/logs
+          if-no-files-found: ignore
+
+  # A full run with autosec_server: new on a runner without ufw. First plan
+  # 6.2's ufw-live cases: --check changes nothing, and local mode and a
+  # listening 51820/udp refuse the turn-on. Then ufw on under the undo,
+  # deploy with its sudo file, fail2ban; the second run changes nothing; an
+  # injected login failure turns ufw off again.
+  # UNVERIFIED until it has run green on GitHub.
+  full-new-live:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core and the pinned collections
+        run: |
+          pip install ansible-core
+          ansible --version
+          ansible-galaxy collection install -r requirements.yml
+      - name: Full run on a new server
+        run: bash tests/full-new-live/run.sh
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-new-live
+          path: ${{ runner.temp }}/full-new-live/logs
+          if-no-files-found: ignore
+
+  # The shared package guard against the runner: needrestart held back,
+  # services keep their PIDs, no python3-apt needed.
+  # UNVERIFIED until it has run green on GitHub.
+  apt-guard-live:
+    name: apt-guard-live (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core
+        run: |
+          pip install ansible-core
+          ansible --version
+      - name: Live package guard tests against this runner
+        run: bash tests/autosec-apt/live/run.sh
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apt-guard-live-${{ matrix.os }}
+          path: ${{ runner.temp }}/apt-guard-live/logs
+          if-no-files-found: ignore
+
+  # The detectors of the last release on the runner: in active mode the 0.6
+  # run stops before fact gathering (R00-3) and the SSH session survives; in
+  # alert mode it warns and changes nothing.
+  # UNVERIFIED until it has run green on GitHub.
+  legacy-live:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core and the pinned collections
+        run: |
+          pip install ansible-core
+          ansible --version
+          ansible-galaxy collection install -r requirements.yml
+      - name: Old detectors against a 0.6 run
+        run: bash tests/full-legacy-live/run.sh
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-live
+          path: ${{ runner.temp }}/full-legacy-live/logs
           if-no-files-found: ignore

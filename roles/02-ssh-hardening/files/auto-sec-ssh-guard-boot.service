@@ -2,15 +2,16 @@
 # sysinit.target.wants/ symlink, so no daemon-reload is needed.
 #
 # A reboot inside the undo window loses the transient revert timer (it
-# lives in /run). This unit puts the previous SSH files back early in the
-# next boot, before sshd starts, so sshd starts with the config that was
-# live before the unconfirmed change. Files only: no reload is needed.
+# lives in /run). This unit puts the previous files back early in the
+# next boot, before sshd and ufw start, so they start with the config that
+# was live before the unconfirmed change (role 03 arms the undo for ufw's
+# files when it turns ufw on). Files only: no reload is needed.
 # It does nothing unless a change is still pending.
 [Unit]
 Description=auto_sec: undo an unconfirmed SSH config change after a reboot
 DefaultDependencies=no
 After=local-fs.target
-Before=ssh.socket ssh.service sysinit.target
+Before=ssh.socket ssh.service ufw.service sysinit.target
 ConditionPathExists=/var/lib/auto-sec/ssh-guard/pending
 
 [Service]

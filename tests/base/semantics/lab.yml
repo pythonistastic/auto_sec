@@ -124,8 +124,10 @@
             dest: "{{ _base_uu_file }}"
             mode: "0644"
 
-        - name: "Step 3 (lab): nothing to write: auto_sec's file goes"
-          when: _base_uu_plan_empty | bool
+        - name: "Step 3 (lab): nothing to write: auto_sec's file goes (auto mode)"
+          when:
+            - _base_uu_plan_empty | bool
+            - _base_uu_file_change == 'remove'
           ansible.builtin.file:
             path: "{{ _base_uu_file }}"
             state: absent
@@ -152,7 +154,8 @@
               'trial_pristine': _base_uu_trial_pristine, 'install': _base_uu_install,
               'diff_lines': _base_uu_diff_lines,
               'off_on_purpose': _base_uu_off_on_purpose, 'write_periodic': _base_uu_write_periodic,
-              'plan_empty': _base_uu_plan_empty, 'blacklist_re': _base_uu_blacklist_re,
+              'plan_empty': _base_uu_plan_empty, 'file_change': _base_uu_file_change,
+              'blacklist_re': _base_uu_blacklist_re,
               'reboot': _base_uu_reboot, 'origins': _base_uu_origins,
               'enabled_mode': _base_uu_enabled_mode,
               'real_after': _base_uu_after | default(none)} | to_nice_json }}

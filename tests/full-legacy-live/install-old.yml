@@ -1,0 +1,15 @@
+---
+# Installs auto_sec's old detection roles (08 and 09 of an earlier release)
+# on this runner, the way that release's site.yml did. run.sh unpacks the
+# release into a work folder, points ANSIBLE_ROLES_PATH at its roles/ and
+# passes its group_vars/all.yml with -e old_vars=<file>.
+#   ansible-playbook -i localhost, -c local install-old.yml -e old_vars=<file>
+#     [-e watcher_mode=active]
+- name: Old detection roles (legacy-live setup)
+  hosts: all
+  become: true
+  vars_files:
+    - "{{ old_vars }}"
+  roles:
+    - role: 08-detection
+    - role: 09-watcher

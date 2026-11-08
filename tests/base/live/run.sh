@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
-# base-live: live tests of role 01 (apt updates, reboot, hostname, timezone)
-# against the GitHub runner itself, with play.yml (preflight + role, the way
-# site.yml runs them) over a local connection with sudo.
+# base-live: live tests of role 01 (apt updates, reboot, hostname, timezone,
+# the admin account and its sudo rule) against the GitHub runner itself, with
+# play.yml (preflight, package-guard preflight and role, the way site.yml
+# runs them) over a local connection with sudo.
 #
-# GITHUB-HOSTED RUNNERS ONLY. It installs unattended-upgrades, rewrites files
-# in /etc/apt/apt.conf.d, changes the hostname and the timezone, opens a
-# listener on port 25, runs unattended-upgrade for real and schedules (then
-# cancels) a reboot. It refuses to start anywhere else.
+# GITHUB-HOSTED RUNNERS ONLY. It installs and purges unattended-upgrades,
+# rewrites files in /etc/apt/apt.conf.d, changes the hostname and the
+# timezone, opens a listener on port 25, runs unattended-upgrade for real,
+# schedules (then cancels) a reboot, creates and deletes the accounts deploy
+# and alice and writes files in /etc/sudoers.d. It refuses to start anywhere
+# else.
 #
 # UNVERIFIED: this script has not run on a runner yet.
 #
 # Usage: bash tests/base/live/run.sh [--cases "LIST"]
-#   --cases  a subset of: i a r d l e o s f u h t p k (default: all, in this
-#            order; every case starts from the canary-like baseline)
+#   --cases  a subset of: i a r d l e o s f u h t p k n (default: all, in
+#            this order; every case starts from the canary-like baseline)
 # Cases:
 #   i  --check changes nothing (find -newer)
 #   a  defaults: no file in apt.conf.d is added or changed, the effective
@@ -34,8 +37,21 @@
 #      untouched
 #   t  timezone: offsets and pg-backup shown, changed; an unknown zone refused
 #   p  apt_full_upgrade in --check changes no package
-#   k  curl removed: the run installs it again or refuses because that would
-#      upgrade an installed package; either way no installed package changes
+#   k  unattended-upgrades purged (auto): the run installs it again through
+#      the package guard, with needrestart held back, or refuses because that
+#      would upgrade an installed package; either way no installed package
+#      changes or goes away. Removed with its configuration kept (dpkg rc)
+#      and unattended_upgrades_enabled: true: refused (P1)
+#   n  the account and its sudo rule (deploy_user_account): keep creates
+#      nothing; create makes deploy (bash, no extra groups, password locked)
+#      and /etc/sudoers.d/deploy (0440 root:root, header), sudo works for it,
+#      a second run changes nothing; an existing account is never changed;
+#      0.1-0.5's file stays; a file of yours, a rule of yours that names the
+#      account, a sudoers without @includedir (a copy: the runner's own is not
+#      touched) and UsePAM no (role 02's facts, given with -e) are refused
+#      with nothing changed; --check writes nothing
+# The inventory sets autosec_server: existing and, for the 0.5 cases,
+# unattended_upgrades_enabled: auto.
 # Logs: $RUNNER_TEMP/base-live/logs. Exit 0 = every check passed.
 
 # shellcheck disable=SC2024 # unattended-upgrade output goes to logs owned by this user
@@ -45,7 +61,7 @@ export LC_ALL=C.UTF-8   # ansible needs a UTF-8 locale
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
 SEM=$ROOT/tests/base/semantics
-ALL_CASES="i a r d l e o s f u h t p k"
+ALL_CASES="i a r d l e o s f u h t p k n"
 CASES=$ALL_CASES
 
 die() { echo "ERROR: $*" >&2; exit 2; }
@@ -63,7 +79,7 @@ fi
 for c in $CASES; do
   case " $ALL_CASES " in *" $c "*) ;; *) die "unknown case: $c" ;; esac
 done
-for t in ansible-playbook sudo timedatectl hostnamectl busctl apt-config python3 sha256sum md5sum; do
+for t in ansible-playbook sudo timedatectl hostnamectl busctl apt-config python3 sha256sum md5sum getent useradd userdel; do
   command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"
 done
 
@@ -137,6 +153,8 @@ all:
       ansible_connection: local
       ansible_python_interpreter: /usr/bin/python3
       deploy_user: deploy
+      autosec_server: existing
+      unattended_upgrades_enabled: auto
 EOF
 }
 baseline() { # the canary's state: stock files, 10periodic, a pending reboot, local time
@@ -354,18 +372,132 @@ case_p() {
 }
 case_k() {
   local rc=0 before changed
-  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq curl >"$LOGS/k-remove.log" 2>&1 \
-    || { fail k "cannot remove curl (log $LOGS/k-remove.log)"; return; }
+  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq unattended-upgrades >"$LOGS/k-purge.log" 2>&1 \
+    || { fail k "cannot purge unattended-upgrades (log $LOGS/k-purge.log)"; return; }
   before=$(pkg_versions)
-  play k || rc=$?
+  play k -v || rc=$?
   changed=$(comm -23 <(printf '%s\n' "$before") <(pkg_versions) | paste -sd' ' -)
   expect k "installed packages whose version changed or that went away" "${changed:-none}" none
   if [ "$rc" -eq 0 ]; then
-    expect k "curl installed again" "$(dpkg-query -W -f='${db:Status-Abbrev}' curl 2>/dev/null | cut -c1-2)" ii
+    expect k "unattended-upgrades installed again" "$(dpkg-query -W -f='${db:Status-Abbrev}' unattended-upgrades 2>/dev/null | cut -c1-2)" ii
+    log_has k k '[N-P2] NOTE: installed on live for role 01 (base): unattended-upgrades' "N-P2"
+    if [ -e /etc/apt/apt.conf.d/99needrestart ]; then
+      log_has k k 'needrestart is suspended' "needrestart's apt hook was held back"
+    else
+      echo "      (needrestart is not installed on this runner)"
+    fi
   else
-    log_has k k 'would also change packages you have' "refused: installing curl would upgrade an installed package"
+    log_has k k 'would also change packages you have' "refused: installing it would upgrade an installed package"
   fi
-  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl >/dev/null 2>&1
+  # Removed with its configuration kept (dpkg "rc"): auto_sec does not bring it back.
+  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unattended-upgrades >/dev/null 2>&1
+  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq unattended-upgrades >"$LOGS/k-remove.log" 2>&1 \
+    || { fail k "cannot remove unattended-upgrades (log $LOGS/k-remove.log)"; return; }
+  case_vars k "unattended_upgrades_enabled: true"
+  rc=0
+  play k-rc -e "@$WORK/k.yml" || rc=$?
+  expect_refused k "$rc"
+  log_has k k-rc '[P1] unattended-upgrades was removed on purpose' "P1"
+  expect k "still removed" "$(dpkg-query -W -f='${db:Status-Abbrev}' unattended-upgrades 2>/dev/null | cut -c1-2)" rc
+  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unattended-upgrades >/dev/null 2>&1
+}
+case_n() {
+  local rc=0 found before sha grp
+  n_clean() {
+    sudo -n userdel -r deploy >/dev/null 2>&1
+    sudo -n userdel -r alice >/dev/null 2>&1
+    sudo -n groupdel alice >/dev/null 2>&1
+    sudo -n groupdel deploy >/dev/null 2>&1
+    sudo -n rm -f /etc/sudoers.d/deploy /etc/sudoers.d/alice /etc/sudoers.d/50-autosec-test
+  }
+  n_clean
+  # keep (the inventory's autosec_server: existing): nothing at all.
+  play n-keep || rc=$?
+  expect n "keep: run rc" "$rc" 0
+  expect n "keep: no account deploy" "$(getent passwd deploy >/dev/null && echo yes || echo no)" no
+  expect n "keep: no sudo file" "$(sudo -n test -e /etc/sudoers.d/deploy && echo yes || echo no)" no
+  # --check with create: nothing is written.
+  touch "$WORK/stamp-n"; sleep 1.2
+  rc=0
+  play n-check --check -e deploy_user_account=create || rc=$?
+  expect n "--check: run rc" "$rc" 0
+  found=$(sudo -n find /etc/passwd /etc/shadow /etc/group /etc/sudoers.d /home -maxdepth 1 -newer "$WORK/stamp-n" 2>/dev/null | paste -sd' ' -)
+  expect n "--check: account files, sudoers.d and /home unchanged" "${found:-none}" none
+  # create
+  rc=0
+  play n-create -e deploy_user_account=create || rc=$?
+  expect n "create: run rc" "$rc" 0
+  expect n "create: shell" "$(getent passwd deploy | cut -d: -f7)" /bin/bash
+  expect n "create: no extra groups" "$(id -nG deploy 2>/dev/null)" deploy
+  expect n "create: password locked (key login only)" "$(sudo -n getent shadow deploy | cut -d: -f2 | cut -c1)" '!'
+  expect n "create: home" "$(sudo -n test -d /home/deploy && echo yes || echo no)" yes
+  expect n "create: sudo file mode and owner" "$(sudo -n stat -c '%a %U:%G' /etc/sudoers.d/deploy 2>/dev/null)" "440 root:root"
+  expect n "create: sudo file header" "$(sudo -n head -n 1 /etc/sudoers.d/deploy | cut -c1-31)" "# Written by auto_sec (role 01)"
+  expect n "create: passwordless sudo for deploy" "$(sudo -n -u deploy sudo -n true >/dev/null 2>&1 && echo yes || echo no)" yes
+  rc=0
+  play n-create2 -e deploy_user_account=create || rc=$?
+  expect n "create, second run: rc" "$rc" 0
+  log_has n n-create2 'changed=0' "create, second run changes nothing"
+  n_clean
+  # An existing account is never changed (shell, groups, home).
+  grp=adm
+  if sudo -n grep -rqsE '%:?adm([[:space:],=]|$)' /etc/sudoers /etc/sudoers.d; then grp=users; fi
+  sudo -n useradd -m -s /bin/sh -G "$grp" alice
+  before=$(getent passwd alice; id alice)
+  rc=0
+  play n-alice -e deploy_user_account=create -e deploy_user=alice || rc=$?
+  expect n "existing alice (/bin/sh, group $grp): run rc" "$rc" 0
+  expect n "existing alice: getent and id unchanged" "$(getent passwd alice; id alice)" "$before"
+  expect n "existing alice: gets the sudo file" "$(sudo -n test -f /etc/sudoers.d/alice && echo yes || echo no)" yes
+  log_has n n-alice '[N01-A1] INFO: alice exists' "N01-A1"
+  n_clean
+  # 0.1-0.5's exact file stays.
+  printf 'deploy ALL=(ALL) NOPASSWD:ALL\n' | sudo -n tee /etc/sudoers.d/deploy >/dev/null
+  sudo -n chmod 0440 /etc/sudoers.d/deploy
+  sha=$(sudo -n sha256sum /etc/sudoers.d/deploy)
+  rc=0
+  play n-legacy -e deploy_user_account=create || rc=$?
+  expect n "0.1-0.5's file: run rc" "$rc" 0
+  expect n "0.1-0.5's file: unchanged" "$(sudo -n sha256sum /etc/sudoers.d/deploy)" "$sha"
+  log_has n n-legacy '[N01-A2]' "N01-A2"
+  n_clean
+  # A file of yours: refused, unchanged, no account.
+  printf 'deploy ALL=(ALL) ALL\n' | sudo -n tee /etc/sudoers.d/deploy >/dev/null
+  sudo -n chmod 0440 /etc/sudoers.d/deploy
+  sha=$(sudo -n sha256sum /etc/sudoers.d/deploy)
+  rc=0
+  play n-foreign -e deploy_user_account=create || rc=$?
+  expect_refused n "$rc"
+  log_has n n-foreign '[R01-A2]' "R01-A2"
+  expect n "your file: unchanged" "$(sudo -n sha256sum /etc/sudoers.d/deploy)" "$sha"
+  expect n "your file: no account created" "$(getent passwd deploy >/dev/null && echo yes || echo no)" no
+  n_clean
+  # A rule of yours that names the account: refused.
+  printf 'Defaults:deploy !lecture\n' | sudo -n tee /etc/sudoers.d/50-autosec-test >/dev/null
+  sudo -n chmod 0440 /etc/sudoers.d/50-autosec-test
+  rc=0
+  play n-rule -e deploy_user_account=create || rc=$?
+  expect_refused n "$rc"
+  log_has n n-rule '[R01-A3]' "R01-A3"
+  log_has n n-rule '/etc/sudoers.d/50-autosec-test:1' "the message names your file and line"
+  expect n "a rule of yours: no account, no sudo file" \
+    "$(getent passwd deploy >/dev/null && echo yes || echo no) $(sudo -n test -e /etc/sudoers.d/deploy && echo yes || echo no)" "no no"
+  n_clean
+  # A sudoers without @includedir (a copy; the runner's own is not touched).
+  sudo -n sh -c "grep -v 'includedir' /etc/sudoers > '$WORK/sudoers-noinc'"
+  rc=0
+  play n-noinc -e deploy_user_account=create -e "_base_sudoers=$WORK/sudoers-noinc" || rc=$?
+  expect_refused n "$rc"
+  log_has n n-noinc '[R01-A4]' "R01-A4"
+  n_clean
+  # UsePAM no: a locked account could not log in with a key (role 02's facts).
+  rc=0
+  play n-pam -e deploy_user_account=create \
+    -e '{"_ssh_role_runs": true, "_ssh_enabled": true, "_ssh_admin": "deploy", "_ssh_before": {"admin": {"usepam": "no"}}}' || rc=$?
+  expect_refused n "$rc"
+  log_has n n-pam '[R01-A7]' "R01-A7"
+  expect n "UsePAM no: no account" "$(getent passwd deploy >/dev/null && echo yes || echo no)" no
+  n_clean
 }
 
 setup

@@ -1,0 +1,52 @@
+---
+# roles/autosec-apt/tasks/status.yml - which of the wanted packages are
+# installed. Read-only (dpkg-query only), so it also runs in --check.
+# Used by plan.yml and install.yml, and by role 01's preflight for its plan
+# line.
+#
+# Input:  _aptg_want     list of package names (role constants)
+# Output: _aptg_have     the wanted packages that are installed (dpkg "^.i";
+#                        a held package counts as installed)
+#         _aptg_removed  the wanted packages removed on purpose: their
+#                        configuration was kept (dpkg "^.c", "rc")
+#         _aptg_missing  the wanted packages that are not installed, in the
+#                        order asked
+
+- name: "Packages: the wanted names are package names (P3)"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _aptg_want_l is sequence
+      - _aptg_want_l is not string
+      - _aptg_want_l is not mapping
+      - _aptg_want_l | reject('string') | list | length == 0
+      - _aptg_want_l | reject('match', _aptg_pkg_re) | list | length == 0
+    fail_msg: >-
+      [P3] auto_sec bug: a role asked the package guard for {{ _aptg_want_l | string | truncate(300) }},
+      which is not a list of package names. Please report it. Nothing has been changed.
+  vars:
+    _aptg_want_l: "{{ _aptg_want | default([]) }}"
+
+# dpkg-query exits 1 when a package is unknown; the known ones are printed.
+# The names are role constants, never host data.
+- name: "Packages: dpkg's state of the wanted packages"
+  when: _aptg_want | default([]) | length > 0
+  ansible.builtin.command:
+    argv: "{{ ['dpkg-query', '-W', '-f=${db:Status-Abbrev} ${Package}\n'] + (_aptg_want | unique | list) }}"
+  register: _aptg_q
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Packages: installed, removed on purpose, missing"
+  ansible.builtin.set_fact:
+    _aptg_have: "{{ _aptg_q_have }}"
+    _aptg_removed: >-
+      {{ _aptg_q_lines | select('match', '^.c. \S+$') | map('regex_replace', '^.c. (\S+)$', '\1')
+         | select('in', _aptg_want | default([])) | reject('in', _aptg_q_have) | unique | list }}
+    _aptg_missing: "{{ _aptg_want | default([]) | unique | reject('in', _aptg_q_have) | list }}"
+  vars:
+    _aptg_q_lines: "{{ (_aptg_q.stdout_lines | default([])) if (_aptg_want | default([]) | length > 0) else [] }}"
+    _aptg_q_have: >-
+      {{ _aptg_q_lines | select('match', '^.i. \S+$') | map('regex_replace', '^.i. (\S+)$', '\1')
+         | select('in', _aptg_want | default([])) | unique | list }}

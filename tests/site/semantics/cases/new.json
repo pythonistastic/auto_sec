@@ -1,0 +1,50 @@
+{
+  "autosec_server": "new",
+  "autosec_require_approval": true,
+  "_base_role_runs": true,
+  "_ssh_role_runs": true,
+  "_ssh_enabled": true,
+  "_fw_role_runs": true,
+  "_f2b_role_runs": true,
+  "_l08_role_runs": true,
+  "_l09_role_runs": true,
+  "_layer_04": false,
+  "_layer_05": false,
+  "_layer_06": false,
+  "_layer_07": false,
+  "_layer_10": true,
+  "_layer_11": false,
+  "_sel_04": true,
+  "_sel_05": true,
+  "_sel_06": true,
+  "_sel_07": true,
+  "_sel_10": true,
+  "_sel_11": true,
+  "_plan_01": [
+    {"role": "01", "part": "packages", "do": "install", "what": "unattended-upgrades", "note": "without recommended packages; needrestart held back"},
+    {"role": "01", "part": "account", "do": "user", "what": "create deploy", "note": "home, shell /bin/bash, password locked (key login only), no extra groups"},
+    {"role": "01", "part": "sudo", "do": "sudoers", "what": "write /etc/sudoers.d/deploy", "note": "passwordless sudo for deploy"}
+  ],
+  "_plan_02": [
+    {"role": "02", "part": "keys", "do": "write", "what": "~deploy/.ssh/authorized_keys: add ssh-ed25519 key ...AbCdEfGhIjKl", "note": "after role 01 creates the account"}
+  ],
+  "_plan_03": [
+    {"role": "03", "part": "ufw", "do": "add-rule", "what": "ufw limit 22/tcp comment auto_sec", "note": ""},
+    {"role": "03", "part": "ufw", "do": "add-rule", "what": "ufw allow 443/tcp comment auto_sec", "note": ""},
+    {"role": "03", "part": "ufw", "do": "firewall-on", "what": "ufw --force enable, undone after 300 s unless a brand-new SSH login works",
+     "note": "ufw sets net.ipv4.conf.all.accept_redirects at every start; they stay after an undo until the next reboot"},
+    {"role": "03", "part": "fail2ban", "do": "install", "what": "fail2ban", "note": ""},
+    {"role": "03", "part": "fail2ban", "do": "write", "what": "/etc/fail2ban/jail.d/00-autosec.conf: bantime 1h, bantime.factor 2, bantime.increment true, findtime 10m, maxretry 4; sshd port 22", "note": ""},
+    {"role": "03", "part": "fail2ban", "do": "start", "what": "fail2ban (sshd jail: bans after 4 failures in 10m; exempt: nobody)", "note": ""}
+  ],
+  "_plan_08": [],
+  "_plan_09": [],
+  "_plan_10": [
+    {"role": "10", "part": "report", "do": "local-file",
+     "what": "reports/security-report-fresh.md on this computer; nothing on the server", "note": ""}
+  ],
+  "_fw_plan": "turn ufw on (2 rule(s) to add)",
+  "_f2b_plan": "install and start fail2ban, write 00-autosec.conf",
+  "_aptg_plan_line": "role 01 (base): unattended-upgrades; role 03 (fail2ban): fail2ban",
+  "_aptg_pf_missing": ["unattended-upgrades", "fail2ban"]
+}

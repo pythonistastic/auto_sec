@@ -1,0 +1,20 @@
+#!/bin/sh
+# Test stub for systemctl. Answers `is-active` from $LAB_UNIT_STATES (lines
+# "<unit> <state>"; a unit not listed is inactive) and logs every call to
+# $LAB_CALLS. Shell builtins only, so a strace of a run shows no command of
+# its own.
+printf 'systemctl %s\n' "$*" >> "${LAB_CALLS:-/dev/null}"
+[ "$1" = is-active ] || exit 1
+shift
+rc=3
+for u in "$@"; do
+  state=inactive
+  if [ -n "${LAB_UNIT_STATES:-}" ] && [ -r "$LAB_UNIT_STATES" ]; then
+    while read -r name s; do
+      [ "$name" = "$u" ] && state=$s
+    done < "$LAB_UNIT_STATES"
+  fi
+  printf '%s\n' "$state"
+  [ "$state" = active ] && rc=0
+done
+exit "$rc"

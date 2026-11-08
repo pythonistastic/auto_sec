@@ -1,0 +1,57 @@
+---
+# roles/03-firewall/tasks/ufw-add.yml - add the planned rules to the OFF ufw
+# (U5-U7). Included by ufw.yml after the undo is armed (and by the
+# unprivileged lab, tests/ufw/semantics, on a lab config tree).
+#
+# ufw is inactive here, so each command only writes ufw's own rule files
+# (user.rules, user6.rules) and, for U6, /etc/default/ufw; nothing loads
+# and nothing restarts. ufw's messages are not trusted: an inactive ufw
+# prints "Rules updated" both for a new rule and for one that REPLACED a
+# rule of yours. U7 compares the whole rule list with the plan instead.
+
+- name: "ufw U5: add the planned rules, in order"
+  ansible.builtin.command:
+    argv: "{{ _fw_ufw_argv + item.argv }}"
+  environment:
+    LANG: C
+    LC_ALL: C
+  loop: "{{ _fw_add }}"
+  loop_control:
+    label: "ufw {{ item.argv | join(' ') }}"
+  changed_when: true
+
+- name: "ufw U6: deny outgoing traffic except the rules above (egress_lockdown)"
+  when:
+    - _fw_egress | bool
+    - _fw_out_policy not in ['DROP', 'REJECT']
+  ansible.builtin.command:
+    argv: "{{ _fw_ufw_argv + ['default', 'deny', 'outgoing'] }}"
+  environment:
+    LANG: C
+    LC_ALL: C
+  changed_when: true
+
+- name: "ufw U7: read ufw's rule list again"
+  ansible.builtin.command:
+    argv: "{{ _fw_ufw_argv + ['show', 'added'] }}"
+  environment:
+    LANG: C
+    LC_ALL: C
+  register: _fw_u7
+  changed_when: false
+  check_mode: false
+
+- name: "ufw U7 M03-W2: ufw's rule list must be exactly the planned one"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _fw_u7.rc == 0
+      - _fw_u7_lines == _fw_turnon.expected_after
+    fail_msg: >-
+      After adding rules, ufw's rule list on {{ inventory_hostname }} is not what the plan expected
+      (now: {{ _fw_u7_lines | join('; ') | truncate(600) }}; expected:
+      {{ _fw_turnon.expected_after | join('; ') | truncate(600) }}).
+  vars:
+    _fw_u7_lines: >-
+      {{ _fw_u7.stdout_lines[1:] | default([]) | select('match', '^ufw ')
+         | map('regex_replace', '[^ -~]', '?') | map('regex_replace', '[{}]', '?') | list }}

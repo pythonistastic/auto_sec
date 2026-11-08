@@ -2,9 +2,9 @@
 # Interactive configuration wizard for secure-deploy.
 #
 # Asks plain-language questions, generates every secret it can
-# (age keypair, fwknop keys, DB password, watcher pattern suggestion),
-# writes host_vars/<server>.yml + inventory/<server>.yml, and prints
-# the exact command to harden the server.
+# (age keypair, fwknop keys, DB password), writes host_vars/<server>.yml
+# + inventory/<server>.yml, and prints the exact commands: the plan first,
+# then the run.
 #
 # Two modes:
 #   local   you are running this ON the server to be hardened
@@ -50,7 +50,7 @@ banner() {
 ART
   local ver
   ver="$(cat "${REPO_DIR}/VERSION" 2>/dev/null || echo '?')"
-  printf '\033[0m\033[2m   one-command server hardening + breach detection  \033[0m'
+  printf '\033[0m\033[2m   server hardening, a personal research project  \033[0m'
   printf '\033[2mv%s\033[0m\n' "$ver"
 }
 
@@ -113,14 +113,30 @@ if [ "$MODE" = "remote" ]; then
     || die "Not a valid IP address or hostname: $SERVER_IP"
 fi
 
+# ----------------------------------------------------------- server type
+# autosec_server has no default: the run stops until it is set. It decides
+# the default of everything that installs something or turns it on.
+say "What kind of server is this?"
+note "existing - it already runs something (a website, a database, ...)."
+note "           auto_sec changes nothing unless you ask for it here. It does"
+note "           not turn the firewall on, install fail2ban or create an"
+note "           account by itself."
+note "new      - a brand-new server with nothing on it yet. auto_sec turns"
+note "           on the firewall (ufw), fail2ban and automatic updates, and"
+note "           can create your admin account."
+ask "existing or new" "existing"
+AUTOSEC_SERVER="$REPLY"
+case "$AUTOSEC_SERVER" in
+  existing|new) ;;
+  *) die "Type existing or new." ;;
+esac
+# Safe defaults for the questions below: off on an existing server.
+NEW_DEFAULT="n"; [ "$AUTOSEC_SERVER" = "new" ] && NEW_DEFAULT="y"
+
 # ------------------------------------------------------------- identity
 say "Basics"
-ask_required "Organization / client name (for the report)" "My Company"
+ask "Organization / client name (for the report; empty to leave it out)" ""
 CLIENT_NAME="$REPLY"
-ask_required "App domain (e.g. app.example.com)"
-DOMAIN="$REPLY"
-ask_required "Email for Let's Encrypt TLS registration"
-LE_EMAIL="$REPLY"
 
 # ------------------------------------------------------------------ ssh key
 say "SSH access"
@@ -225,11 +241,28 @@ else
   note "Which account should you (and Ansible) log in as from now on?"
 fi
 note "  root    - keep logging in as root, with your key."
-note "  deploy  - a separate account with sudo. auto_sec creates it."
+note "  deploy  - a separate account with sudo. auto_sec can create it."
 note "  You can also type an existing account that has passwordless sudo."
 ask "Admin login account" "$ADMIN_DEFAULT"
 ADMIN_USER="$REPLY"
 valid_user "$ADMIN_USER" || die "Not a valid user name: $ADMIN_USER"
+
+# deploy_user_account: create makes role 01 create deploy_user (when it is
+# missing) and write auto_sec's own sudo file for it. An existing account
+# is never changed.
+DEPLOY_USER="deploy"
+ACCOUNT="keep"
+if [ "$ADMIN_USER" != "root" ]; then
+  note "auto_sec can create ${ADMIN_USER} for you: a password-locked account"
+  note "(key login only, no extra groups) with passwordless sudo in"
+  note "/etc/sudoers.d/${ADMIN_USER}. It never changes an account that exists,"
+  note "and it stops if your own sudo rules already name ${ADMIN_USER}."
+  if confirm "Create ${ADMIN_USER} if it does not exist yet?" "$NEW_DEFAULT"; then
+    ACCOUNT="create"; DEPLOY_USER="$ADMIN_USER"
+  else
+    note "Then ${ADMIN_USER} must already exist, with passwordless sudo."
+  fi
+fi
 
 # -------------------------------------------------------------- login rules
 # These two have no default on purpose: preflight stops until they are set.
@@ -280,22 +313,37 @@ if [ "$MODE" = "local" ] && { [ "$PERMIT_ROOT" != "keep" ] || [ "$PASSWORD_AUTH"
 fi
 
 # --------------------------------------------------------------------- app
-say "Application runtime"
-ask "App type: node or docker" "node"
-APP_TYPE="$REPLY"
-[ "$APP_TYPE" = "node" ] || [ "$APP_TYPE" = "docker" ] || die "Must be node or docker."
-ask "App listen port (Nginx proxies to it)" "3000"
-APP_PORT="$REPLY"
-# Rendered into the nginx vhost's proxy_pass line.
-if ! [[ "$APP_PORT" =~ ^[0-9]{1,5}$ ]] || [ "$APP_PORT" -lt 1 ] || [ "$APP_PORT" -gt 65535 ]; then
-  die "Port must be a number between 1 and 65535."
+say "Web app (layer 05)"
+note "Layer 05 sets up a NEW web server: nginx with TLS (Let's Encrypt), and"
+note "Node.js (pm2) or Docker. On a server whose nginx was installed before,"
+note "the run stops instead."
+APP=0
+APP_TYPE=""; APP_PORT=""; NODE_VERSION=""; DOMAIN=""; LE_EMAIL=""
+if confirm "Set up the web app layer?" "$NEW_DEFAULT"; then
+  APP=1
+  ask "App type: node or docker" "node"
+  APP_TYPE="$REPLY"
+  [ "$APP_TYPE" = "node" ] || [ "$APP_TYPE" = "docker" ] || die "Must be node or docker."
+  ask "App listen port (Nginx proxies to it)" "3000"
+  APP_PORT="$REPLY"
+  # Rendered into the nginx vhost's proxy_pass line.
+  if ! [[ "$APP_PORT" =~ ^[0-9]{1,5}$ ]] || [ "$APP_PORT" -lt 1 ] || [ "$APP_PORT" -gt 65535 ]; then
+    die "Port must be a number between 1 and 65535."
+  fi
+  NODE_VERSION="20"
+  [ "$APP_TYPE" = "node" ] && { ask "Node.js major version" "20"; NODE_VERSION="$REPLY"; }
+  ask_required "App domain (e.g. app.example.com)"
+  DOMAIN="$REPLY"
+  ask_required "Email for Let's Encrypt TLS registration"
+  LE_EMAIL="$REPLY"
 fi
-NODE_VERSION="20"
-[ "$APP_TYPE" = "node" ] && { ask "Node.js major version" "20"; NODE_VERSION="$REPLY"; }
 
 # ---------------------------------------------------------------- database
-say "Database"
-ask "Database engine: postgres, mysql, or none" "postgres"
+say "Database (layer 06)"
+note "Layer 06 sets up a NEW PostgreSQL or MySQL server that only this"
+note "server can reach. On a server that already has one, the run stops."
+DB_DEFAULT="none"; [ "$AUTOSEC_SERVER" = "new" ] && DB_DEFAULT="postgres"
+ask "Database engine: postgres, mysql, or none" "$DB_DEFAULT"
 DB_ENGINE="$REPLY"
 DB_NAME=""; DB_USER=""; DB_PASSWORD=""
 if [ "$DB_ENGINE" != "none" ]; then
@@ -309,7 +357,7 @@ if [ "$DB_ENGINE" != "none" ]; then
 fi
 
 # ------------------------------------------------------------------ alerts
-say "Telegram alerts (breach alerts, backup status, watcher)"
+say "Telegram alerts (backup status and the CVE watch)"
 note "1) In Telegram, open @BotFather and run /newbot to get a bot TOKEN."
 note "2) Open your new bot and press START / send it any message"
 note "   (Telegram won't let a bot message you until you do)."
@@ -372,17 +420,18 @@ fi
 
 if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
   [ -n "$TG_TOKEN" ] && warn "Alerts left unconfigured; you can edit $HOSTVARS later."
-  [ -z "$TG_TOKEN" ] && warn "Alerts disabled. The detectors still write incident files to /var/log/sentinel, but nobody gets pinged."
+  [ -z "$TG_TOKEN" ] && note "Alerts are off. You can add them later in $HOSTVARS."
   TG_TOKEN="${TG_TOKEN:-CHANGE_ME}"; TG_CHAT="${TG_CHAT:-CHANGE_ME}"
 fi
 
 # ----------------------------------------------------------------- backups
 say "Encrypted off-site backups (Backblaze B2)"
 note "Uses a B2 application key WITHOUT delete permission, so ransomware"
-note "on the server cannot destroy backup history."
+note "on the server cannot destroy backup history. If root's rclone.conf"
+note "already exists and is yours, the run stops instead of replacing it."
 BACKUPS=0
 B2_BUCKET=""; B2_KEY_ID=""; B2_APP_KEY=""; AGE_PUBLIC=""
-if confirm "Enable backups now?"; then
+if confirm "Enable backups now?" "$NEW_DEFAULT"; then
   BACKUPS=1
   ask_required "B2 bucket name"
   B2_BUCKET="$REPLY"
@@ -408,17 +457,31 @@ fi
 
 # ---------------------------------------------------------------- paranoia
 say "Paranoia level"
-note "standard: SSH port open, rate-limited, with fail2ban"
+if [ "$AUTOSEC_SERVER" = "new" ]; then
+  note "standard: SSH port open, rate-limited, with fail2ban"
+else
+  note "standard: SSH, ufw and fail2ban stay as they are (existing server)"
+fi
 note "high:     also installs fwknop (Single Packet Authorization)."
 note "          In this version the SSH port stays visible in high mode."
 note "          Hiding it behind a knock returns in a later release."
 ask "Level: standard or high" "standard"
 PARANOIA="$REPLY"
 [ "$PARANOIA" = "standard" ] || [ "$PARANOIA" = "high" ] || die "Must be standard or high."
-FWKNOP_KEY=""; FWKNOP_HMAC=""
+FWKNOP_KEY=""; FWKNOP_HMAC=""; PCAP_INTF=""
 if [ "$PARANOIA" = "high" ]; then
   FWKNOP_KEY="$(openssl rand -base64 32)"
   FWKNOP_HMAC="$(openssl rand -base64 64 | tr -d '\n')"
+  note "fwknopd listens on one network interface. On the server,"
+  note "'ip route show default' shows it after 'dev' (often eth0 or ens3)."
+  if [ "$MODE" = "local" ]; then
+    # Display only: you type the value.
+    IF_HINT="$(ip route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}' || true)"
+    [[ "$IF_HINT" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] && note "(This server's default route uses ${IF_HINT}.)"
+  fi
+  ask_required "Network interface for fwknopd"
+  PCAP_INTF="$REPLY"
+  [[ "$PCAP_INTF" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "Not an interface name: $PCAP_INTF"
   warn "Before the first 'high' run, make sure you have provider console"
   warn "access (VNC) as break-glass. The knock client is not needed yet,"
   warn "because SSH stays visible. To get ready for later, see"
@@ -437,8 +500,15 @@ is_own_ip() {  # $1 = address without /prefix
 }
 
 OFFICE_IP=""
-note "A break-glass IP is your office or home STATIC IP. It may always"
-note "reach the SSH port without the rate limit, and fail2ban never bans it."
+note "A break-glass IP is your office or home STATIC IP."
+if [ "$AUTOSEC_SERVER" = "new" ]; then
+  note "When auto_sec turns ufw on, it may reach SSH without the rate limit,"
+  note "and auto_sec's fail2ban file never bans it."
+else
+  note "On an existing server auto_sec uses it only where it writes: in a ufw"
+  note "it turns on, or in its own fail2ban file (fail2ban_hardening_enabled:"
+  note "true). Otherwise add it to your own ufw rules and jail.local."
+fi
 if confirm "Add a break-glass IP (recommended if you have a static IP)?"; then
   DETECTED_IP=""
   if [ "$MODE" = "remote" ]; then
@@ -464,23 +534,74 @@ if confirm "Add a break-glass IP (recommended if you have a static IP)?"; then
   fi
 fi
 
+# ---------------------------------------------------------------- firewall
+# Role 03. auto_sec never runs a ufw command on a ufw that is already on.
+say "Firewall (ufw)"
+FW_STATE="keep"
+INBOUND=()
+if [ "$MODE" = "local" ]; then
+  # Turning ufw on is proven with a brand-new SSH login from your own
+  # computer; on the server itself the run would stop (R03-W10).
+  note "On the server itself auto_sec cannot test a new login from your"
+  note "computer, so it does not turn ufw on here (firewall_state: keep). To"
+  note "turn ufw on later, run auto_sec from your own computer with"
+  note "firewall_state: enabled and firewall_inbound in ${HOSTVARS}."
+elif [ "$AUTOSEC_SERVER" = "new" ]; then
+  note "On a new server auto_sec turns ufw on if it is off. Incoming traffic"
+  note "is then blocked, except SSH and the ports you list here. If another"
+  note "port listens when the run starts, the run stops and names it."
+  FW_STATE="enabled"
+else
+  note "auto_sec runs no ufw command on a ufw that is already on. If ufw is"
+  note "off on this server, auto_sec can turn it on, after its checks and"
+  note "with an automatic undo. Incoming traffic is then blocked, except SSH"
+  note "and the ports you list here."
+  confirm "Turn ufw on if it is off?" n && FW_STATE="enabled"
+fi
+if [ "$FW_STATE" = "enabled" ]; then
+  if [ "$APP" = 1 ]; then
+    INBOUND=(80/tcp 443/tcp)
+    note "80 and 443 (the web app) stay open."
+  fi
+  note "Other ports to keep open to everyone, separated by spaces, for"
+  note "example: 25 587 51820/udp. SSH is handled already. Empty for none."
+  ask "Other open ports" ""
+  for p in $REPLY; do
+    [[ "$p" =~ ^[0-9]{1,5}(/(tcp|udp))?$ ]] || die "Not a port: $p (write 25 or 51820/udp)"
+    n=$((10#${p%%/*}))
+    [ "$n" -ge 1 ] && [ "$n" -le 65535 ] || die "Port out of range: $p"
+    case $p in */udp) p="$n/udp" ;; *) p="$n/tcp" ;; esac
+    [ "$p" = "22/tcp" ] && die "SSH (22/tcp) is handled by auto_sec itself; leave it out."
+    case " ${INBOUND[*]} " in *" $p "*) continue ;; esac
+    INBOUND+=("$p")
+  done
+fi
+
 # ------------------------------------------------------------ egress lockdown
-say "Egress lockdown (outbound firewall)"
-note "Default-deny OUTBOUND traffic, allowing only DNS/NTP/HTTP/HTTPS."
-note "Blocks the most common reverse shells (callbacks to random high"
-note "ports). Can break apps that call external services on odd ports;"
-note "you can add allowed ports later in host_vars (egress_allow_extra)."
 EGRESS="false"
-confirm "Enable egress lockdown?" n && EGRESS="true"
+if [ "$FW_STATE" = "enabled" ]; then
+  say "Egress lockdown (outbound firewall)"
+  note "Only when this run turns ufw on: deny OUTBOUND traffic except"
+  note "DNS/NTP/HTTP/HTTPS. Blocks the most common reverse shells (callbacks"
+  note "to random high ports). Can break apps that call outside services on"
+  note "other ports; you can add allowed ports later (egress_allow_extra)."
+  confirm "Enable egress lockdown?" n && EGRESS="true"
+fi
 
 # ------------------------------------------------- updates and reboots
 # Role 01. Every answer here is written to host_vars; the run checks it
 # again and shows what it would change before it changes anything.
 say "Automatic updates and reboots"
-note "Security updates install by themselves every night, at about"
-note "06:00-07:00 server time. Some of them (a new kernel) only take effect"
-note "after a reboot. auto_sec does not turn automatic reboots on unless you"
-note "say so here."
+if [ "$AUTOSEC_SERVER" = "new" ]; then
+  note "On a new server auto_sec installs unattended-upgrades if it is"
+  note "missing, so security updates install by themselves every night."
+else
+  note "On an existing server auto_sec leaves automatic updates as they are"
+  note "(unattended_upgrades_enabled: keep)."
+fi
+note "Updates run at about 06:00-07:00 server time. Some of them (a new"
+note "kernel) only take effect after a reboot. auto_sec does not turn"
+note "automatic reboots on unless you say so here."
 REBOOT_CHOICE="keep"; REBOOT_TIME=""
 if confirm "Turn on automatic reboots when an update needs one?" n; then
   note "The server reboots at this time of day, in its own timezone. A time"
@@ -546,46 +667,47 @@ if [ "$TZ_CHOICE" != "keep" ]; then
   fi
 fi
 
-# ------------------------------------------------------------- first run
-say "First run"
-note "On a BRAND-NEW server, the first run can also install every update"
-note "that is waiting (apt-get dist-upgrade). That can restart services, and"
-note "a new kernel needs a reboot. Do not do this on a server that already"
-note "runs something: there, the nightly security updates are enough."
-FULL_UPGRADE=0
-confirm "Is this a brand-new server with nothing running on it yet?" n && FULL_UPGRADE=1
-
-# ----------------------------------------------------------------- watcher
-say "Detection suite"
-note "Two robust detectors run automatically (in the mode you pick below):"
-note "  - reverse-shell scanner (catches shells with a network socket, and"
-note "    the app/service user spawning a shell - i.e. a web exploit)"
-note "  - recon-burst detector (fires when a session runs many enumeration"
-note "    commands fast - 'looking around', any entry vector)"
-echo
-note "There is also an EXPERIMENTAL SSH login-pattern watcher (a tripwire"
-note "second factor). It is off by default because it can false-positive on"
-note "automation (Ansible/CI). You can enable it below."
-SSH_WATCHER="false"
-if confirm "Enable the experimental SSH login-pattern watcher?" n; then
-  SSH_WATCHER="true"
-  note "Every interactive SSH login must run a secret command within a time"
-  note "window, or it is treated as a breach. Pick something natural you"
-  note "will actually type, and keep it secret (it is your duress signal)."
-  ask "Secret pattern (substring of a command)" "cd /opt/app"
-  WATCHER_PATTERN="$REPLY"
-else
-  WATCHER_PATTERN="cd /opt/app"
+# --------------------------------------------------------------- CVE watch
+# Role 11, off unless chosen: it sends package names and versions to an
+# outside service, so it is your call.
+say "CVE watch (role 11)"
+note "Once a day it reads the dependency lockfiles in your app's folder and"
+note "sends the package names and versions to api.osv.dev, a public"
+note "vulnerability database. It tells you (Telegram) when one of them has"
+note "a known vulnerability. It adds a timer that runs as root and never"
+note "upgrades anything."
+CVE="false"; APP_DIR="/opt/app"
+if confirm "Turn on the CVE watch?" n; then
+  CVE="true"
+  if [ "$APP" = 1 ]; then
+    ask "Your app's folder on the server (the web app layer creates it)" "/opt/app"
+  else
+    ask "Your app's folder on the server (it must exist)" "/opt/app"
+  fi
+  APP_DIR="$REPLY"
+  # Same shape rule as site.yml: absolute, no "..", never "/".
+  { [[ "$APP_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]] && [[ "$APP_DIR" != *..* ]] && [ "$APP_DIR" != "/" ]; } \
+    || die "Not a usable folder: $APP_DIR (an absolute path like /opt/app)"
 fi
 
-# Response mode applies to ALL detectors.
-say "Response mode (applies to every detector)"
-ask "Mode: alert (notify only) or active (kill session/process + block IP)" "alert"
-WATCHER_MODE="$REPLY"
-[ "$WATCHER_MODE" = "alert" ] || [ "$WATCHER_MODE" = "active" ] || die "Must be alert or active."
-if [ "$WATCHER_MODE" = "active" ]; then
-  warn "active mode terminates offending sessions/processes and blocks IPs."
-  warn "Run in alert mode for at least a week first to tune false positives."
+# ------------------------------------------------------------ approval
+say "Your OK before changes"
+note "Every run first prints a plan: what it would change, and a plan id."
+note "With this on, a run that would change the server stops at the plan"
+note "until you run it again with -e autosec_approve=<plan id>. A run that"
+note "changes nothing needs no OK."
+APPROVE="false"
+APPROVE_DEFAULT="y"; [ "$AUTOSEC_SERVER" = "new" ] && APPROVE_DEFAULT="n"
+confirm "Ask for your OK before a run changes this server?" "$APPROVE_DEFAULT" && APPROVE="true"
+
+# ------------------------------------------------------------- first run
+FULL_UPGRADE=0
+if [ "$AUTOSEC_SERVER" = "new" ]; then
+  say "First run"
+  note "On a brand-new server, the first run can also install every update"
+  note "that is waiting (apt-get dist-upgrade). That can restart services, and"
+  note "a new kernel needs a reboot."
+  confirm "Install every waiting update on the first run?" y && FULL_UPGRADE=1
 fi
 
 # ------------------------------------------------------------------- write
@@ -593,12 +715,12 @@ fi
 # the subshell - the wizard would carry on and write an empty value. So check
 # every value here, in the main shell, before anything is written. The usual
 # source of a newline is a .pub file holding more than one key.
-for v in ADMIN_USER AGE_PUBLIC APP_PORT APP_TYPE B2_APP_KEY B2_BUCKET \
-         B2_KEY_ID CLIENT_NAME DB_ENGINE DB_NAME DB_PASSWORD DB_USER \
-         DEPLOY_PUBKEY DOMAIN EXCLUDE_DOCKER FWKNOP_HMAC FWKNOP_KEY \
-         HOST_CHOICE LE_EMAIL NODE_VERSION NOW_USER OFFICE_IP PARANOIA \
-         PASSWORD_AUTH PERMIT_ROOT REBOOT_CHOICE REBOOT_TIME SERVER_IP \
-         SSH_KEY_FILE TG_CHAT TG_TOKEN TZ_CHOICE WATCHER_MODE WATCHER_PATTERN; do
+for v in ACCOUNT ADMIN_USER AGE_PUBLIC APP_DIR APP_PORT APP_TYPE APPROVE AUTOSEC_SERVER \
+         B2_APP_KEY B2_BUCKET B2_KEY_ID CLIENT_NAME CVE DB_ENGINE DB_NAME DB_PASSWORD \
+         DB_USER DEPLOY_PUBKEY DEPLOY_USER DOMAIN EGRESS EXCLUDE_DOCKER FW_STATE \
+         FWKNOP_HMAC FWKNOP_KEY HOST_CHOICE LE_EMAIL NODE_VERSION NOW_USER OFFICE_IP \
+         PARANOIA PASSWORD_AUTH PCAP_INTF PERMIT_ROOT REBOOT_CHOICE REBOOT_TIME \
+         SERVER_IP SSH_KEY_FILE TG_CHAT TG_TOKEN TZ_CHOICE; do
   case "${!v-}" in
     *$'\n'*|*$'\r'*) die "$v contains a newline; refusing to write $HOSTVARS. (A .pub file with several keys? Pick one.)" ;;
   esac
@@ -610,13 +732,30 @@ say "Writing ${HOSTVARS}"
   echo "# Generated by scripts/configure.sh on $(date -u +%F)"
   echo "# This file contains secrets. It is gitignored - keep it that way."
   echo
-  echo "client_name: $(yaml_str "${CLIENT_NAME}")"
-  echo "client_domain: $(yaml_str "${DOMAIN}")"
-  echo "letsencrypt_email: $(yaml_str "${LE_EMAIL}")"
+  echo "# existing: change nothing unless named below. new: set up a brand-new"
+  echo "# server (ufw, fail2ban, automatic updates, the admin account)."
+  echo "autosec_server: $(yaml_str "${AUTOSEC_SERVER}")"
+  echo "# true: a run that would change this server needs -e autosec_approve=<plan id>."
+  echo "autosec_require_approval: $(yaml_str "${APPROVE}")"
   echo
+  if [ -n "$CLIENT_NAME" ]; then
+    echo "client_name: $(yaml_str "${CLIENT_NAME}")"
+  fi
   echo "paranoia_level: $(yaml_str "${PARANOIA}")"
   echo "office_static_ip: $(yaml_str "${OFFICE_IP}")"
-  echo "egress_lockdown: ${EGRESS}"
+  echo
+  echo "# Firewall (role 03). keep: auto_sec runs no ufw command. enabled: turn"
+  echo "# an inactive ufw on, letting in SSH and the ports below only."
+  echo "firewall_state: $(yaml_str "${FW_STATE}")"
+  if [ ${#INBOUND[@]} -gt 0 ]; then
+    echo "firewall_inbound:"
+    for p in "${INBOUND[@]}"; do
+      echo "  - { port: $(yaml_str "${p%/*}"), proto: $(yaml_str "${p#*/}") }"
+    done
+  else
+    echo "firewall_inbound: []"
+  fi
+  echo "egress_lockdown: $(yaml_str "${EGRESS}")"
   echo
   echo "# SSH login (role 02). Root login: keep | prohibit-password | 'no'."
   echo "# Password login: keep | 'no'. Always quote 'no': unquoted, YAML"
@@ -627,8 +766,12 @@ say "Writing ${HOSTVARS}"
   echo "ssh_permit_root_login: $(yaml_str "${PERMIT_ROOT}")"
   echo "ssh_password_authentication: $(yaml_str "${PASSWORD_AUTH}")"
   echo
-  echo "# Also added (never exclusively) for the deploy user."
-  echo "deploy_ssh_public_key: $(yaml_str "${DEPLOY_PUBKEY}")"
+  echo "# The admin account (role 01). create: create deploy_user if it is"
+  echo "# missing, with passwordless sudo. keep: no account, no sudo rule."
+  if [ "$ACCOUNT" = "create" ]; then
+    echo "deploy_user: $(yaml_str "${DEPLOY_USER}")"
+  fi
+  echo "deploy_user_account: $(yaml_str "${ACCOUNT}")"
   echo
   echo "# Updates, reboots, hostname, timezone (role 01). keep = leave it as"
   echo "# the server has it. A reboot time is in the server's own timezone and"
@@ -643,10 +786,14 @@ say "Writing ${HOSTVARS}"
     echo "unattended_exclude_docker: $(yaml_str "${EXCLUDE_DOCKER}")"
   fi
   echo
-  echo "app_type: $(yaml_str "${APP_TYPE}")"
-  echo "app_dir: \"/opt/app\""
-  echo "app_port: $(yaml_str "${APP_PORT}")"
-  echo "node_version: $(yaml_str "${NODE_VERSION}")"
+  echo "app_dir: $(yaml_str "${APP_DIR}")"
+  if [ "$APP" = 1 ]; then
+    echo "app_type: $(yaml_str "${APP_TYPE}")"
+    echo "app_port: $(yaml_str "${APP_PORT}")"
+    echo "node_version: $(yaml_str "${NODE_VERSION}")"
+    echo "client_domain: $(yaml_str "${DOMAIN}")"
+    echo "letsencrypt_email: $(yaml_str "${LE_EMAIL}")"
+  fi
   if [ "$DB_ENGINE" != "none" ]; then
     echo
     echo "db_engine: $(yaml_str "${DB_ENGINE}")"
@@ -654,6 +801,10 @@ say "Writing ${HOSTVARS}"
     echo "db_user: $(yaml_str "${DB_USER}")"
     echo "db_password: $(yaml_str "${DB_PASSWORD}")"
   fi
+  echo
+  echo "# CVE watch (role 11): sends app_dir's package names and versions to"
+  echo "# api.osv.dev once a day when true."
+  echo "cve_watch_enabled: $(yaml_str "${CVE}")"
   echo
   echo "telegram_bot_token: $(yaml_str "${TG_TOKEN}")"
   echo "telegram_chat_id: $(yaml_str "${TG_CHAT}")"
@@ -666,15 +817,11 @@ say "Writing ${HOSTVARS}"
   fi
   if [ "$PARANOIA" = "high" ]; then
     echo
+    echo "fwknop_pcap_intf: $(yaml_str "${PCAP_INTF}")"
     echo "fwknop_key: $(yaml_str "${FWKNOP_KEY}")"
     echo "fwknop_hmac_key: $(yaml_str "${FWKNOP_HMAC}")"
-    echo "fwknop_open_seconds: 30"
+    echo "fwknop_open_seconds: $(yaml_str 30)"
   fi
-  echo
-  echo "watcher_pattern: $(yaml_str "${WATCHER_PATTERN}")"
-  echo "watcher_mode: $(yaml_str "${WATCHER_MODE}")"
-  echo "watcher_whitelist_ips: []"
-  echo "ssh_pattern_watcher_enabled: ${SSH_WATCHER}"
 } > "$HOSTVARS"
 chmod 600 "$HOSTVARS"
 
@@ -744,13 +891,16 @@ echo
 # The full upgrade is a one-off: only the first run gets it.
 UPGRADE_OPT=""
 [ "$FULL_UPGRADE" = 1 ] && UPGRADE_OPT=" -e apt_full_upgrade=true"
+APPROVE_HINT=""
+[ "$APPROVE" = "true" ] && APPROVE_HINT=" -e autosec_approve=<plan id>"
 if [ "$MODE" = "local" ]; then
   PREVIEW_CMD="sudo ansible-playbook -i inventory site.yml -l ${SERVER}"
   RUN_CMD="${PREVIEW_CMD}${UPGRADE_OPT}"
-  note "Harden this server now with:"
-  note "  ${RUN_CMD}"
-  note "To preview the SSH part first (it writes no config files):"
-  note "  ${PREVIEW_CMD} --check --diff --tags ssh"
+  note "First see the plan. It shows what the run would change, and changes"
+  note "nothing:"
+  note "  ${PREVIEW_CMD} -e autosec_plan_only=true"
+  note "Then the real run:"
+  note "  ${RUN_CMD}${APPROVE_HINT}"
   if [ "$FULL_UPGRADE" = 1 ]; then
     note "(-e apt_full_upgrade=true installs every waiting update. Use it on"
     note "this first run only; later runs are the same command without it.)"
@@ -773,13 +923,11 @@ else
   note "  ssh-copy-id -i ${SSH_KEY_FILE}.pub ${NOW_USER}@${SERVER_IP}"
   note "  (Type the password if asked. If the key is already there, it adds nothing.)"
   note ""
-  note "Step 2. See what the SSH part would change. This writes no config files:"
-  note "  ${PREVIEW_CMD} --check --diff --tags ssh"
-  note "  (A full --check stops at the firewall role on a new server: ufw is"
-  note "  not installed yet. The real run installs it.)"
+  note "Step 2. See the plan: what the run would change. This changes nothing:"
+  note "  ${PREVIEW_CMD} -e autosec_plan_only=true"
   note ""
   note "Step 3. The real run:"
-  note "  ${RUN_CMD}"
+  note "  ${RUN_CMD}${APPROVE_HINT}"
   if [ "$FULL_UPGRADE" = 1 ]; then
     note "  (-e apt_full_upgrade=true installs every waiting update. Use it on"
     note "  this first run only.)"
@@ -803,19 +951,27 @@ else
   note "  ssh -i ${SSH_KEY_FILE} ${ADMIN_USER}@${SERVER_IP}"
 fi
 echo
-note "Is this server already in production? A full run no longer replaces"
-note "your fail2ban files, turns on reboots or changes the hostname or"
-note "timezone (issues #2, #3, #7 are fixed). But it still:"
-note "  - turns ufw on if it is off (then only SSH, 80 and 443 stay open);"
-note "  - creates the 'deploy' user with passwordless sudo;"
-note "  - installs curl and unattended-upgrades if they are missing (it"
-note "    stops instead if that would upgrade a package you have);"
-note "  - changes kernel network settings and adds the detectors;"
-note "  - sets up the app, database and backups you chose here, including"
-note "    nginx for ${DOMAIN} (it removes nginx's default site)."
-note "On such a server, run only the parts you want, for example"
-note "--tags ssh,fail2ban, and read 'Known limitations' in README.md first."
-note "Do not put the playbook in cron."
+if [ "$AUTOSEC_SERVER" = "new" ]; then
+  if [ "$FW_STATE" = "enabled" ]; then
+    note "autosec_server: new. The run turns ufw on if it is off (SSH and the"
+    note "ports you listed stay open), installs fail2ban and unattended-upgrades"
+    note "if they are missing, and sets up what you chose here."
+  else
+    note "autosec_server: new. The run installs fail2ban and unattended-upgrades"
+    note "if they are missing and sets up what you chose here. It leaves ufw as"
+    note "it is (firewall_state: keep)."
+  fi
+else
+  note "autosec_server: existing. The run changes only what you chose here."
+  note "It runs no ufw command on an active ufw, installs nothing you did not"
+  note "ask for, and writes no kernel settings."
+fi
+if [ "$APPROVE" = "true" ]; then
+  note "A run that would change the server stops at the plan until you add"
+  note "-e autosec_approve=<plan id> (the id the plan prints)."
+fi
+note "auto_sec is a personal research project, not a finished product. Try"
+note "it on a throwaway server first, and do not put the playbook in cron."
 echo
 if confirm "Run the playbook now?" n; then
   eval "$RUN_CMD"

@@ -1,8 +1,41 @@
 ---
-- name: Install rclone and age
-  ansible.builtin.apt:
-    name: [rclone, age]
-    state: present
+# Layer 07: encrypted off-site backups, only when b2_bucket is set. 0.6:
+# follows plan.yml (site.yml pre_tasks), which refuses a host whose
+# rclone.conf (R07-1) or another file of layer 07 (R07-2) is not
+# auto_sec's; checked again here (M07-1). apt installs go through the
+# package guard (rclone, age and curl, which the backup script uses for its
+# alerts).
+
+- name: "Backups: the plan must have run in this play"
+  ansible.builtin.assert:
+    quiet: true
+    that: _l07_planned | default(false) | bool
+    fail_msg: >-
+      Role 07 needs its plan (site.yml includes roles/07-backups/tasks/plan.yml in
+      pre_tasks). Nothing has been changed.
+
+- name: "Backups: the files again, right before the write"
+  ansible.builtin.include_tasks:
+    file: read.yml
+
+- name: "Backups M07-1: the files are as the plan saw them"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _l07_now == _l07_plan_snapshot
+      - _l07_files == _l07_files_snapshot
+    fail_msg: >-
+      A file layer 07 writes on {{ inventory_hostname }} (rclone.conf, /opt/backup or
+      /etc/logrotate.d/backup) changed during this run. Nothing was written. Run again.
+
+- name: Install rclone, age and curl (package guard)
+  when: not ansible_check_mode
+  ansible.builtin.include_role:
+    name: autosec-apt
+    tasks_from: install
+  vars:
+    _aptg_want: "{{ _l07_pkg_want }}"
+    _aptg_who: role 07 (backups)
 
 - name: Create backup working directory
   ansible.builtin.file:
@@ -27,6 +60,7 @@
     dest: /root/.config/rclone/rclone.conf
     mode: "0600"
     content: |
+      {{ _l07_header }}
       [b2]
       type = b2
       account = {{ b2_key_id }}
@@ -83,6 +117,7 @@
     dest: /etc/logrotate.d/backup
     mode: "0644"
     content: |
+      {{ _l07_header }}
       /var/log/backup.log {
           weekly
           rotate 8

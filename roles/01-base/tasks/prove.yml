@@ -31,7 +31,9 @@
           - sh
           - "{{ _base_apt_parts }}"
           - "{{ _base_sim_dir }}"
-          - "{{ '-' if (_base_uu_plan_empty | bool) else _base_uu_file }}"
+          # auto_sec's file, unless step 3 removed it or there is none
+          - "{{ _base_uu_file if (not (_base_uu_plan_empty | bool)
+                                  or (_base_uu_file_state == 'ours' and _base_uu_file_change == 'none')) else '-' }}"
           - "{{ _base_uu_file | basename }}"
           - "-"
       environment:

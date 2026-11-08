@@ -1,0 +1,44 @@
+---
+# roles/06-database/tasks/read.yml - existing database clusters (read-only).
+# Included by plan.yml (site.yml pre_tasks) and again by main.yml right
+# before the change. Sets _l06_now: {clusters: <n>, ours: yes|no}.
+
+- name: "Database: existing clusters (read-only)"
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - |
+        engine=$1; ver=$2; db=$3
+        if [ "$engine" = postgres ]; then
+          n=0
+          for d in /etc/postgresql/*/*/; do [ -d "$d" ] && n=$((n + 1)); done
+          echo "clusters $n"
+          c=/etc/postgresql/$ver/main/postgresql.conf
+          if [ -f "$c" ] && grep -qx "listen_addresses = '127.0.0.1'" "$c" \
+             && grep -qx 'log_min_duration_statement = 1000' "$c"; then echo "ours yes"; else echo "ours no"; fi
+        else
+          if [ -d /var/lib/mysql/mysql ]; then echo "clusters 1"; else echo "clusters 0"; fi
+          c=/etc/mysql/mysql.conf.d/mysqld.cnf
+          if [ -f "$c" ] && grep -qx 'bind-address = 127.0.0.1' "$c" && [ -d "/var/lib/mysql/$db" ]; then
+            echo "ours yes"; else echo "ours no"; fi
+        fi
+      - sh
+      - "{{ db_engine }}"
+      - "{{ pg_version | default('16') | string }}"
+      - "{{ db_name }}"
+  environment:
+    LC_ALL: C
+  register: _l06_read
+  changed_when: false
+  check_mode: false
+
+- name: "Database: remember what is there"
+  ansible.builtin.set_fact:
+    _l06_now: >-
+      {%- set out = {} -%}
+      {%- for ln in _l06_read.stdout_lines | select('match', '^(clusters|ours) ') -%}
+      {%- set f = ln.split(' ', 1) -%}
+      {%- set _ = out.update({f[0]: (f[1] if f | length > 1 else '')}) -%}
+      {%- endfor -%}
+      {{ out }}

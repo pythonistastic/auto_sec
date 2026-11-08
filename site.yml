@@ -1,29 +1,101 @@
 ---
-# Master playbook. Runs all layers in order.
-# Usage: ansible-playbook -i inventory/hosts.yml site.yml -l <client>
+# Master playbook. Runs every layer in order, one host at a time.
+# Usage: ansible-playbook -i inventory/<server>.yml site.yml -l <server>
 #
-# Core hardening (01-03) always runs. Optional layers are loaded
-# dynamically and only when their feature is configured, so a missing
-# optional collection or a misconfigured optional role can never break
-# core hardening or the detectors.
+# Every run starts with checks that only read (pre_tasks), and then prints
+# the plan: one line per role, the totals and a plan id. Nothing changes
+# before that point.
+#   -e autosec_plan_only=true          print the plan and stop
+#   autosec_require_approval: true     (host_vars) a run that would change
+#                                      the server needs -e autosec_approve=<plan id>
+#
+# Each host needs autosec_server: existing or new (host_vars). existing
+# changes nothing unless you name it; new sets up a brand-new server.
+#
+# Optional layers are loaded dynamically and only when their feature is
+# configured, so a missing optional collection or a misconfigured optional
+# role can never break core hardening.
 
 - name: Secure deployment pipeline
   hosts: all
   become: true
+  gather_facts: false
+  # One host at a time; the first failed or unreachable host stops the
+  # hosts after it (#12). autosec_serial is read before any host variable:
+  # pass it with -e. No any_errors_fatal: with serial, ansible-core 2.16 and
+  # 2.21 then count an unreachable host twice and go on to the next batch
+  # (tests/site/semantics case s4).
+  serial: "{{ autosec_serial | default(1) }}"
+  max_fail_percentage: 0
 
-  # --- Preflight: fail BEFORE any change if required vars are missing, so
-  #     the server is never left half-hardened (SSH locked, run aborted).
-  #     This block is also the single source of truth for "required vars".
-  #     Three read-only role preflights are imported at the end: role 02
-  #     (SSH variables and the live SSH setup), role 01 (updates, reboots,
-  #     hostname, timezone) and role 03 (fail2ban).
+  vars:
+    # When each optional layer is configured. The single source for the
+    # layer includes (tasks:) and for their plan includes (pre_tasks).
+    _layer_04: "{{ (paranoia_level | default('standard')) == 'high' }}"
+    _layer_05: "{{ app_type is defined }}"
+    _layer_06: "{{ db_engine is defined }}"
+    _layer_07: "{{ b2_bucket is defined }}"
+    _layer_10: true
+    _layer_11: "{{ (cve_watch_enabled | default(false) | string | lower) in ['true', 'yes', '1', 'on'] }}"
+    # Whether --tags/--skip-tags select a layer. The plan includes run with
+    # tags always, so they check it here: a layer the tags leave out plans
+    # nothing and installs nothing.
+    _autosec_run_all: "{{ ('all' in ansible_run_tags) or ('tagged' in ansible_run_tags) }}"
+    _autosec_skip_all: "{{ ('all' in ansible_skip_tags) or ('tagged' in ansible_skip_tags) }}"
+    _sel_04: "{{ not (_autosec_skip_all | bool) and 'fwknop' not in ansible_skip_tags and ((_autosec_run_all | bool) or 'fwknop' in ansible_run_tags) }}"
+    _sel_05: "{{ not (_autosec_skip_all | bool) and 'app' not in ansible_skip_tags and ((_autosec_run_all | bool) or 'app' in ansible_run_tags) }}"
+    _sel_06: "{{ not (_autosec_skip_all | bool) and 'database' not in ansible_skip_tags and ((_autosec_run_all | bool) or 'database' in ansible_run_tags) }}"
+    _sel_07: "{{ not (_autosec_skip_all | bool) and 'backups' not in ansible_skip_tags and ((_autosec_run_all | bool) or 'backups' in ansible_run_tags) }}"
+    _sel_10: "{{ not (_autosec_skip_all | bool) and 'report' not in ansible_skip_tags and ((_autosec_run_all | bool) or 'report' in ansible_run_tags) }}"
+    _sel_11: "{{ not (_autosec_skip_all | bool) and 'cve' not in ansible_skip_tags and ((_autosec_run_all | bool) or 'cve' in ansible_run_tags) }}"
+
+  # --- Preflight: every check BEFORE any change, so a refusal never leaves
+  #     a server half-done. All of it is tagged always and also runs in
+  #     --check. The order matters:
+  #       1  host-count guard (controller only)
+  #       2  variable checks (no host access)
+  #       3  auto_sec 0.1-0.5's detectors in active mode (before facts)
+  #       4  fact gathering
+  #       5  checks that need facts
+  #       6  role preflights 02 -> 01 -> 03 -> 08 -> 09, then the plans of
+  #          roles 02, 04-07, 10 and 11
+  #       7  one package check for the whole run
+  #       8  the plan, plan-only stop and approval
   pre_tasks:
+    # --- 1. Host-count guard (#12) -------------------------------------------
+    # An assert runs on the controller: no connection to any host. Without
+    # -l, a run over several hosts needs the count confirmed. (The play uses
+    # the default linear strategy, so run_once means once per batch.) An
+    # empty -l ("" or ",", for example from an unset shell variable) limits
+    # nothing in Ansible, so it counts as no -l.
+    - name: "Preflight R00-2: a run over several hosts needs -l"
+      tags: [always]
+      run_once: true  # noqa: run-once[task]
+      ansible.builtin.assert:
+        quiet: true
+        that: >-
+          (ansible_limit | default('') | string | regex_replace('[][,:]', ' ') | trim | length) > 0
+          or (ansible_play_hosts_all | length) <= 1
+          or (autosec_confirm_hosts | default('') | string) == (ansible_play_hosts_all | length | string)
+        fail_msg: >-
+          [R00-2] This run targets {{ ansible_play_hosts_all | length }} hosts
+          ({{ ansible_play_hosts_all | join(', ') | truncate(300) }}) and no -l was given (an empty
+          -l counts as none). Pass -l <host>, or confirm with
+          -e autosec_confirm_hosts={{ ansible_play_hosts_all | length }}. Nothing has been changed.
+
+    # --- 2. Variable checks (no host access) ---------------------------------
+    # autosec_server (R00-1) and the plan switches.
+    - name: "Preflight: autosec_server and the plan switches"
+      ansible.builtin.import_role:
+        name: 00-plan
+        tasks_from: vars
+      tags: [always]
+
     - name: "Preflight: variables required by the features you enabled"
       tags: [always]
       ansible.builtin.assert:
         quiet: true
         that:
-          - (not (ssh_pattern_watcher_enabled | default(false))) or (watcher_pattern is defined)
           - >-
             (app_type is not defined)
             or (client_domain is defined and letsencrypt_email is defined
@@ -86,14 +158,14 @@
           # hostname is server_hostname, checked by role 01's preflight.)
           - inventory_hostname is match('^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$')
           - inventory_hostname is not search('\.\.')
-          # Reaches sudoers, audit rules and /home/<user> paths.
+          # Reaches sudoers, the sudo scan and /home/<user> paths.
           - deploy_user is match('^[a-z_][a-z0-9_-]{0,31}$')
           # Reaches ufw, fail2ban's jail.d/00-autosec.conf and fwknop
           # access.conf. It must be the port sshd already listens on (role
           # 02's preflight checks that); auto_sec never moves sshd.
           - ssh_port | string is match('^[0-9]{1,5}$')
           - (ssh_port | int) > 0 and (ssh_port | int) < 65536
-          # Reaches `tar -C`, pm2 --hp, the file module and the canary.
+          # Reaches `tar -C`, pm2 --hp, the file module and the CVE watch.
           # Must be absolute, traversal-free, and never '/'.
           - app_dir is match('^/[A-Za-z0-9._/-]+$')
           - app_dir is not search('\.\.')
@@ -162,33 +234,27 @@
           A feature variable has an unsafe shape (see the failed assertion).
           Nothing has been changed on the server.
 
-    - name: "Preflight: alerting and detector values must have a safe shape"
+    - name: "Preflight: alerting and report values must have a safe shape"
       tags: [always]
       ansible.builtin.assert:
         quiet: true
         that:
-          # Rendered into shell scripts run by root from cron and systemd.
+          # Rendered into the backup and CVE watch scripts run by root.
           - >-
             (telegram_bot_token is not defined) or (telegram_bot_token == 'CHANGE_ME')
             or (telegram_bot_token is match('^[0-9]{5,}:[A-Za-z0-9_-]{20,}$'))
           - >-
             (telegram_chat_id is not defined) or (telegram_chat_id == 'CHANGE_ME')
             or (telegram_chat_id | string is match('^-?[0-9]{1,32}$'))
-          # watcher.conf is a newline-delimited INI and is the only control
-          # surface for all three detectors: a newline rewrites their config.
-          - (watcher_pattern is not defined) or (watcher_pattern is not search('[\r\n]'))
-          - (watcher_mode is not defined) or (watcher_mode in ['alert', 'active'])
           - (office_static_ip is not defined) or (office_static_ip | length == 0) or (office_static_ip is match('^[0-9a-fA-F:.]{2,45}(/[0-9]{1,3})?$'))
-          - (revshell_allowed_parent_cmdlines is not defined) or (revshell_allowed_parent_cmdlines is not search('[\r\n,]'))
-          - (recon_patterns is not defined) or (recon_patterns is not search('[\r\n]'))
           - (report_prepared_by is not defined) or (report_prepared_by is not search('[\r\n]'))
-          # Rendered into the client-facing report: a newline would let a
-          # value inject whole sections into a document a client relies on.
+          # Rendered into the report: a newline would let a value inject
+          # whole sections into it.
           - (client_name is not defined) or (client_name is not search('[\r\n]') and client_name | length <= 200)
           # Rendered into cve-watch.conf (an INI file read by the scanner).
           - (cve_watch_min_severity is not defined) or (cve_watch_min_severity | lower in ['low', 'moderate', 'medium', 'high', 'critical'])
         fail_msg: >-
-          An alerting or detector value has an unsafe shape (see the failed
+          An alerting or report value has an unsafe shape (see the failed
           assertion). Nothing has been changed on the server.
 
     # Any other value (a typo, "High") used to skip the SSH firewall rule
@@ -227,6 +293,36 @@
           for example ["203.0.113.7", "198.51.100.0/24"]. Got: {{ _f2b_ips }}.
           Nothing has been changed on the server.
 
+    # The ufw values (firewall_state, firewall_inbound, ...) and the CVE
+    # watch values. Variables only: no host access.
+    - name: "Preflight: ufw variable checks"
+      ansible.builtin.import_role:
+        name: 03-firewall
+        tasks_from: vars
+      tags: [always]
+
+    - name: "Preflight: CVE watch variable checks"
+      ansible.builtin.import_role:
+        name: 11-cve-watch
+        tasks_from: vars
+      tags: [always]
+
+    # --- 3. auto_sec 0.1-0.5's detectors (R00-3), BEFORE fact gathering --
+    # In active mode they end SSH sessions that look like reconnaissance,
+    # and fact gathering alone looks like that. A stat, a grep and
+    # `systemctl is-active` only (tests/legacy proves they trip nothing).
+    - name: "Preflight R00-3: auto_sec 0.1-0.5's detectors must not run in active mode"
+      ansible.builtin.import_role:
+        name: 09-watcher
+        tasks_from: legacy_active
+      tags: [always]
+
+    # --- 4. Facts ----------------------------------------------------------------
+    - name: "Preflight: gather facts"
+      tags: [always]
+      ansible.builtin.setup:
+
+    # --- 5. Checks that need facts --------------------------------------------
     # The break-glass address must be where YOU connect from. The server's
     # own address there (the old wizard default in local mode) opens nothing
     # for you. Host facts are used only to refuse, never as a value.
@@ -249,99 +345,195 @@
           FROM (your office or home), or to "" to turn break-glass off.
           Nothing has been changed on the server.
 
-    # --- SSH preflight (role 02) -------------------------------------------
-    # Read-only checks of every SSH variable and of the live SSH setup
-    # (config, port, socket, pending undo), before role 01 or anything else
-    # changes the server. Tagged always, so `--tags firewall` still gets the
-    # port checks that protect role 03. Also runs in --check.
+    # --- 6. Role preflights (read-only) ------------------------------------------
+    # A wrong value in a role's variables stops every run, whatever the
+    # tags; a role's checks of the server stop a run only when the tags
+    # select that role.
+    #
+    # Role 02 first: SSH variables and the live SSH setup (config, port,
+    # socket, pending undo). Role 01 reads its results (the admin account).
     - name: "Preflight: SSH checks (read-only)"
       ansible.builtin.import_role:
         name: 02-ssh-hardening
         tasks_from: preflight
       tags: [always]
 
-    # --- Updates, reboots, hostname and timezone preflight (role 01) -------
-    # Checks every role 01 variable, reads the apt configuration and runs
-    # role 01's apt file on a copy of it (trial run), before role 01 changes
-    # anything. A wrong variable stops every run, whatever the tags; the
-    # checks of the server stop a run only when the tags select role 01
-    # ("base"). Read-only; also runs in --check.
-    - name: "Preflight: update, reboot, hostname and timezone checks (read-only)"
+    # Role 01: account and sudo, updates, reboots, hostname, timezone, and
+    # the apt trial run on a copy.
+    - name: "Preflight: account, sudo, update, hostname and timezone checks (read-only)"
       ansible.builtin.import_role:
         name: 01-base
         tasks_from: preflight
       tags: [always]
 
-    # --- fail2ban preflight (role 03) ----------------------------------------
-    # Checks the fail2ban variables and asks fail2ban's own config reader,
-    # on a copy of /etc/fail2ban, what auto_sec's file would change. A wrong
-    # variable stops every run, whatever the tags; the checks of the server
-    # stop a run only when the tags select role 03's fail2ban part
-    # ("firewall" or "fail2ban"). Read-only; also runs in --check.
-    - name: "Preflight: fail2ban checks (read-only)"
+    # Role 03: ufw (no command on an active ufw; the turn-on checks when it
+    # is off and firewall_state is enabled), then fail2ban.
+    - name: "Preflight: ufw and fail2ban checks (read-only)"
       ansible.builtin.import_role:
         name: 03-firewall
         tasks_from: preflight
       tags: [always]
 
-  # --- Core hardening: always applied.
+    # Roles 08 and 09 change nothing in 0.6: warnings about what 0.1-0.5
+    # left on the server.
+    - name: "Preflight: auto_sec 0.1-0.5's audit rules (read-only)"
+      ansible.builtin.import_role:
+        name: 08-detection
+        tasks_from: legacy
+      tags: [always]
+
+    - name: "Preflight: auto_sec 0.1-0.5's detectors (read-only)"
+      ansible.builtin.import_role:
+        name: 09-watcher
+        tasks_from: legacy
+      tags: [always]
+
+    # Role 02's plan lines. After role 01: a key for deploy_user waits for
+    # the account role 01 creates in this run.
+    - name: "Plan: role 02 (SSH)"
+      ansible.builtin.import_role:
+        name: 02-ssh-hardening
+        tasks_from: plan
+      tags: [always]
+
+    - name: "Plan: layer 04 (fwknop)"
+      when: (_layer_04 | bool) and (_sel_04 | bool)
+      ansible.builtin.include_role:
+        name: 04-fwknop
+        tasks_from: plan
+        apply: { tags: [always] }
+      tags: [always]
+
+    - name: "Plan: layer 05 (app runtime)"
+      when: (_layer_05 | bool) and (_sel_05 | bool)
+      ansible.builtin.include_role:
+        name: 05-app-runtime
+        tasks_from: plan
+        apply: { tags: [always] }
+      tags: [always]
+
+    - name: "Plan: layer 06 (database)"
+      when: (_layer_06 | bool) and (_sel_06 | bool)
+      ansible.builtin.include_role:
+        name: 06-database
+        tasks_from: plan
+        apply: { tags: [always] }
+      tags: [always]
+
+    - name: "Plan: layer 07 (backups)"
+      when: (_layer_07 | bool) and (_sel_07 | bool)
+      ansible.builtin.include_role:
+        name: 07-backups
+        tasks_from: plan
+        apply: { tags: [always] }
+      tags: [always]
+
+    - name: "Plan: layer 10 (report)"
+      when: (_layer_10 | bool) and (_sel_10 | bool)
+      ansible.builtin.include_role:
+        name: 10-report
+        tasks_from: plan
+        apply: { tags: [always] }
+      tags: [always]
+
+    - name: "Plan: layer 11 (CVE watch)"
+      when: (_layer_11 | bool) and (_sel_11 | bool)
+      ansible.builtin.include_role:
+        name: 11-cve-watch
+        tasks_from: plan
+        apply: { tags: [always] }
+      tags: [always]
+
+    # CVE watch off: say so when a 0.2-0.5 cve-watch timer is still there.
+    - name: "Preflight: a CVE watch timer from 0.2-0.5 (read-only)"
+      when: not (_layer_11 | bool) and (_sel_11 | bool)
+      ansible.builtin.include_role:
+        name: 11-cve-watch
+        tasks_from: legacy
+        apply: { tags: [always] }
+      tags: [always]
+
+    # --- 7. Packages ---------------------------------------------------------------
+    # One apt simulation for every package the selected roles want. With
+    # every choice keep, apt is not asked at all.
+    - name: "Preflight: packages (read-only)"
+      ansible.builtin.import_role:
+        name: autosec-apt
+        tasks_from: preflight
+      tags: [always]
+
+    # --- 8. The plan -------------------------------------------------------------
+    - name: "Plan: summary, plan id and approval"
+      ansible.builtin.import_role:
+        name: 00-plan
+        tasks_from: summary
+      tags: [always]
+
+  # --- Core: roles 01-03 follow their preflight. ---------------------------
   roles:
     - { role: 01-base, tags: ["base"] }
     - { role: 02-ssh-hardening, tags: ["ssh"] }
     - { role: 03-firewall, tags: ["firewall"] }
 
-  # --- Optional + detection layers: loaded dynamically so parse-time
-  #     module resolution in an optional role can't break the core run.
+  # --- Optional layers: loaded dynamically, so parse-time module resolution
+  #     in an optional role can't break the core run.
   tasks:
     - name: "Layer 04: Single Packet Authorization (fwknop)"
       ansible.builtin.include_role:
         name: 04-fwknop
         apply: { tags: ["fwknop"] }
       tags: ["fwknop"]
-      when: paranoia_level | default('standard') == "high"
+      when: _layer_04 | bool
 
     - name: "Layer 05: app runtime (Node/Docker + Nginx + TLS)"
       ansible.builtin.include_role:
         name: 05-app-runtime
         apply: { tags: ["app"] }
       tags: ["app"]
-      when: app_type is defined
+      when: _layer_05 | bool
 
     - name: "Layer 06: database (localhost-only, least privilege)"
       ansible.builtin.include_role:
         name: 06-database
         apply: { tags: ["database"] }
       tags: ["database"]
-      when: db_engine is defined
+      when: _layer_06 | bool
 
     - name: "Layer 07: encrypted off-site backups"
       ansible.builtin.include_role:
         name: 07-backups
         apply: { tags: ["backups"] }
       tags: ["backups"]
-      when: b2_bucket is defined
+      when: _layer_07 | bool
 
-    - name: "Layer 08: detection (auditd tripwires, ransomware canary)"
+    # Roles 08 and 09 are not managed in 0.6 (issue #18): only the warnings
+    # of pre_tasks, which already ran. These includes do nothing then.
+    - name: "Layer 08: detection (not managed in 0.6)"
       ansible.builtin.include_role:
         name: 08-detection
+        tasks_from: legacy
         apply: { tags: ["detection"] }
       tags: ["detection"]
+      when: not (_l08_done | default(false) | bool)
 
-    - name: "Layer 09: breach detection suite"
+    - name: "Layer 09: watcher (not managed in 0.6)"
       ansible.builtin.include_role:
         name: 09-watcher
+        tasks_from: legacy
         apply: { tags: ["watcher"] }
       tags: ["watcher"]
+      when: not (_l09_done | default(false) | bool)
 
-    - name: "Layer 10: client security report"
+    - name: "Layer 10: security report (written on this computer)"
       ansible.builtin.include_role:
         name: 10-report
         apply: { tags: ["report"] }
       tags: ["report"]
+      when: _layer_10 | bool
 
-    - name: "Layer 11: CVE watch (dependency + OS vulnerability scan)"
+    - name: "Layer 11: CVE watch (off unless cve_watch_enabled: true)"
       ansible.builtin.include_role:
         name: 11-cve-watch
         apply: { tags: ["cve"] }
       tags: ["cve"]
-      when: cve_watch_enabled | default(true)
+      when: _layer_11 | bool

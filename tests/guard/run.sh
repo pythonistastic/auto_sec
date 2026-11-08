@@ -10,7 +10,8 @@
 # Every test gets a private copy of the guard whose paths block points at a
 # temp state dir and stub binaries (tests/guard/stubs): sshd (its -t result
 # is set per test), systemctl (logs calls; timer calls go to the real
-# systemctl), fail2ban-client and logger. The revert timers are REAL
+# systemctl), fail2ban-client, logger and ufw (the --ufw mode role 03 uses
+# when it turns ufw on). The revert timers are REAL
 # systemd-run timers. Nothing outside the temp dir is touched, except one
 # daemon-reload of the chosen manager (it must not move the deadline) and,
 # with --system, /run/sshd, which the guard creates when it is missing.
@@ -82,12 +83,17 @@ readonly SSHD=/usr/sbin/sshd
 readonly SYSTEMCTL=systemctl
 readonly SYSTEMD_RUN=systemd-run
 readonly F2B=fail2ban-client
-readonly LOGGER=logger'
+readonly LOGGER=logger
+readonly UFW=/usr/sbin/ufw'
 block=$(sed -n '/^# --- paths (tests rewrite this block) ---$/,/^# --- end paths ---$/p' "$GUARD_SRC" | sed '1d;$d')
-expect_eq "$expected_block" "$block" "paths block holds exactly the six fixed lines"
+expect_eq "$expected_block" "$block" "paths block holds exactly the seven fixed lines"
 expect_eq 1 "$(count "$GUARD_SRC" '^# --- paths (tests rewrite this block) ---$')" "exactly one paths block"
 expect_eq 0 "$(grep -c -E 'AUTOSEC_|\$\{[A-Z][A-Z0-9_]*:[-=]' "$GUARD_SRC")" "no environment-variable overrides"
-expect_eq 0 "$(grep -c -i 'ufw' "$GUARD_SRC")" "no ufw handling"
+# ufw (the --ufw mode) is run in one place only, and only to turn it off.
+# shellcheck disable=SC2016  # the patterns match the literal text "$UFW"
+expect_eq 1 "$(grep -cE '"\$UFW" -' "$GUARD_SRC")" "ufw is run in one place only"
+# shellcheck disable=SC2016
+expect_true "and only as 'ufw --force disable'" grep -qF '"$UFW" --force disable' "$GUARD_SRC"
 expect_true "bash -n passes" bash -n "$GUARD_SRC"
 if command -v shellcheck >/dev/null; then
   expect_true "shellcheck (default severity) is clean on the guard, run.sh, lib.sh and stubs" \
@@ -104,13 +110,12 @@ expect_eq idle "$(cat "$W/probe/out")" "fresh status prints exactly 'idle'"
 
 section "static: boot unit"
 for line in '[Unit]' 'DefaultDependencies=no' 'After=local-fs.target' \
-    'Before=ssh.socket ssh.service sysinit.target' \
+    'Before=ssh.socket ssh.service ufw.service sysinit.target' \
     'ConditionPathExists=/var/lib/auto-sec/ssh-guard/pending' \
     'Type=oneshot' 'ExecStart=/usr/local/sbin/auto-sec-ssh-guard revert --boot' \
     'WantedBy=sysinit.target'; do
   expect_true "unit has: $line" grep -qxF -- "$line" "$UNIT_SRC"
 done
-expect_eq 0 "$(grep -c -i 'ufw' "$UNIT_SRC")" "unit does not mention ufw"
 expect_eq 1 "$(grep -c '^Exec' "$UNIT_SRC")" "unit has a single Exec line (no reload)"
 if command -v systemd-analyze >/dev/null; then
   # The real ExecStart does not exist here; point it at the test copy.
@@ -244,6 +249,7 @@ ID=$(id_for hp)
 gd hp arm "$ID" "$(dl 600)" -- "$A" "$M"
 expect_rc 0 $? "arm"
 expect_true "arm prints 'armed <id> until <UTC time>'" has "$I/out" "^armed $ID until .* UTC\$"
+# Role 03 reads these three lines right before it turns ufw on (U8).
 expect_eq "pending $ID" "$(status_line1 hp)" "status line 1 while armed"
 expect_true "status shows the deadline" has "$I/out" '^deadline: .* UTC (in [0-9]*s)$'
 expect_true "status shows the timer active" has "$I/out" '^timer:    active'
@@ -418,6 +424,82 @@ gd bt revert --boot
 expect_rc 0 $? "a second boot revert finds nothing pending"
 gd bt disarm "$ID"
 expect_rc 3 $? "disarm after the boot revert"
+
+section "--ufw (role 03 turning ufw on): ufw off first, then the files; no sshd"
+new_instance uf
+I=$W/uf
+printf 'orig conf\nENABLED=no\n' > "$I/etc/ufw.conf"
+echo "orig rules" > "$I/etc/user.rules"
+C=$I/etc/ufw.conf
+R=$I/etc/user.rules
+ID=$(id_for uf)
+echo 1 > "$I/sshd_t_rc"     # sshd's config does not matter to a ufw-only change
+gd uf arm "$ID" "$(dl 600)" --ufw -- "$C" "$R"
+expect_rc 0 $? "arm --ufw while sshd -t would fail"
+expect_false "arm --ufw ran no sshd -t" has "$I/calls" 'sshd -t'
+gd uf status
+expect_true "status says a revert turns ufw off first" has "$I/out" '^ufw:      a revert turns ufw off first'
+printf 'orig conf\nENABLED=yes\n' > "$C"   # what `ufw allow` and `ufw enable` leave
+echo "new rules" > "$R"
+gd uf revert "$ID"
+expect_rc 0 $? "revert"
+expect_true "ufw --force disable ran" has "$I/calls" ' ufw --force disable$'
+expect_eq "$(printf 'orig conf\nENABLED=no')" "$(content "$C")" "ufw.conf is the snapshot (put back after the disable)"
+expect_eq "orig rules" "$(content "$R")" "user.rules is restored"
+expect_false "no sshd -t at revert" has "$I/calls" 'sshd -t'
+expect_false "no sshd reload" has "$I/calls" 'try-reload-or-restart'
+expect_true "the revert timer is stopped" has "$I/calls" "systemctl stop auto-sec-ssh-guard-$ID.timer"
+expect_true "the revert record says ufw was turned off" has "$I/state/reverted.$ID" '^ufw turned off$'
+expect_eq idle "$(status_line1 uf)" "status idle"
+
+new_instance ufb
+I=$W/ufb
+echo "orig rules" > "$I/etc/user.rules"
+ID=$(id_for ufb)
+gd ufb arm "$ID" "$(dl 600)" --ufw -- "$I/etc/user.rules"
+expect_rc 0 $? "arm --ufw (boot case)"
+echo "new rules" > "$I/etc/user.rules"
+stop_timer "$ID"
+n_calls=$(wc -l < "$I/calls")
+gd ufb revert --boot
+expect_rc 0 $? "revert --boot"
+expect_eq "orig rules" "$(content "$I/etc/user.rules")" "boot: user.rules is restored"
+expect_eq "" "$(lines_after "$I/calls" "$n_calls")" "boot: no ufw, sshd or systemctl call (ufw has not started yet)"
+
+new_instance ufx
+I=$W/ufx
+echo "orig rules" > "$I/etc/user.rules"
+ID=$(id_for ufx)
+gd ufx arm "$ID" "$(dl 600)" --ufw -- "$I/etc/user.rules"
+expect_rc 0 $? "arm --ufw (ufw disable fails)"
+echo "new rules" > "$I/etc/user.rules"
+echo 1 > "$I/ufw_rc"
+gd ufx revert "$ID"
+expect_rc 1 $? "revert reports the failed disable"
+expect_eq "orig rules" "$(content "$I/etc/user.rules")" "the file is restored anyway"
+expect_true "logged: ufw --force disable failed" has "$I/log" 'ufw --force disable failed'
+expect_eq idle "$(status_line1 ufx)" "the change is closed"
+
+new_instance ufm
+I=$W/ufm
+echo "orig rules" > "$I/etc/user.rules"
+rm -f "$I/bin/ufw"
+ID=$(id_for ufm)
+gd ufm arm "$ID" "$(dl 600)" --ufw -- "$I/etc/user.rules"
+expect_rc 0 $? "arm --ufw (no ufw binary)"
+echo "new rules" > "$I/etc/user.rules"
+gd ufm revert "$ID"
+expect_rc 0 $? "revert without a ufw binary"
+expect_true "logged: no ufw to turn off" has "$I/log" 'no ufw to turn off'
+expect_eq "orig rules" "$(content "$I/etc/user.rules")" "the file is restored"
+
+# A path under /etc/ssh/ brings sshd back into the change. The path does
+# not exist and the arm is refused, so nothing is written there.
+new_instance ufs
+echo 1 > "$W/ufs/sshd_t_rc"
+gd ufs arm "$(id_for ufs)" "$(dl 600)" --ufw -- "/etc/ssh/auto-sec-guard-test-$TAGP.conf"
+expect_rc 8 $? "--ufw with a path under /etc/ssh/ still needs sshd -t"
+expect_false "no timer started" has "$W/ufs/calls" 'systemd-run'
 
 section "arm fails cleanly when the revert timer cannot be started"
 new_instance nr

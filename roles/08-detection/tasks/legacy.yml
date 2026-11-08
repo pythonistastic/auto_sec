@@ -1,0 +1,100 @@
+---
+# roles/08-detection/tasks/legacy.yml
+#
+# Role 08 in auto_sec 0.6: read-only. It installs nothing, writes nothing
+# and deletes nothing. (0.3-0.5 deleted any /etc/audit/rules.d/
+# hardening.rules, also yours; 0.6 never does.) Detection returns,
+# rewritten, in 0.7.
+#
+# site.yml imports this file in pre_tasks (tags always), after the role 03
+# preflight, and includes it again as layer 08 (tag detection). Only the
+# first pass works; the second does nothing. Also runs in --check.
+#
+# W08-1: a warning for each audit rules file that auto_sec 0.1-0.5 wrote
+# and that is still there. A file counts as auto_sec's only when its
+# SHA-256, with the authorized_keys line normalized, is one of the two
+# contents those releases wrote (defaults/main.yml). Any other file is
+# yours and is not mentioned. Regular files up to _l08_max_bytes only.
+#
+# Trust boundary (SECURITY.md): a file's content is read only to compare
+# its hash with the constants. Only the file name is shown.
+#
+# Facts set on every host:
+#   _plan_08        list  [] (role 08 changes nothing in 0.6)
+#   _l08_role_runs  bool  the tags select role 08 ("detection")
+#   _l08_legacy     list  {file, versions} for each 0.1-0.5 file found
+#   _l08_report     str   one line for the report (role 10)
+#
+# The host reads run only when the tags select role 08, like the other
+# role preflights.
+
+- name: "Detection (0.6: not managed): look for auto_sec 0.1-0.5's audit rules"
+  when: not (_l08_done | default(false) | bool)
+  block:
+    - name: "Detection legacy: start every role 08 fact from a safe value"
+      ansible.builtin.set_fact:
+        _plan_08: []
+        _l08_role_runs: >-
+          {{ (('all' in ansible_run_tags) or ('tagged' in ansible_run_tags) or ('detection' in ansible_run_tags))
+             and ('detection' not in ansible_skip_tags) and ('tagged' not in ansible_skip_tags)
+             and ('all' not in ansible_skip_tags) }}
+        _l08_legacy: []
+        _l08_report: "not managed by auto_sec 0.6"
+
+    - name: "Detection legacy: the file names 0.1-0.5 used"
+      when: _l08_role_runs | bool
+      ansible.builtin.stat:
+        path: "{{ _l08_rules_dir }}/{{ item.name }}"
+        follow: false
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      loop: "{{ _l08_legacy_files }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: _l08_st
+
+    # Content goes to the controller only to be hashed there.
+    - name: "Detection legacy: read the small regular files among them"
+      when:
+        - _l08_role_runs | bool
+        - item.stat.isreg | default(false)
+        - (item.stat.size | default(0) | int) <= (_l08_max_bytes | int)
+      ansible.builtin.slurp:
+        src: "{{ item.stat.path }}"
+      loop: "{{ _l08_st.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      register: _l08_sl
+
+    - name: "Detection legacy: keep the files whose content 0.1-0.5 wrote"
+      when:
+        - _l08_role_runs | bool
+        - item.content is defined
+        - >-
+          ((item.content | b64decode) | regex_replace(_l08_ak_re, _l08_ak_norm) | hash('sha256'))
+          in item.item.item.sha256
+      ansible.builtin.set_fact:
+        _l08_legacy: "{{ _l08_legacy + [{'file': item.item.stat.path, 'versions': item.item.item.versions}] }}"
+      loop: "{{ _l08_sl.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.item.name }}"
+
+    - name: "Detection legacy W08-1: an audit rules file of auto_sec 0.1-0.5 is still there"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ item.file }} on {{ inventory_hostname }} is the audit rules file auto_sec
+          {{ item.versions }} wrote. {{ 'It loads before your files;' if item.versions == '0.3-0.5'
+          else 'It loads together with your files;' }} a rule of yours that repeats one of its lines
+          stops the load there. auto_sec 0.6 leaves it. To remove it: sudo rm {{ item.file }} &&
+          sudo augenrules --load (this reloads all your rules).
+      loop: "{{ _l08_legacy }}"
+      loop_control:
+        label: "{{ item.file }}"
+
+    - name: "Detection legacy: report line, and mark this pass done"
+      ansible.builtin.set_fact:
+        _l08_report: >-
+          {{ 'not managed by auto_sec 0.6' ~ ((('; still there from auto_sec 0.1-0.5: '
+             ~ (_l08_legacy | map(attribute='file') | join(', '))) if (_l08_legacy | length > 0) else '')) }}
+        _l08_done: true

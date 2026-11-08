@@ -1,16 +1,64 @@
 ---
 # Role 03 (firewall and fail2ban) defaults.
+#
+# The public settings below are documented in group_vars/all.yml, which
+# site.yml reads and which beats these defaults. The same values stay here
+# so that the role behaves the same in a playbook without group_vars (the
+# tests in tests/fail2ban and tests/ufw). CI checks that both files hold
+# the same values. The "existing"/"new" defaults follow autosec_server.
+
+# --- ufw: public settings -------------------------------------------------
+# auto_sec runs no ufw command on a ufw that is already on: it adds,
+# changes, reorders and restarts nothing there. It turns ufw on only when
+# ufw is off and firewall_state is enabled, after its checks, with an
+# automatic undo, and keeps it on only if a brand-new SSH login works.
+#   keep:    leave ufw as it is, on or off (default with autosec_server: existing)
+#   enabled: turn an inactive ufw on; installs ufw if it is missing
+#            (default with autosec_server: new)
+firewall_state: "{{ 'enabled' if (autosec_server | default('') | string) == 'new' else 'keep' }}"
+
+# The SSH rule added when this run turns ufw on and no rule of yours lets
+# ssh_port in from every address: limit (rate-limited), allow, or keep
+# (add none: then a rule of yours must let SSH in).
+firewall_ssh_rule: limit
+
+# Ports to let in when this run turns ufw on (at most 64 items):
+#   - { port: 443 }                          # tcp from anywhere (allow)
+#   - { port: 51820, proto: udp }
+#   - { port: "6000:6010", proto: tcp }       # a range needs proto
+#   - { port: 5432, from: "203.0.113.0/24" }  # one address or network
+#   - { port: 25, rule: limit }               # allow (default) or limit
+# On a ufw that is already on, nothing is added: the run prints the
+# `sudo ufw ...` line for each item it does not find.
+firewall_inbound: []
+
+# Ports that listen now and may close when this run turns ufw on, e.g.
+# ["3000/tcp"]. A listening port that is neither here nor let in stops
+# the turn-on.
+firewall_closed_ok: []
+
+# Seconds the automatic undo waits for the brand-new SSH login after ufw
+# is turned on (120-3600).
+firewall_revert_seconds: 300
+
+# Outgoing traffic.
+#   false: leave the outgoing policy as it is (0.1-0.5 set it to allow).
+#   true:  when this run turns ufw on, allow out only DNS, NTP, HTTP and
+#          HTTPS (plus egress_allow_extra) and deny the rest. On a ufw that
+#          is already on, auto_sec changes nothing and prints the commands.
+egress_lockdown: false
+# Extra outbound ports for egress_lockdown, e.g.
+#   - { port: 587, proto: tcp }   # SMTP submission
+egress_allow_extra: []
 
 # --- fail2ban: public settings --------------------------------------------
-# Documented in group_vars/all.yml, which site.yml reads and which beats
-# these defaults. The same values stay here so that the role behaves the
-# same in a playbook without group_vars (the tests in tests/fail2ban). CI
-# checks that both files hold the same values.
-#
 # auto_sec writes only /etc/fail2ban/jail.d/00-autosec.conf, never
 # jail.local. fail2ban reads it first, so any value YOUR files set wins.
-# false: role 03 does not install or configure fail2ban (ufw still runs).
-fail2ban_hardening_enabled: true
+#   keep: leave fail2ban alone: no install, no file, no reload (default
+#         with autosec_server: existing). "false" means the same.
+#   true: install fail2ban if missing, write 00-autosec.conf, reload only
+#         on an effective change (default with autosec_server: new).
+fail2ban_hardening_enabled: "{{ 'true' if (autosec_server | default('') | string) == 'new' else 'keep' }}"
 
 # fail2ban [DEFAULT] values. They apply to every jail that sets none of its
 # own; if one would change a jail of yours, the run stops and names it.
@@ -106,3 +154,32 @@ _f2b_client: fail2ban-client
 _f2b_python: /usr/bin/python3
 _f2b_conffiles_file: ""
 _f2b_file_owner: root
+
+# --- ufw: role-internal constants -----------------------------------------
+
+# Outbound ports egress_lockdown always lets out (DNS, NTP, HTTP, HTTPS).
+_fw_egress_base:
+  - { port: 53, proto: udp }
+  - { port: 53, proto: tcp }
+  - { port: 123, proto: udp }
+  - { port: 80, proto: tcp }
+  - { port: 443, proto: tcp }
+
+# The comment every rule auto_sec adds carries, so it is provably auto_sec's.
+_fw_comment: auto_sec
+
+# ufw's four files the undo guard snapshots before ufw is turned on and puts
+# back byte-for-byte on revert (the guard also runs `ufw --force disable`).
+_fw_guard_paths:
+  - /etc/ufw/ufw.conf
+  - /etc/default/ufw
+  - /etc/ufw/user.rules
+  - /etc/ufw/user6.rules
+
+# How role 03 runs ufw and the turn-on helper (files/). Only the
+# unprivileged lab (tests/ufw/semantics) changes these, to point at an
+# unpacked ufw build, a lab config tree and lab /proc and /sys copies;
+# never set them for a real host.
+_fw_ufw_argv: [ufw]
+_fw_python: /usr/bin/python3
+_fw_helper_lab_args: []

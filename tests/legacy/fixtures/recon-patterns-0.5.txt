@@ -1,0 +1,37 @@
+# The default recon_patterns of auto_sec 0.3-0.5's recon detector
+# (roles/09-watcher/templates/recon_watch.py.j2, DEFAULT_PATTERNS), one
+# Python regex per line. A command line that matches one counts as one
+# indicator; 4 distinct indicators in 45 s raised an incident, and in
+# active mode ended the SSH session.
+\bwhoami\b
+\bid\b
+\buname\b
+/etc/passwd
+/etc/shadow
+sudo\s+-l
+crontab\s+-l
+\bnetstat\b
+\bss\s+-
+\bifconfig\b
+\bip\s+a
+\.ssh
+\bhistory\b
+ps\s+aux
+ps\s+-ef
+/etc/os-release
+lsb_release
+\bwget\b
+\bcurl\b
+\bnmap\b
+\bmasscan\b
+\bprintenv\b
+\benv\b
+\bmount\b
+\blsblk\b
+\blast\b
+\bwho\b
+docker\s+ps
+find\s+/.*-perm
+cat\s+/root
+cat\s+.*/\.aws
+cat\s+.*/\.env

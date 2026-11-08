@@ -1,16 +1,49 @@
 ---
 # Single Packet Authorization (fwknopd), paranoia_level: high.
 #
-# 0.4.0: SSH stays VISIBLE. Role 03 keeps the rate-limited SSH rule in
-# both paranoia levels and this role never deletes it, so a broken or
-# unconfigured fwknop can never lock you out. Hiding SSH behind fwknop
-# (with a proven knock and login under the undo guard) returns in a later
-# release. Until then fwknopd runs alongside the open, rate-limited port.
+# 0.4.0: SSH stays VISIBLE. Role 03 never removes an SSH rule, and this role
+# never touches ufw, so a broken or unconfigured fwknop can never lock you
+# out. Hiding SSH behind fwknop (with a proven knock and login under the
+# undo guard) returns in a later release. Until then fwknopd runs alongside
+# the open, rate-limited port.
+#
+# 0.6: follows plan.yml (site.yml pre_tasks). The package goes through the
+# package guard; both config files are written only while they are the
+# package's own, auto_sec's, or 0.1-0.5's (checked again here, M04-1);
+# PCAP_INTF comes from fwknop_pcap_intf, never from a host fact; a fwknopd
+# that was installed before this run is never started or enabled.
 
-- name: Install fwknop server
-  ansible.builtin.apt:
-    name: fwknop-server
-    state: present
+- name: "fwknop: the plan must have run in this play"
+  ansible.builtin.assert:
+    quiet: true
+    that: _l04_planned | default(false) | bool
+    fail_msg: >-
+      Role 04 needs its plan (site.yml includes roles/04-fwknop/tasks/plan.yml in pre_tasks).
+      Nothing has been changed.
+
+- name: "fwknop: the config files again, right before the write"
+  ansible.builtin.include_tasks:
+    file: read.yml
+
+- name: "fwknop M04-1: nothing changed since the plan"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _l04_now['access.conf'] == _l04_plan_snapshot['access.conf']
+      - _l04_now['fwknopd.conf'] == _l04_plan_snapshot['fwknopd.conf']
+      - _l04_now.pkg == _l04_plan_snapshot.pkg
+    fail_msg: >-
+      fwknop-server or /etc/fwknop on {{ inventory_hostname }} changed during this run. Nothing
+      was written. Run again.
+
+- name: "fwknop: install fwknop-server (package guard)"
+  when: not ansible_check_mode
+  ansible.builtin.include_role:
+    name: autosec-apt
+    tasks_from: install
+  vars:
+    _aptg_want: "{{ _l04_pkg_want }}"
+    _aptg_who: role 04 (fwknop)
 
 # no_log: this renders both SPA keys. Without it, `--diff` (or `--check
 # --diff`) prints the full rendered access.conf, including KEY_BASE64 and
@@ -30,7 +63,9 @@
     mode: "0600"
   notify: restart fwknopd
 
-- name: Enable and start fwknopd
+# Only the fwknopd this run installed is started and enabled.
+- name: Enable and start the fwknopd this run installed
+  when: not (_l04_installed_before | bool)
   ansible.builtin.service:
     name: fwknop-server
     state: started
@@ -51,7 +86,9 @@
   until: _fwknopd_state.stdout != 'activating'
   retries: 5
   delay: 2
-  when: not ansible_check_mode
+  when:
+    - not ansible_check_mode
+    - (_l04_active_before | bool) or not (_l04_installed_before | bool)
 
 - name: Refuse to continue unless fwknopd is active
   ansible.builtin.assert:
@@ -62,5 +99,7 @@
       fwknopd is not running (systemctl is-active fwknop-server says
       "{{ _fwknopd_state.stdout }}"). SSH is unaffected: the rate-limited
       SSH rule stays in place. Check `journalctl -u fwknop-server` (often
-      PCAP_INTF or the keys in access.conf), then run again.
-  when: not ansible_check_mode
+      fwknop_pcap_intf or the keys in access.conf), then run again.
+  when:
+    - not ansible_check_mode
+    - (_l04_active_before | bool) or not (_l04_installed_before | bool)

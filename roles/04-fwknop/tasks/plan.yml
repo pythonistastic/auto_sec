@@ -1,0 +1,73 @@
+---
+# roles/04-fwknop/tasks/plan.yml - role 04's read-only plan (paranoia_level: high).
+#
+# site.yml includes this in pre_tasks (tags always) when layer 04 is on.
+# Read-only; also runs in --check.
+#
+#   R04-1  fwknop_pcap_intf is set (auto_sec never copies the interface
+#          from the host; the default-route interface is shown as a hint)
+#   R04-2  /etc/fwknop/fwknopd.conf and access.conf are written only when
+#          each one is missing, the package's own file (its md5 matches
+#          dpkg's conffile record), carries auto_sec's header, or has exactly
+#          the line shape auto_sec 0.1-0.5 wrote
+#
+# The file check runs on the host and prints one word per file: the
+# access.conf keys never come back to Ansible. Sets _plan_04 and the _l04_*
+# facts main.yml uses.
+
+- name: "fwknop plan R04-1: fwknop_pcap_intf names the interface fwknopd listens on"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - fwknop_pcap_intf is defined
+      - fwknop_pcap_intf is string
+      - fwknop_pcap_intf is match('^[A-Za-z0-9_.:-]{1,15}$')
+    fail_msg: >-
+      paranoia_level is high, so layer 04 sets up fwknopd, and it needs fwknop_pcap_intf:
+      the network interface it listens on (got {{ fwknop_pcap_intf | default('nothing') | string | truncate(20) }}).
+      {% if _l04_hint | length > 0 %}This server's default route uses {{ _l04_hint }} (shown as a hint
+      only; auto_sec never copies it). {% endif %}Set fwknop_pcap_intf in host_vars, or set
+      paranoia_level: standard to skip layer 04. Nothing has been changed.
+  vars:
+    _l04_hint: "{{ ansible_facts['default_ipv4']['interface'] | default('') | string | regex_replace('[^A-Za-z0-9_.:-]', '') | truncate(15, true, '') }}"
+
+- name: "fwknop plan: package, service and config files (read-only)"
+  ansible.builtin.include_tasks:
+    file: read.yml
+
+- name: "fwknop plan R04-2: fwknopd's config files are the package's or auto_sec's"
+  ansible.builtin.assert:
+    quiet: true
+    that: _l04_foreign | length == 0
+    fail_msg: >-
+      {{ _l04_foreign | map('regex_replace', '^', '/etc/fwknop/') | join(' and ') }} on {{ inventory_hostname }}
+      {{ 'is' if _l04_foreign | length == 1 else 'are' }} yours (not the package's file, no auto_sec
+      header, not the file auto_sec 0.1-0.5 wrote). auto_sec never replaces a file it did not
+      write. Set paranoia_level: standard to skip layer 04. Nothing has been changed.
+  vars:
+    _l04_foreign: "{{ ['access.conf', 'fwknopd.conf'] | select('in', _l04_now | dict2items | selectattr('value', 'in', ['foreign', 'other']) | map(attribute='key') | list) | list }}"
+
+- name: "fwknop plan: plan lines"
+  ansible.builtin.set_fact:
+    _l04_installed_before: "{{ (_l04_now.pkg | default('none')) is match('^.i') }}"
+    _l04_active_before: "{{ (_l04_now.active | default('')) == 'active' }}"
+    _l04_pkg_want: [fwknop-server]
+    _l04_planned: true
+    _l04_plan_snapshot: "{{ _l04_now }}"
+    _plan_04: >-
+      {{ ([] if ((_l04_now.pkg | default('none')) is match('^.i')) else
+          [{'role': '04', 'part': 'fwknop', 'do': 'install', 'what': 'fwknop-server', 'note': ''},
+           {'role': '04', 'part': 'fwknop', 'do': 'start', 'what': 'fwknop-server (enabled at boot)', 'note': ''}])
+         + [{'role': '04', 'part': 'fwknop', 'do': 'write', 'what': '/etc/fwknop/access.conf and /etc/fwknop/fwknopd.conf (PCAP_INTF ' ~ fwknop_pcap_intf ~ ')', 'note': ''}]
+         + ([{'role': '04', 'part': 'fwknop', 'do': 'restart', 'what': 'fwknop-server when its config changes', 'note': ''}]
+            if (_l04_now.active | default('')) == 'active' else []) }}
+
+- name: "fwknop plan: an installed fwknopd that is not running stays that way"
+  when:
+    - (_l04_now.pkg | default('none')) is match('^.i')
+    - (_l04_now.active | default('')) != 'active'
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: fwknop-server is installed on {{ inventory_hostname }} but not running. auto_sec writes
+      its config and never starts or enables a fwknopd it did not install. Start it with:
+      sudo systemctl enable --now fwknop-server

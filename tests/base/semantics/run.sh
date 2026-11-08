@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# base-semantics: unprivileged tests of role 01's apt handling (#3, auto_sec
-# 0.5). No root and nothing installed: the pinned unattended-upgrades .debs
+# base-semantics: unprivileged tests of role 01: its apt handling (#3, auto_sec
+# 0.5) and the account, sudo and kernel-settings parts of 0.6. No root and
+# nothing installed: the pinned unattended-upgrades .debs
 # in debs.txt (SHA256-checked) are unpacked with dpkg-deb -x. Each test builds
 # a lab apt configuration (its own apt.conf.d) that apt reads through
 # APT_CONFIG. Then
@@ -16,8 +17,17 @@
 # Debian), updates switched off on purpose (also after an earlier run, the
 # way dpkg-reconfigure does it), an update interval of yours, a removed
 # package, a file of yours that sorts after auto_sec's, broken apt files,
-# and the stock files of 22.04, 13 and 26.04. Last, role 01's packages.yml
-# (install only, upgrade nothing) runs against canned apt output (pkg.yml).
+# and the stock files of 22.04, 13 and 26.04.
+# Then account.yml runs role 01's account.yml, sudo_check.yml, admin.yml,
+# kernel.yml and plan_items.yml against lab trees (their own sudoers,
+# sudoers.d and sysctl files), with fake getent, id and dpkg-query and the
+# real visudo (-f): deploy_user_account and its defaults for existing and
+# new servers, whose sudo file it is (absent, 0.1-0.5's, auto_sec's, yours,
+# not a file), the scan for your rules that name the account or its groups,
+# @includedir, a broken configuration, the account role 02 logs in as
+# (R01-A6, R01-A7), the notes about /etc/sysctl.conf (N01-K1, N01-K2), main
+# step 6b's check before the write (M01-A1) and the plan items. The package
+# guard has its own tests (tests/autosec-apt/semantics).
 #
 # Usage: tests/base/semantics/run.sh [--cache DIR]... [--keep] [--verbose]
 #   --cache DIR  where the .debs are kept. Searched 3 levels deep by package
@@ -26,7 +36,7 @@
 #                Default: ~/.cache/auto-sec-base-semantics
 #   --keep       keep the work directory and print its path
 #   --verbose    print what unattended-upgrades uses in every lab
-# Needs: curl dpkg-deb sha256sum apt-config ansible-playbook python3. The
+# Needs: curl dpkg-deb sha256sum apt-config ansible-playbook python3 visudo. The
 # unattended-upgrades checks also need python3-apt, python3-distro-info and
 # lsb_release for /usr/bin/python3 (SKIP lines without them). ShellCheck is
 # optional.
@@ -56,7 +66,7 @@ while [ $# -gt 0 ]; do
 done
 [ ${#CACHES[@]} -gt 0 ] || CACHES=("${XDG_CACHE_HOME:-$HOME/.cache}/auto-sec-base-semantics")
 CACHE=${CACHES[0]}
-for t in curl dpkg-deb sha256sum apt-config ansible-playbook python3; do
+for t in curl dpkg-deb sha256sum apt-config ansible-playbook python3 visudo; do
   command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"
 done
 # The distro's python3: python3-apt is not on PyPI.
@@ -213,6 +223,16 @@ bad=$(grep -rnE 'dest:.*(20auto-upgrades|50unattended-upgrades)' "$ROOT/roles" |
 expect static "no role writes 20auto-upgrades or 50unattended-upgrades by name" "${bad:-none}" none
 n=$(grep -cE '^ *dest: "\{\{ _base_uu_dist_file \}\}"' "$ROOT/roles/01-base/tasks/main.yml")
 expect static "role 01 writes 50unattended-upgrades in one task (the 0.1-0.4 restore)" "$n" 1
+SCAN=$ROOT/roles/01-base/files/autosec-sudo-scan
+if command -v shellcheck >/dev/null 2>&1; then
+  if shellcheck -s sh "$SCAN"; then pass static "shellcheck -s sh autosec-sudo-scan"; else fail static "shellcheck autosec-sudo-scan"; fi
+fi
+bad=$(grep -rnE --include='*.yml' 'ansible\.posix\.sysctl|(dest|path): *"?/etc/sysctl\.(conf|d)' "$ROOT/roles" | grep -vE ':[[:space:]]*#' | sed "s|$ROOT/||" | paste -sd' ' -)
+expect static "no role writes kernel settings (no ansible.posix.sysctl, no sysctl file as a destination)" "${bad:-none}" none
+bad=$(grep -rnE --include='*.yml' 'dest: .*sudoers' "$ROOT/roles" | sed "s|$ROOT/||" | grep -v '^roles/01-base/tasks/main.yml:.*dest: "{{ _base_sudo_file }}"' | paste -sd' ' -)
+expect static "only role 01 writes into sudoers.d (its own file, from its template)" "${bad:-none}" none
+n=$(awk '/ansible\.builtin\.user:/ { u = 1; next } u && /^ *[a-z_]+:/ { if ($1 ~ /^(groups|append|password|update_password):/) print; } /^ *- name:/ { u = 0 }' "$ROOT/roles/01-base/tasks/main.yml" | wc -l)
+expect static "role 01 creates the account with no groups, append or password" "$n" 0
 n=$(grep -cE '^ *(ansible\.builtin\.hostname|community\.general\.timezone):' "$ROOT/roles/01-base/tasks/main.yml")
 g=$(grep -B2 -E '^ *(ansible\.builtin\.hostname|community\.general\.timezone):' "$ROOT/roles/01-base/tasks/main.yml" \
   | grep -cE 'when: _base_(hostname|tz)_change')
@@ -467,6 +487,21 @@ lab_ok off old51 default old51-default
 expect off "earlier auto_sec switches, distro says 0: file removed, off on purpose" \
   "$(j old51-default '[d["plan_empty"], d["off_on_purpose"], d["diff"], d["after"]["APT::Periodic::Unattended-Upgrade"]]')" \
   '[true, true, ["APT::Periodic::Unattended-Upgrade", "APT::Periodic::Update-Package-Lists"], ["0"]]'
+# The same host with keep (the default with autosec_server: existing):
+# auto_sec's file stays, so its "1" switches still count.
+lab_ok off old51 keepall old51-keepall
+expect off "earlier auto_sec switches, keep: the file stays, nothing changes" \
+  "$(j old51-keepall '[d["plan_empty"], d["file_change"], d["diff"], d["off_on_purpose"], d["after"]["APT::Periodic::Unattended-Upgrade"]]')" \
+  '[true, "none", [], false, ["1"]]'
+clone old51 p-old51-keepall
+if lab_ok off p-old51-keepall keepall p-old51-keepall -e lab_prove=true; then
+  expect off "earlier auto_sec switches, keep: after main step 3 the file is there and apt reads the same" \
+    "$(j p-old51-keepall '[d["real_after"] == d["before"], d["real_after"]["APT::Periodic::Unattended-Upgrade"]]') $(test -f "$W/lab/p-old51-keepall/parts/$UUFILE" && echo file)" \
+    '[true, ["1"]] file'
+fi
+# keep with another unattended_* value would rewrite that file without the
+# switches: refused.
+lab_refused off old51 rebootfalse old51-rebootfalse "[R01-U1] unattended_upgrades_enabled is keep"
 # An interval of yours ("7": weekly; "always") is left alone in auto mode.
 for iv in 7 always; do
   clone canary "iv-$iv"
@@ -532,12 +567,35 @@ clone canary p-inject2
 lab_refused prove p-inject2 default p-inject2 "different configuration than the trial run predicted" -e lab_prove=true \
   -e '{"lab_inject": "Unattended-Upgrade::Mail \"root\";"}'
 
-# --- 10. packages: install only, upgrade or remove nothing (packages.yml) --------------
-# Fake dpkg-query and apt-get first in PATH print canned output. The apt-get
-# outputs in fixtures/pkg-*.txt are real `apt-get -s --no-install-recommends
-# install` output of apt 2.7 (Ubuntu 24.04), with the package names kept.
-mkdir -p "$W/fakebin"
-cat >"$W/fakebin/dpkg-query" <<'FAKE'
+# --- 10. the account and its sudo rule (account.yml, sudo_check.yml) ------------
+# account.yml runs against lab trees: their own sudoers, sudoers.d, sysctl
+# files. Fake getent, id and dpkg-query come first in PATH; visudo is the
+# real one, run on the lab with -f.
+mkdir -p "$W/fakebin2" "$W/acct"
+cat >"$W/fakebin2/getent" <<'FAKE'
+#!/bin/sh
+# Fake getent passwd <name>: the line from $LAB_PASSWD, else exit 2.
+[ "$1" = passwd ] || exit 1
+grep -m1 "^$2:" "$LAB_PASSWD" 2>/dev/null || exit 2
+FAKE
+cat >"$W/fakebin2/id" <<'FAKE'
+#!/bin/sh
+# Fake id -nG|-u|-G [--] <name>: for an account in $LAB_PASSWD, its groups
+# from $LAB_GROUPS ("name group..."), its uid from $LAB_PASSWD, its gids
+# from $LAB_GIDS ("name gid..."); else exit 1, as id does.
+o=$1; shift
+[ "${1:-}" = -- ] && shift
+grep -q "^$1:" "$LAB_PASSWD" 2>/dev/null || { echo "id: '$1': no such user" >&2; exit 1; }
+case $o in
+  -nG) l=$(grep -m1 "^$1 " "$LAB_GROUPS" 2>/dev/null) || { echo "id: '$1': no such user" >&2; exit 1; }
+       printf '%s\n' "${l#* }" ;;
+  -u) grep -m1 "^$1:" "$LAB_PASSWD" | cut -d: -f3 ;;
+  -G) l=$(grep -m1 "^$1 " "$LAB_GIDS" 2>/dev/null) || { echo "id: '$1': no such user" >&2; exit 1; }
+      printf '%s\n' "${l#* }" ;;
+  *) exit 1 ;;
+esac
+FAKE
+cat >"$W/fakebin2/dpkg-query" <<'FAKE'
 #!/bin/sh
 # Fake: LAB_DPKG="name:ii name2:rc ..." are the known packages.
 shift 2
@@ -548,66 +606,313 @@ for p in "$@"; do
 done
 exit $rc
 FAKE
-cat >"$W/fakebin/apt-get" <<'FAKE'
-#!/bin/sh
-# Fake: prints $LAB_APT_OUT (its "E:" lines on stderr, as apt does) and
-# exits $LAB_APT_RC; records its arguments.
-printf '%s\n' "$*" >"$LAB_APT_ARGS"
-grep -v '^E:' "$LAB_APT_OUT"
-grep '^E:' "$LAB_APT_OUT" >&2
-exit "${LAB_APT_RC:-0}"
-FAKE
-chmod +x "$W/fakebin/dpkg-query" "$W/fakebin/apt-get"
-pkg() { # name dpkg-state apt-out apt-rc [ansible args...]: returns ansible's rc
+chmod +x "$W/fakebin2/"*
+printf '%s\n' 'alice:x:1001:1001::/home/alice:/bin/sh' 'deploy:x:1002:1002::/home/deploy:/bin/bash' \
+  'odd:x:1003:1003::/home/odd:/bin/sh;rm' >"$W/acct/passwd"
+printf '%s\n' 'alice alice adm' 'deploy deploy sudo' 'odd odd Domain.Users' >"$W/acct/groups"
+printf '%s\n' 'alice 1001 4' 'deploy 1002 27' 'odd 1003 5000' >"$W/acct/gids"
+: >"$W/acct/nobody"
+
+# A lab's directory name must not contain an account name: the scan would
+# find it in the @includedir line (grep -w).
+L() { printf '%s/acct/c%s' "$W" "$(printf '%s' "$1" | cksum | cut -d' ' -f1)"; }
+mksudo() { # name: a lab tree like Ubuntu's: sudoers reads sudoers.d; sysctl.conf is read
+  local d
+  d=$(L "$1")
+  rm -rf "$d"
+  mkdir -p "$d/sudoers.d" "$d/sysctl.d" || die "mkdir $d"
+  printf 'Defaults env_reset\nroot ALL=(ALL:ALL) ALL\n%%admin ALL=(ALL) ALL\n%%sudo ALL=(ALL:ALL) ALL\n@includedir %s/sudoers.d\n' "$d" >"$d/sudoers"
+  printf '%s\n' '#' '# Files in this directory are read by sudo. deploy is named only in this comment.' '#' >"$d/sudoers.d/README"
+  : >"$d/sysctl.conf"
+  ln -s ../sysctl.conf "$d/sysctl.d/99-sysctl.conf"
+}
+acct() { # name [ansible args...]: role 01's pieces on lab tree $W/acct/<name>; returns ansible's rc
   local n=$1 rc=0
+  shift
   rm -f "$W/out/$n".*
-  (cd "$HERE" && PATH="$W/fakebin:$PATH" LAB_DPKG="$2" LAB_APT_OUT="$HERE/fixtures/$3" LAB_APT_RC="$4" \
-    LAB_APT_ARGS="$W/out/$n.args" LC_ALL=C.UTF-8 ANSIBLE_ROLES_PATH="$ROOT/roles" ANSIBLE_LOCALHOST_WARNING=False \
-    ANSIBLE_INVENTORY_UNPARSED_WARNING=False ANSIBLE_NOCOLOR=1 ANSIBLE_RETRY_FILES_ENABLED=False \
-    ansible-playbook pkg.yml -e "lab_out=$W/out/$n.json" "${@:5}") >"$W/out/$n.log" 2>&1 || rc=$?
+  (cd "$HERE" && PATH="$W/fakebin2:$PATH" LAB_PASSWD="${LAB_PASSWD:-$W/acct/nobody}" LAB_GROUPS="$W/acct/groups" \
+    LAB_GIDS="$W/acct/gids" \
+    LAB_DPKG="${LAB_DPKG:-sudo:ii unattended-upgrades:ii}" LC_ALL=C.UTF-8 ANSIBLE_ROLES_PATH="$ROOT/roles" \
+    ANSIBLE_LOCALHOST_WARNING=False ANSIBLE_INVENTORY_UNPARSED_WARNING=False ANSIBLE_NOCOLOR=1 \
+    ANSIBLE_RETRY_FILES_ENABLED=False \
+    ansible-playbook account.yml -e "lab_dir=$(L "$n")" -e "lab_out=$W/out/$n.json" -e deploy_user=deploy "$@") \
+    >"$W/out/$n.log" 2>&1 || rc=$?
   return "$rc"
 }
-pkg_ok() { # test name ...
+acct_ok() { # test name [args...]
   local t=$1
   shift
-  if pkg "$@"; then pass "$t" "$1: passes"; return 0; fi
-  fail "$t" "$1: refused (log $W/out/$1.log)"; grep -E '"msg"' "$W/out/$1.log" | head -n 3 | cut -c1-400; return 1
+  if acct "$@"; then pass "$t" "$1: passes"; return 0; fi
+  fail "$t" "$1: refused (log $W/out/$1.log):"
+  grep -E '"msg"|ERROR' "$W/out/$1.log" | head -n 3 | cut -c1-400
+  return 1
 }
-pkg_refused() { # test name msg dpkg-state apt-out apt-rc [args...]
+acct_refused() { # test name fixed-string [args...]: must refuse with that message
   local t=$1 n=$2 s=$3 rc=0
   shift 3
-  pkg "$n" "$@" || rc=$?
+  acct "$n" "$@" || rc=$?
   if [ "$rc" -eq 0 ]; then fail "$t" "$n: run succeeded, want a refusal"; return; fi
   if grep -Fq -- "$s" "$W/out/$n.log"; then pass "$t" "$n: refused with \"$s\""
-  else fail "$t" "$n: refused (rc $rc) but without \"$s\" (log $W/out/$n.log)"; fi
+  else fail "$t" "$n: refused (rc $rc) but without \"$s\" (log $W/out/$n.log)"; grep -E '"msg"|ERROR' "$W/out/$n.log" | head -n 3 | cut -c1-400; fi
+  if [ -e "$(L "$n")/run/sudoers-candidate" ]; then fail "$t" "$n: the rendered sudo file was left behind"; fi
 }
-if pkg_ok pkgs k-all "curl:ii unattended-upgrades:ii" pkg-clean.txt 0; then
-  expect pkgs "everything installed: nothing to install, apt not asked" \
-    "$(j k-all '[d["missing"], d["side"]]')/$(test -e "$W/out/k-all.args" && echo asked || echo not-asked)" "[[], []]/not-asked"
+NEW=(-e autosec_server=new)
+CREATE=(-e deploy_user_account=create)
+
+# Defaults: with autosec_server unset or existing, every choice is keep.
+for c in unset existing; do
+  mksudo "def-$c"
+  # shellcheck disable=SC2046 # no argument at all for unset
+  if acct_ok acct "def-$c" $( [ "$c" = existing ] && echo "-e autosec_server=existing" ); then
+    expect acct "$c: account keep, updates keep, nothing planned, no package" \
+      "$(j "def-$c" '[d["account_mode"], d["uu_enabled"], d["user_plan"], d["sudo_write"], d["pkg_want"], d["plan"]]')" \
+      '["keep", "keep", "keep", false, [], []]'
+    expect acct "$c: the sudo configuration is not even read" "$(j "def-$c" 'd["sudo"]["checked"]')" false
+  fi
+done
+mksudo new
+if acct_ok acct new "${NEW[@]}" -e "lab_render=$W/out/new.render"; then
+  expect acct "new: create deploy and its sudo file; updates auto" \
+    "$(j new '[d["account_mode"], d["uu_enabled"], d["user_plan"], d["sudo_write"], d["sudo"]["state"], d["sudo"]["checked"]]')" \
+    '["create", "auto", "create", true, "absent", true]'
+  expect acct "new: sudo wanted (installed here), nothing missing" "$(j new '[d["pkg_want"], d["pkgs_missing"]]')" '[["sudo"], []]'
+  expect acct "new: the sudo scan finds nothing (README names deploy only in a comment)" \
+    "$(j new '[d["sudo"]["includedir"], d["sudo"]["user_lines"], d["sudo"]["group_lines"], int(d["sudo"]["visudo_rc"])]')" '[true, [], [], 0]'
+  expect acct "new: plan items" "$(j new '[[i["part"], i["do"], i["what"]] for i in d["plan"]]' | sed "s|$(L new)|LAB|g")" \
+    '[["account", "user", "create deploy"], ["sudo", "sudoers", "write LAB/sudoers.d/deploy"]]'
+  expect acct "new: the rendered sudo file is removed again" "$(j new 'd["candidate_left"]')" false
 fi
-if pkg_ok pkgs k-held "curl:hi unattended-upgrades:ii" pkg-clean.txt 0; then
-  expect pkgs "a held package counts as installed" "$(j k-held 'd["missing"]')" "[]"
+mksudo new-uu
+if acct_ok acct new-uu "${NEW[@]}" -e lab_uu_install=true; then
+  expect acct "new, updates to install: both packages wanted" "$(j new-uu 'd["pkg_want"]')" '["unattended-upgrades", "sudo"]'
 fi
-if pkg_ok pkgs k-clean "unattended-upgrades:ii" pkg-clean.txt 0; then
-  expect pkgs "curl missing, a clean install" "$(j k-clean '[d["missing"], d["side"]]')" '[["curl"], []]'
-  expect pkgs "apt is asked without recommendations" "$(cat "$W/out/k-clean.args")" "-s -o Debug::NoLocking=true --no-install-recommends install curl"
+mksudo new-rootadmin
+if acct_ok acct new-rootadmin "${NEW[@]}" -e ssh_admin_user=root; then
+  expect acct "new, ssh_admin_user root: no account" "$(j new-rootadmin '[d["account_mode"], d["uu_enabled"]]')" '["keep", "auto"]'
 fi
-pkg_refused pkgs k-upgrade "would also change packages you have: libapparmor1 4.0.1really4.0.1-0ubuntu0.24.04.3 -> 4.0.1really4.0.1-0ubuntu0.24.04.7" \
-  "unattended-upgrades:ii" pkg-upgrade.txt 0
-pkg_refused pkgs k-upgrade-main "only the package lists were refreshed" "unattended-upgrades:ii" pkg-upgrade.txt 0 -e lab_ctx=main
-if pkg_ok pkgs k-upgrade-full "unattended-upgrades:ii" pkg-upgrade.txt 0 -e lab_full_upgrade=true; then
-  expect pkgs "apt_full_upgrade allows the upgrades" "$(j k-upgrade-full 'len(d["side"])')" 2
+mksudo new-deployroot
+if acct_ok acct new-deployroot "${NEW[@]}" -e deploy_user=root; then
+  expect acct "new, deploy_user root: no account (and no R01-A1)" "$(j new-deployroot 'd["account_mode"]')" keep
 fi
-pkg_refused pkgs k-remove "remove systemd-timesyncd 255.4-1ubuntu8.16" "unattended-upgrades:ii" pkg-remove.txt 0
-if pkg_ok pkgs k-nolists "unattended-upgrades:ii" pkg-nolists.txt 100; then
-  expect pkgs "no package lists yet (preflight): a note, checked again in main" "$(grep -c "NOTE: apt cannot plan the install of curl" "$W/out/k-nolists.log")" 1
+mksudo create-root
+acct_refused acct create-root "[R01-A1] deploy_user is root" "${CREATE[@]}" -e deploy_user=root
+mksudo bad-value
+acct_refused acct bad-value '[R01-A0] deploy_user_account is \"True\"' -e '{"deploy_user_account": true}'
+
+# The file /etc/sudoers.d/<user>: whose is it?
+for v in "deploy" "a_b-c" "abcdefghijklmnopqrstuvwxyz012345"; do
+  mksudo "name-$v"
+  if acct_ok names "name-$v" "${CREATE[@]}" -e "deploy_user=$v" -e "lab_render=$W/out/name-$v.render"; then
+    if visudo -c -q -f "$W/out/name-$v.render"; then pass names "$v: visudo -cf accepts auto_sec's sudo file"
+    else fail names "$v: visudo -cf rejects auto_sec's sudo file"; fi
+    expect names "$v: first line is the header" "$(head -n 1 "$W/out/name-$v.render" | cut -c1-31)" "# Written by auto_sec (role 01)"
+    expect names "$v: the rule line" "$(tail -n 1 "$W/out/name-$v.render")" "$v ALL=(ALL) NOPASSWD:ALL"
+    expect names "$v: 0.1-0.5's exact bytes" "$(j "name-$v" 'd["legacy_sha256"]')" "$(printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$v" | sha256sum | cut -d' ' -f1)"
+  fi
+done
+expect names "deploy: 0.1-0.5's sha256 (30 bytes, main.yml:206 in 0.5)" "$(j name-deploy 'd["legacy_sha256"]')" 62c2729541ccc891a071a3e96739f155ef56275cc8af2d373e2f1d539442dc11
+
+mksudo legacy
+printf 'deploy ALL=(ALL) NOPASSWD:ALL\n' >"$(L legacy)/sudoers.d/deploy"
+if acct_ok sudofile legacy "${CREATE[@]}"; then
+  expect sudofile "0.1-0.5's exact file: kept, nothing written" "$(j legacy '[d["sudo"]["state"], d["sudo_write"], d["pkg_want"]]')" '["legacy", false, []]'
 fi
-pkg_refused pkgs k-nolists-main "apt cannot install curl" "unattended-upgrades:ii" pkg-nolists.txt 100 -e lab_ctx=main
-if pkg_ok pkgs k-uukeep "curl:ii" pkg-clean.txt 0 -e lab_uu_install=false; then
-  expect pkgs "unattended-upgrades not wanted (keep, or removed in auto): not installed" "$(j k-uukeep 'd["missing"]')" "[]"
+mksudo ours-same
+cp "$W/out/new.render" "$(L ours-same)/sudoers.d/deploy"
+if acct_ok sudofile ours-same "${CREATE[@]}"; then
+  expect sudofile "auto_sec's file, same content: nothing written" "$(j ours-same '[d["sudo"]["state"], d["sudo_write"], d["plan"]]')" \
+    '["ours", false, [{"do": "user", "note": "home, shell /bin/bash, password locked (key login only), no extra groups", "part": "account", "role": "01", "what": "create deploy"}]]'
 fi
-if pkg_ok pkgs k-uufresh "curl:ii" pkg-clean.txt 0; then
-  expect pkgs "unattended-upgrades missing (auto): installed" "$(j k-uufresh 'd["missing"]')" '["unattended-upgrades"]'
+mksudo ours-diff
+printf '%s\n' '# Written by auto_sec (role 01). An older text.' 'deploy ALL=(ALL) NOPASSWD:ALL' >"$(L ours-diff)/sudoers.d/deploy"
+if acct_ok sudofile ours-diff "${CREATE[@]}"; then
+  expect sudofile "auto_sec's file, other content: written again" "$(j ours-diff '[d["sudo"]["state"], d["sudo_write"]]')" '["ours", true]'
+fi
+mksudo foreign
+printf 'deploy ALL=(ALL) ALL\n' >"$(L foreign)/sudoers.d/deploy"
+acct_refused sudofile foreign "[R01-A2] $(L foreign)/sudoers.d/deploy on localhost was not written by auto_sec" "${CREATE[@]}"
+mksudo foreign-keep
+printf 'deploy ALL=(ALL) ALL\n' >"$(L foreign-keep)/sudoers.d/deploy"
+if acct_ok sudofile foreign-keep; then
+  expect sudofile "a file of yours with keep: no refusal, nothing planned" "$(j foreign-keep '[d["sudo"]["state"], d["sudo_write"]]')" '["foreign", false]'
+fi
+mksudo other-dir
+mkdir "$(L other-dir)/sudoers.d/deploy"
+acct_refused sudofile other-dir "is not a regular file" "${CREATE[@]}"
+mksudo other-link
+ln -s ../sudoers "$(L other-link)/sudoers.d/deploy"
+acct_refused sudofile other-link "is not a regular file" "${CREATE[@]}"
+
+# The scan: your rules that name the account or its groups. Groups are
+# known only for an account that exists.
+mksudo pct-sudo-missing
+acct_ok scan pct-sudo-missing "${CREATE[@]}"
+mksudo pct-sudo
+LAB_PASSWD=$W/acct/passwd acct_refused scan pct-sudo \
+  "[R01-A3] Your sudo configuration already names deploy or a group of deploy: $(L pct-sudo)/sudoers:4 (%sudo)" "${CREATE[@]}"
+scan_case() { # name refused|ok line...: a 50ops file with these lines (deploy exists, in group sudo; no %sudo line)
+  local n=$1 want=$2
+  shift 2
+  mksudo "$n"
+  sed -i '/^%sudo/d' "$(L "$n")/sudoers"
+  printf '%s\n' "$@" | sed "s|LAB|$(L "$n")|g" >"$(L "$n")/sudoers.d/50ops"
+  : >"$(L "$n")/extra.deploy"
+  if [ "$want" = refused ]; then
+    LAB_PASSWD=$W/acct/passwd acct_refused scan "$n" "[R01-A3] Your sudo configuration already names deploy" "${CREATE[@]}"
+  else
+    LAB_PASSWD=$W/acct/passwd acct_ok scan "$n" "${CREATE[@]}"
+  fi
+}
+scan_case pct-colon refused '%:sudo ALL=(ALL) NOPASSWD: ALL'
+expect scan "%:sudo is named with its file and line" "$(grep -qF "$(L pct-colon)/sudoers.d/50ops:1 (%sudo)" "$W/out/pct-colon.log" && echo yes)" yes
+scan_case defaults-line refused 'Defaults:deploy !requiretty'
+scan_case user-alias refused 'User_Alias ADMINS = bob, deploy'
+scan_case comment ok '# deploy ALL=(ALL) NOPASSWD: ALL' '   ## deploy is not here'
+scan_case include-line refused '#include LAB/extra.deploy'
+scan_case deployer ok 'deployer ALL=(ALL) ALL' 'Cmnd_Alias DEPLOYX = /bin/true'
+scan_case deploy-ci refused 'deploy-ci ALL=(ALL) ALL'
+scan_case admin-group ok '%adm ALL=(ALL) ALL'
+# By number (sudoers(5): "#" and digits in a user position is a uid, not a
+# comment), and netgroups, which the scan cannot resolve. deploy is uid
+# 1002, gids 1002 and 27 in the lab.
+scan_case by-uid refused '#1002 ALL=(ALL) ALL'
+expect scan "#1002 is named with its file and line" "$(grep -qF "$(L by-uid)/sudoers.d/50ops:1" "$W/out/by-uid.log" && echo yes)" yes
+scan_case by-gid refused '%#27 ALL=(ALL) ALL'
+scan_case by-gid-colon refused '%:#27 ALL=(ALL) NOPASSWD: ALL'
+scan_case netgroup refused '+admins ALL=(ALL) ALL'
+scan_case netgroup-defaults refused 'Defaults:+admins !authenticate'
+scan_case other-uid ok '#1003 ALL=(ALL) ALL' '%#4 ALL=(ALL) ALL'
+scan_case number-comment ok '# 1002 is deploy' '#  1002 too'
+scan_case plus-in-command ok 'bob ALL=(ALL) /usr/bin/chmod +x /srv/x'
+for f in 50.ops 50ops~; do
+  mksudo "skip-$f"
+  printf 'deploy ALL=(ALL) ALL\n' >"$(L "skip-$f")/sudoers.d/$f"
+  acct_ok scan "skip-$f" "${CREATE[@]}"
+done
+mksudo no-includedir
+sed -i '/includedir/d' "$(L no-includedir)/sudoers"
+acct_refused scan no-includedir "[R01-A4] $(L no-includedir)/sudoers on localhost does not read $(L no-includedir)/sudoers.d" "${CREATE[@]}"
+mksudo hash-includedir
+sed -i 's/^@includedir/#includedir/' "$(L hash-includedir)/sudoers"
+if acct_ok scan hash-includedir "${CREATE[@]}"; then
+  expect scan "#includedir counts as reading sudoers.d" "$(j hash-includedir 'd["sudo"]["includedir"]')" true
+fi
+mksudo broken
+printf 'oops(\n' >"$(L broken)/sudoers.d/60bad"
+acct_refused scan broken "[R01-A5] sudo cannot read its configuration on localhost now (visudo -c: $(L broken)/sudoers.d/60bad:1:5: syntax error)" \
+  "${CREATE[@]}"
+mksudo odd-group
+sed -i '/^%sudo/d' "$(L odd-group)/sudoers"
+LAB_PASSWD=$W/acct/passwd acct_refused scan odd-group "groups of odd with unusual names: Domain.Users" "${CREATE[@]}" -e deploy_user=odd
+mksudo alice
+if LAB_PASSWD=$W/acct/passwd acct_ok scan alice "${CREATE[@]}" -e deploy_user=alice; then
+  expect scan "an existing account (shell /bin/sh, group adm): never changed, gets the sudo file" \
+    "$(j alice '[d["user_plan"], d["user_shell"], d["sudo_write"], [i["do"] for i in d["plan"]]]')" '["exists", "/bin/sh", true, ["sudoers"]]'
+fi
+mksudo odd
+if LAB_PASSWD=$W/acct/passwd acct_ok scan odd -e deploy_user=odd -e deploy_user_account=keep; then
+  expect scan "keep: an existing account is only looked at; a shell of an odd shape is not shown" \
+    "$(j odd '[d["user_plan"], d["user_exists"], d["user_shell"]]')" '["keep", true, ""]'
+fi
+mksudo nosudo
+if LAB_DPKG="unattended-upgrades:ii" acct_ok scan nosudo "${CREATE[@]}"; then
+  expect scan "sudo missing: it is installed first, the scan waits for main step 1" \
+    "$(j nosudo '[d["pkg_want"], d["pkgs_missing"], d["sudo_installed"], d["sudo"]["checked"], [i["what"] for i in d["plan"]][:1]]')" \
+    '[["sudo"], ["sudo"], false, false, ["sudo"]]'
+fi
+
+# Main step 6b: the reads right before the write must equal the preflight's.
+mksudo m-file
+acct_refused main m-file "[M01-A1] $(L m-file)/sudoers.d/deploy on localhost changed during this run" "${CREATE[@]}" \
+  -e 'lab_mutate=deploy ALL=(ALL) NOPASSWD:ALL'
+mksudo m-other
+sed -i '/^%sudo/d' "$(L m-other)/sudoers"
+LAB_PASSWD=$W/acct/passwd acct_refused main m-rule "[M01-A1]" "${CREATE[@]}" -e "lab_dir=$(L m-other)" \
+  -e '{"lab_mutate": "deploy ALL=(ALL) ALL", "lab_mutate_file": "99late"}'
+mksudo m-same
+acct_ok main m-same "${CREATE[@]}" -e '{"lab_mutate": "Defaults env_reset", "lab_mutate_file": "99other"}'
+
+# --- 11. the account role 02 logs in as (admin.yml) -----------------------------
+SSH='"_ssh_role_runs": true, "_ssh_enabled": true'
+mksudo b12
+acct_refused admin b12-other "[R01-A6] ssh_admin_user is carol, but carol does not exist on localhost, and this run does not create it (it is not deploy_user)" \
+  -e "{$SSH, \"_ssh_admin\": \"carol\"}" -e "lab_dir=$(L b12)"
+acct_refused admin b12-keep "(deploy_user_account is keep)" -e "{$SSH, \"_ssh_admin\": \"deploy\"}" -e "lab_dir=$(L b12)"
+acct_refused admin b12-tags "(role 01 is not in this run's tags)" -e "{$SSH, \"_ssh_admin\": \"deploy\"}" "${CREATE[@]}" \
+  -e lab_role_runs=false -e "lab_dir=$(L b12)"
+acct_ok admin b12-create -e "{$SSH, \"_ssh_admin\": \"deploy\"}" "${CREATE[@]}" -e "lab_dir=$(L b12)"
+acct_refused admin b12-pam "[R01-A7] deploy would be created password-locked (key login only), but sshd on localhost has UsePAM no" \
+  -e "{$SSH, \"_ssh_admin\": \"deploy\", \"_ssh_before\": {\"admin\": {\"usepam\": \"no\"}, \"root\": {\"usepam\": \"no\"}}}" "${CREATE[@]}" \
+  -e "lab_dir=$(L b12)"
+acct_ok admin b12-pam-yes -e "{$SSH, \"_ssh_admin\": \"deploy\", \"_ssh_before\": {\"admin\": {\"usepam\": \"yes\"}}}" "${CREATE[@]}" \
+  -e "lab_dir=$(L b12)"
+LAB_PASSWD=$W/acct/passwd acct_ok admin b12-exists -e "{$SSH, \"_ssh_admin\": \"alice\"}" -e "lab_dir=$(L b12)"
+if acct_ok admin b12-root -e "{$SSH, \"_ssh_admin\": \"root\"}" -e "lab_dir=$(L b12)"; then
+  expect admin "ssh_admin_user root: not checked" "$(j b12-root 'd["b12"]')" false
+fi
+if acct_ok admin b12-nossh -e '{"_ssh_role_runs": false, "_ssh_enabled": true, "_ssh_admin": "carol"}' -e "lab_dir=$(L b12)"; then
+  expect admin "role 02 not in the run: not checked" "$(j b12-nossh 'd["b12"]')" false
+fi
+
+# --- 12. kernel settings, read only (kernel.yml) -----------------------------------
+LEGACY7='net.ipv4.tcp_syncookies=1
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.conf.all.log_martians=1
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.all.accept_source_route=0
+kernel.dmesg_restrict=1'
+mksudo k-legacy
+printf '# /etc/sysctl.conf\n;comment\n\n%s\n' "$LEGACY7" >"$(L k-legacy)/sysctl.conf"
+if acct_ok kernel k-legacy; then
+  expect kernel "0.1-0.5's 7 lines, read at boot: N01-K2 only" "$(j k-legacy '[int(d["sysctl_lines"]), d["sysctl_legacy"], d["sysctl_unread"]]')" '[7, true, false]'
+fi
+mksudo k-deb13
+printf 'vm.swappiness=10\nnet.ipv4.ip_forward = 0\n' >"$(L k-deb13)/sysctl.conf"
+rm "$(L k-deb13)/sysctl.d/99-sysctl.conf"
+if acct_ok kernel k-deb13; then
+  expect kernel "settings, but 99-sysctl.conf does not lead to the file (Debian 13): N01-K1" "$(j k-deb13 '[int(d["sysctl_lines"]), d["sysctl_legacy"], d["sysctl_unread"]]')" '[2, false, true]'
+fi
+mksudo k-comments
+printf '# only comments\n;and this\n   \n' >"$(L k-comments)/sysctl.conf"
+rm "$(L k-comments)/sysctl.d/99-sysctl.conf"
+if acct_ok kernel k-comments; then
+  expect kernel "only comments: nothing to say" "$(j k-comments '[int(d["sysctl_lines"]), d["sysctl_unread"]]')" '[0, false]'
+fi
+mksudo k-six
+printf '%s\n' "$LEGACY7" | head -n 6 >"$(L k-six)/sysctl.conf"
+if acct_ok kernel k-six; then
+  expect kernel "6 of the 7 lines: not 0.1-0.5's set" "$(j k-six 'd["sysctl_legacy"]')" false
+fi
+
+# --- 13. plan items (plan_items.yml) ------------------------------------------------
+mksudo plan
+MORE=(-e lab_uu_change=write -e server_hostname=mail.example.com -e timezone=Europe/Berlin -e apt_full_upgrade=true -e lab_pending=3)
+if acct_ok plan plan-a "${NEW[@]}" "${MORE[@]}" -e "lab_dir=$(L plan)"; then
+  expect plan "items" "$(j plan-a '[[i["role"], i["part"], i["do"]] for i in d["plan"]]')" \
+    '[["01", "updates", "write"], ["01", "updates", "install"], ["01", "account", "user"], ["01", "sudo", "sudoers"], ["01", "hostname", "write"], ["01", "timezone", "write"]]'
+  expect plan "the dos are in the plan contract" "$(j plan-a 'sorted(set(i["do"] for i in d["plan"]) - set("write replace install start restart reload daemon-reload enable add-rule policy firewall-on user sudoers cron timer network-call local-file".split()))')" "[]"
+  expect plan "what: only your values and constant names" "$(j plan-a '[i["what"] for i in d["plan"] if i["part"] in ("hostname", "timezone", "updates")]')" \
+    '["write /etc/apt/apt.conf.d/51autosec-unattended-upgrades: comments only", "apt-get dist-upgrade (apt_full_upgrade)", "hostname mail.example.com", "timezone Europe/Berlin"]'
+fi
+# What auto_sec's apt file says is part of the item, so another value gives
+# another plan id.
+if acct_ok plan plan-d "${NEW[@]}" "${MORE[@]}" -e lab_uu_periodic=true -e unattended_automatic_reboot=true \
+     -e unattended_reboot_time=03:30 -e unattended_exclude_docker=true -e unattended_origins=security -e "lab_dir=$(L plan)"; then
+  expect plan "the apt file's values are in its item" "$(j plan-d '[i["what"] for i in d["plan"] if i["part"] == "updates"][0]')" \
+    "write /etc/apt/apt.conf.d/51autosec-unattended-upgrades: updates on (Update-Package-Lists 1, Unattended-Upgrade 1); Automatic-Reboot true at 03:30; blacklist docker-ce docker-ce-cli docker-ce-rootless-extras docker-buildx-plugin docker-compose-plugin containerd.io docker.io containerd; origins security"
+fi
+if acct_ok plan plan-b "${NEW[@]}" "${MORE[@]}" -e lab_tz_now=Asia/Tokyo -e lab_pending=7 -e "lab_dir=$(L plan)"; then
+  expect plan "host values change only the notes" "$(j plan-a '[{k: v for k, v in i.items() if k != "note"} for i in d["plan"]]')" \
+    "$(j plan-b '[{k: v for k, v in i.items() if k != "note"} for i in d["plan"]]')"
+  if [ "$(j plan-a '[i["note"] for i in d["plan"]]')" != "$(j plan-b '[i["note"] for i in d["plan"]]')" ]; then
+    pass plan "and the notes do change"
+  else fail plan "the notes do not change with the host values"; fi
+fi
+if acct_ok plan plan-c "${NEW[@]}" "${MORE[@]}" -e timezone=UTC -e "lab_dir=$(L plan)"; then
+  if [ "$(j plan-a '[i["what"] for i in d["plan"]]')" != "$(j plan-c '[i["what"] for i in d["plan"]]')" ]; then
+    pass plan "a changed value changes an item"
+  else fail plan "a changed value does not change any item"; fi
 fi
 
 echo

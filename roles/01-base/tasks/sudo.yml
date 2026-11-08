@@ -1,0 +1,126 @@
+---
+# roles/01-base/tasks/sudo.yml - read auto_sec's sudo file and, when asked,
+# sudo's own configuration. Read-only (check_mode false), so it also runs
+# in --check. Imported three times: preflight B2/B3, main step 1 (only when
+# that step installed sudo) and main step 6b, right before the write.
+#
+# Input:  _base_sudo_scan  bool: also run `visudo -c`, the includedir check
+#                          and the conflict scan (files/autosec-sudo-scan).
+#                          Only when sudo is installed.
+# Output: _base_sudo_now, a dict:
+#   state       absent | legacy (0.1-0.5's exact file) | ours (auto_sec's
+#               header on line 1) | foreign | other (not a regular file)
+#   sha256      of the file ('' if not a regular file)
+#   checked     the configuration was read (the keys below are valid)
+#   visudo_rc   `visudo -c` exit code
+#   visudo_err  its first error line, filtered
+#   includedir  /etc/sudoers reads /etc/sudoers.d
+#   user_lines  "file:line" naming the account (by name or #uid)
+#   group_lines "file:line (%group)" naming one of its groups (or %#gid)
+#   netgroup_lines "file:line (netgroup)": a netgroup that may name it
+#   unreadable  files the scan could not read
+#   bad_groups  groups of the account auto_sec cannot check (name shape)
+# What is read from the host is only compared and shown (file names and
+# line numbers, never the lines): SECURITY.md.
+
+- name: "Base sudo: auto_sec's sudo file"
+  ansible.builtin.stat:
+    path: "{{ _base_sudo_file }}"
+    follow: false
+    checksum_algorithm: sha256
+  register: _base_s_stat
+
+- name: "Base sudo: first line of that file"
+  when: _base_s_stat.stat.exists and _base_s_stat.stat.isreg
+  ansible.builtin.command:
+    argv: [head, -n, "1", --, "{{ _base_sudo_file }}"]
+  register: _base_s_head
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# The primary group counts too: sudo matches %group against all of them.
+- name: "Base sudo: the account's groups"
+  when: _base_sudo_scan | default(false) | bool
+  ansible.builtin.command:
+    argv: [id, -nG, "{{ deploy_user }}"]
+  register: _base_s_groups
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# sudo also matches #<uid>, %#<gid> and %:#<gid>. Two lines: uid, gids.
+- name: "Base sudo: the account's uid and gids"
+  when: _base_sudo_scan | default(false) | bool
+  ansible.builtin.command:
+    argv: [sh, -c, 'id -u -- "$1" && id -G -- "$1"', sh, "{{ deploy_user }}"]
+  register: _base_s_ids
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Base sudo: sudo's files that name the account or its groups"
+  when: _base_sudo_scan | default(false) | bool
+  ansible.builtin.command:
+    argv: >-
+      {{ ['sh', '-c', lookup('ansible.builtin.file', 'autosec-sudo-scan'), 'sh',
+          _base_sudoers, _base_sudo_dir, _base_sudo_file, deploy_user] + _base_s_group_names
+         + ((['--'] + _base_s_id_lines[0:1] + (_base_s_id_lines[1:2] | join(' ') | split | list))
+            if (_base_s_id_lines | length == 2 and _base_s_id_lines | reject('match', '^[0-9 ]+$') | list | length == 0)
+            else []) }}
+  register: _base_s_scan
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  vars:
+    _base_s_group_names: >-
+      {{ ((_base_s_groups.stdout | default('')) if (_base_s_groups.rc | default(1)) == 0 else '') | split | list }}
+    _base_s_id_lines: "{{ (_base_s_ids.stdout_lines | default([])) if (_base_s_ids.rc | default(1)) == 0 else [] }}"
+
+- name: "Base sudo: can sudo read its configuration?"
+  when: _base_sudo_scan | default(false) | bool
+  ansible.builtin.command:
+    argv: "{{ _base_visudo_check }}"
+  register: _base_s_visudo
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Base sudo: remember what was read"
+  ansible.builtin.set_fact:
+    _base_sudo_now:
+      state: >-
+        {{ 'absent' if not _base_s_stat.stat.exists
+           else ('other' if not _base_s_stat.stat.isreg
+           else ('legacy' if (_base_s_stat.stat.checksum | default('')) == _base_sudo_legacy_sha256
+           else ('ours' if (_base_s_head.stdout | default('')).startswith(_base_sudo_header) else 'foreign'))) }}
+      sha256: "{{ (_base_s_stat.stat.checksum | default('')) if (_base_s_stat.stat.isreg | default(false)) else '' }}"
+      checked: "{{ _base_sudo_scan | default(false) | bool }}"
+      visudo_rc: "{{ _base_s_visudo.rc | default(-1) }}"
+      visudo_err: >-
+        {{ (_base_s_visudo.stderr_lines | default([]) + _base_s_visudo.stdout_lines | default([]))
+           | reject('search', 'parsed OK$') | select('search', '(error|unable|Permission|not found)')
+           | map('regex_replace', '[^ -~]', '?') | map('regex_replace', '[{}]', '?')
+           | first | default('exit ' ~ (_base_s_visudo.rc | default(-1)), true) | truncate(200) }}
+      includedir: "{{ 'I yes' in _base_s_lines }}"
+      user_lines: >-
+        {{ _base_s_lines | select('match', '^U [0-9]+ \S') | map('regex_replace', '^U ([0-9]+) (.*)$', '\2:\1') | unique | list }}
+      group_lines: >-
+        {{ _base_s_lines | select('match', '^G ([a-z_][a-z0-9_-]*|gid:[0-9]+) [0-9]+ \S')
+           | map('regex_replace', '^G gid:([0-9]+) ', 'G #\1 ')
+           | map('regex_replace', '^G (\S+) ([0-9]+) (.*)$', '\3:\2 (%\1)') | unique | list }}
+      netgroup_lines: >-
+        {{ _base_s_lines | select('match', '^X [0-9]+ \S') | map('regex_replace', '^X ([0-9]+) (.*)$', '\2:\1 (netgroup)')
+           | unique | list }}
+      unreadable: >-
+        {{ _base_s_lines | select('match', '^E cannot read ') | map('regex_replace', '^E cannot read ', '') | unique | list }}
+      bad_groups: >-
+        {{ _base_s_group_names | reject('match', _base_user_re) | map('regex_replace', '[^ -~]|[{}]', '?') | list }}
+  vars:
+    # File names come from the host: only these characters are shown.
+    _base_s_lines: >-
+      {{ ((_base_s_scan.stdout_lines | default([])) if (_base_sudo_scan | default(false) | bool) else [])
+         | map('regex_replace', _base_path_bad_re, '?') | list }}
+    _base_s_group_names: >-
+      {{ (((_base_s_groups.stdout | default('')) if (_base_s_groups.rc | default(1)) == 0 else '') | split | list)
+         if (_base_sudo_scan | default(false) | bool) else [] }}

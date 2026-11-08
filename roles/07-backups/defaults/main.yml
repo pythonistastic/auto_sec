@@ -1,0 +1,19 @@
+---
+# --- Role-internal constants. These are not settings: do not override. ---
+# First line of the rclone.conf and logrotate file role 07 writes. auto_sec
+# replaces those files only while this line is first, or while they are
+# exactly 0.1-0.5's files.
+_l07_header: "# Written by auto_sec (role 07). auto_sec changes this file only while this line is first."
+
+# The files layer 07 writes (read.yml prints one word for each name).
+_l07_paths:
+  rclone: /root/.config/rclone/rclone.conf
+  dir: /opt/backup
+  script: /opt/backup/backup.sh
+  recipients: /opt/backup/recipients.txt
+  tg_token: /opt/backup/.tg_token
+  tg_chat: /opt/backup/.tg_chat
+  logrotate: /etc/logrotate.d/backup
+
+# sha256 of the /etc/logrotate.d/backup auto_sec 0.1-0.5 wrote.
+_l07_logrotate_legacy_sha256: bc73164c2079a0c3ce9079a1c6c5a93ce2bd19a1e539283afc8c4c7dc2290848

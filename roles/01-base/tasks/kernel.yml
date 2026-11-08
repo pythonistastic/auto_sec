@@ -1,0 +1,45 @@
+---
+# roles/01-base/tasks/kernel.yml - preflight B13: kernel settings, read
+# only. auto_sec 0.6 writes no kernel setting (0.1-0.5 wrote 7 lines into
+# /etc/sysctl.conf with ansible.posix.sysctl, which rewrote that whole file
+# and re-applied it). It only says what it sees there:
+#   N01-K2  the 7 lines 0.1-0.5 wrote are there; they are yours now
+#   N01-K1  the file has settings, but systemd-sysctl does not read it:
+#           /etc/sysctl.d/99-sysctl.conf does not lead to it (Debian 13
+#           dropped that link; release notes 5.1.15)
+# Sets _base_sysctl_lines (setting lines in the file), _base_sysctl_legacy
+# and _base_sysctl_unread (bools). Imported by preflight.yml only when
+# role 01 runs.
+
+- name: "Base B13: /etc/sysctl.conf, and does systemd-sysctl read it?"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['sh', '-c', _base_k_script, 'sh', _base_sysctl_conf, _base_sysctl_link] + _base_sysctl_legacy_lines }}
+  register: _base_pf_sysctl
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  vars:
+    _base_k_script: |
+      conf=$1 link=$2
+      shift 2
+      n=0
+      if [ -r "$conf" ]; then n=$(grep -cvE '^[[:space:]]*([#;]|$)' "$conf"); fi
+      echo "N $n"
+      for l in "$@"; do if grep -qxF -- "$l" "$conf" 2>/dev/null; then echo "L $l"; fi; done
+      echo "C $(readlink -f -- "$conf" 2>/dev/null)"
+      echo "R $(readlink -f -- "$link" 2>/dev/null)"
+      exit 0
+
+- name: "Base B13: remember it"
+  ansible.builtin.set_fact:
+    _base_sysctl_lines: "{{ _base_k_n | int }}"
+    _base_sysctl_legacy: >-
+      {{ _base_k_lines | select('match', '^L ') | map('regex_replace', '^L ', '') | select('in', _base_sysctl_legacy_lines)
+         | unique | list | length == _base_sysctl_legacy_lines | length }}
+    _base_sysctl_unread: "{{ (_base_k_n | int) > 0 and _base_k_r != _base_k_c }}"
+  vars:
+    _base_k_lines: "{{ _base_pf_sysctl.stdout_lines | default([]) }}"
+    _base_k_n: "{{ _base_k_lines | select('match', '^N [0-9]+$') | map('regex_replace', '^N ', '') | first | default('0') }}"
+    _base_k_c: "{{ _base_k_lines | select('match', '^C ') | map('regex_replace', '^C ', '') | first | default('') }}"
+    _base_k_r: "{{ _base_k_lines | select('match', '^R ') | map('regex_replace', '^R ', '') | first | default('') }}"

@@ -1,0 +1,10 @@
+## Lab fixture: an operator's own hardening.rules (CIS-style), not auto_sec's.
+-a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -k time-change
+-w /etc/localtime -p wa -k time-change
+-w /etc/passwd -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/sudoers -p wa -k scope
+-w /etc/sudoers.d/ -p wa -k scope
+-w /var/log/lastlog -p wa -k logins
+-a always,exit -F arch=b64 -S execve -F euid=0 -k rootcmd

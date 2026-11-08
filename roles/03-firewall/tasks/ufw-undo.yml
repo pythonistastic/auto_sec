@@ -1,0 +1,112 @@
+---
+# roles/03-firewall/tasks/ufw-undo.yml - the rescue of ufw.yml's U5-U10
+# block: something failed after the automatic undo was armed.
+#
+# It reads the guard first (was this run's change still pending, or had
+# the undo's timer already put the files back?), reverts, then reads ufw
+# again. The guard's revert also exits 0 when its timer already ran; if
+# that happened before U8, ufw went on with the old rule files, so this
+# file turns ufw off itself (ufw was off when the run started: preflight
+# and U2). Then it stops the host with what it found.
+#
+# Inputs: _fw_armed, _fw_kept, _fw_u8_ran, _ssh_guard_id, _fw_ufw_argv
+# (and ansible_failed_task / ansible_failed_result of the rescue).
+
+# Before the revert: was this run's change still pending, or
+# had the undo's timer already put the files back?
+- name: "ufw: is the undo still pending?"
+  when:
+    - _fw_armed | bool
+    - not (_fw_kept | bool)
+  ansible.builtin.include_role:
+    name: 02-ssh-hardening
+    tasks_from: guard
+  vars:
+    _ssh_guard_action: status
+
+- name: "ufw: turn ufw off and put its 4 files back now"
+  when:
+    - _fw_armed | bool
+    - not (_fw_kept | bool)
+  ansible.builtin.include_role:
+    name: 02-ssh-hardening
+    tasks_from: guard
+  vars:
+    _ssh_guard_action: revert
+
+# The undo's rc 0 also means "already reverted". If that
+# happened before U8, ufw went on with the old rule files.
+- name: "ufw: is ufw off now?"
+  ansible.builtin.command:
+    argv: "{{ _fw_ufw_argv + ['status'] }}"
+  environment:
+    LANG: C
+    LC_ALL: C
+  register: _fw_rs_status
+  changed_when: false
+  failed_when: false
+
+# ufw was off when this run started (preflight and U2), and
+# this run turned it on: turning it off puts that back.
+- name: "ufw: turn ufw off (the undo ran before ufw was turned on)"
+  when:
+    - _fw_u8_ran | default(false) | bool
+    - not (_fw_kept | bool)
+    - "'Status: inactive' not in (_fw_rs_status.stdout_lines | default([]))"
+  ansible.builtin.command:
+    argv: "{{ _fw_ufw_argv + ['--force', 'disable'] }}"
+  environment:
+    LANG: C
+    LC_ALL: C
+  register: _fw_rs_disable
+  changed_when: _fw_rs_disable.rc == 0
+  failed_when: false
+
+- name: "ufw: is ufw off now? (after turning it off)"
+  when: _fw_rs_disable is not skipped
+  ansible.builtin.command:
+    argv: "{{ _fw_ufw_argv + ['status'] }}"
+  environment:
+    LANG: C
+    LC_ALL: C
+  register: _fw_rs_status2
+  changed_when: false
+  failed_when: false
+
+- name: "ufw: stop this host"
+  ansible.builtin.fail:
+    msg: >-
+      {% if (ansible_failed_task.name | default('')) is search('M03-W3') %}A brand-new SSH login to
+      {{ inventory_hostname }} failed after ufw was turned on.
+      {% elif (ansible_failed_task.name | default('')) is search('M03-W2') %}After adding rules, ufw's rule
+      list on {{ inventory_hostname }} was not what the plan expected.
+      {% else %}Turning ufw on for {{ inventory_hostname }} failed at
+      "{{ ansible_failed_task.name | default('?') }}".
+      {% endif %}Reason: {{ ((ansible_failed_result.msg | default('')) ~ ' ' ~ (ansible_failed_result.stderr | default('')))
+         | string | regex_replace('[{}]', '?') | regex_replace('\s+', ' ') | trim | truncate(600) }}.
+      {% if _fw_kept | bool %}ufw stays on (the undo was already disarmed).
+      {% elif not (_fw_off | bool) %}ufw may still be ON on {{ inventory_hostname }}
+      ({{ _fw_rs_last | select('match', '^Status: ') | first | default('ufw status failed') }}){{ ''
+      if (_fw_u8_ran | default(false) | bool) else ', and this run did not turn it on' }}. Check from the
+      provider console: `sudo ufw status`, `sudo ufw --force disable` if SSH is blocked, and
+      `sudo auto-sec-ssh-guard status`.
+      {% elif _fw_rs_disable is not skipped and not (_ssh_guard_still_pending | default(true) | bool) %}The
+      automatic undo had already put ufw's four files back before ufw was turned on (its timer ran
+      early), so auto_sec turned ufw off itself.
+      {% elif _fw_rs_disable is not skipped %}The undo left ufw on (rc {{ _ssh_guard_revert_rc | default('?') }}:
+      {{ _ssh_guard_revert_err | default('') }}), so auto_sec turned ufw off itself. Check the files it lists
+      with `sudo auto-sec-ssh-guard status`.
+      {% elif not (_ssh_guard_still_pending | default(true) | bool) %}ufw is off: the automatic undo had
+      already put ufw's four files back (its timer ran before this run finished).{{ '' if (_fw_u8_ran | default(false) | bool)
+      else " Rules added after that may still be listed: check `sudo ufw show added`." }}
+      {% elif (_ssh_guard_revert_rc | default(-1) | int) == 0 %}{{ 'auto_sec turned ufw off and put its four files back.'
+      if (_fw_u8_ran | default(false) | bool) else 'ufw was not turned on; auto_sec put its four files back.' }}
+      {% else %}ufw status says inactive, but the undo reported rc {{ _ssh_guard_revert_rc | default('?') }}
+      ({{ _ssh_guard_revert_err | default('') }}): ufw's rules may still be loaded, or some files left in
+      place. Check from the provider console: `sudo iptables -S | head`, `sudo auto-sec-ssh-guard status`.
+      {% endif %}No later role ran on this host.
+  vars:
+    _fw_rs_last: >-
+      {{ ((_fw_rs_status2.stdout_lines | default([])) if (_fw_rs_disable is not skipped) else (_fw_rs_status.stdout_lines | default([])))
+         | map('regex_replace', '[^ -~]', '?') | map('regex_replace', '[{}]', '?') | list }}
+    _fw_off: "{{ 'Status: inactive' in _fw_rs_last }}"

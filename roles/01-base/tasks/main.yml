@@ -3,21 +3,29 @@
 #
 # Preflight (tasks/preflight.yml, imported by site.yml pre_tasks) already
 # checked everything and set the _base_* facts. This file:
-#   1. installs the missing base packages, without recommendations; it
-#      stops instead if that would upgrade or remove an installed package
-#      (packages.yml), unless apt_full_upgrade is set
+#   1. installs the missing packages (unattended-upgrades, sudo) through
+#      the shared package guard (roles/autosec-apt), without
+#      recommendations and with needrestart held back; it stops instead if
+#      that would upgrade or remove an installed package. If it installed
+#      sudo, the sudo checks of preflight B3 run now, for the first time
 #   2. on a host set up by auto_sec 0.1-0.4 only, and only with
 #      -e apt_migrate_unattended_upgrades=true: keeps a copy of the old
 #      50unattended-upgrades and puts the distro's own file back
-#   3. writes /etc/apt/apt.conf.d/51autosec-unattended-upgrades, or removes
-#      it when there is nothing to write (the default: nothing)
+#   3. writes /etc/apt/apt.conf.d/51autosec-unattended-upgrades; with
+#      nothing to write (the default), removes it in auto mode only (keep
+#      leaves it)
 #   4. proves that apt now reads what the trial run said
-#   5. full upgrade, only with -e apt_full_upgrade=true
-#   6. deploy user, sudoers, sysctl (unchanged in 0.5)
+#   5. full upgrade, only with -e apt_full_upgrade=true (also through the
+#      guard)
+#   6. deploy_user_account: create only: the account if it is missing (an
+#      existing one is never changed), then auto_sec's sudo file, after the
+#      preflight's checks were repeated, and a test of the rule
 #   7. hostname, only when server_hostname is set and differs
 #   8. timezone, only when timezone is set and differs
 # auto_sec never writes 20auto-upgrades, never edits 50unattended-upgrades
 # (apart from the one-time restore in 2) and never touches the apt timers.
+# It writes no kernel setting (0.1-0.5 wrote 7 lines into
+# /etc/sysctl.conf; they stay, as yours).
 
 - name: "Base: the preflight must have run in this play"
   ansible.builtin.assert:
@@ -26,6 +34,9 @@
       - _base_uu_plan_empty is defined
       - _base_uu_sim_after is defined
       - _base_hostname_change is defined
+      - _base_user_plan is defined
+      - _base_sudo_write is defined
+      - _base_sudo_pf is defined
       # Preflight skips its role-01-only checks unless the tags select
       # "base"; role 01 must then not run under some other tag.
       - _base_role_runs | default(false) | bool
@@ -38,27 +49,45 @@
 # --- 1. Packages ----------------------------------------------------------------
 
 # Only when something is missing (preflight B5b): a host that has every
-# package gets no apt run at all, not even a list refresh.
-- name: "Base 1: refresh the package lists (only if older than an hour)"
+# package gets no apt run at all, not even a list refresh. The guard
+# refreshes the lists, checks again (install only, upgrade nothing), installs
+# and proves that nothing else changed. Not in --check.
+- name: "Base 1: install the missing packages"
   when: _base_pkgs_missing | length > 0
-  ansible.builtin.apt:
-    update_cache: true
-    cache_valid_time: 3600
-
-- name: "Base 1: check again with the fresh lists: install only, upgrade nothing"
-  when: _base_pkgs_missing | length > 0
-  ansible.builtin.import_tasks: packages.yml
+  ansible.builtin.include_role:
+    name: autosec-apt
+    tasks_from: install
+    apply:
+      tags: [base]
   vars:
-    _base_pkg_ctx: main
+    _aptg_want: "{{ _base_pkg_want }}"
+    _aptg_who: "role 01 (base)"
+    _aptg_allow_changes: "{{ _base_full_upgrade }}"
 
-# state: present installs only the missing names; the check above made sure
-# that this upgrades and removes nothing (or apt_full_upgrade allows it).
-- name: "Base 1: install the missing base packages"
-  when: _base_pkgs_missing | length > 0
-  ansible.builtin.apt:
-    name: "{{ _base_pkgs_missing }}"
-    state: present
-    install_recommends: false
+# sudo was not installed at preflight, so its configuration could not be
+# read then. Read and check it now, before anything else changes.
+- name: "Base 1: sudo's configuration, now that sudo is installed"
+  when:
+    - _base_sudo_write | bool
+    - not (_base_sudo_installed | bool)
+    - not ansible_check_mode
+  block:
+    - name: "Base 1: read it"
+      ansible.builtin.import_tasks: sudo.yml
+      vars:
+        _base_sudo_scan: true
+
+    - name: "Base 1: the sudo file did not change, and the preflight's sudo checks"
+      ansible.builtin.import_tasks: sudo_check.yml
+      vars:
+        _base_sudo_cmp: true
+        _base_sudo_end: >-
+          Nothing in sudo has been changed (this run installed {{ _base_pkgs_missing | join(', ') }}).
+
+    - name: "Base 1: these reads are what step 6b compares with"
+      ansible.builtin.set_fact:
+        _base_sudo_pf: "{{ _base_sudo_now }}"
+        _base_sudo_installed: true
 
 # --- 2. Host set up by auto_sec 0.1-0.4 ------------------------------------------
 
@@ -140,11 +169,14 @@
     mode: "0644"
     validate: apt-config -c %s dump
 
-# Preflight B3 refused any other file under this name.
-- name: "Base 3: nothing to write: remove auto_sec's own file"
+# Preflight B3 refused any other file under this name. Only in auto mode
+# (the trial run's _base_uu_file_change): with keep the file stays, as
+# it may hold the update switches of an earlier run.
+- name: "Base 3: nothing to write: remove auto_sec's own file (auto mode)"
   when:
     - _base_uu_plan_empty | bool
     - _base_uu_file_state == 'ours'
+    - _base_uu_file_change == 'remove'
   ansible.builtin.file:
     path: "{{ _base_uu_file }}"
     state: absent
@@ -180,45 +212,95 @@
 # --- 5. Full upgrade (one-off switch) -----------------------------------------------
 
 # Last of the apt steps, so the package's ucf sees the restored, unmodified
-# 50unattended-upgrades and replaces it normally.
+# 50unattended-upgrades and replaces it normally. `apt-get dist-upgrade`
+# with the guard's environment (needrestart held back); not in --check.
 - name: "Base 5: full upgrade (apt_full_upgrade)"
   when: _base_full_upgrade | bool
-  ansible.builtin.apt:
-    upgrade: dist
-    update_cache: true
-    cache_valid_time: 3600
+  ansible.builtin.include_role:
+    name: autosec-apt
+    tasks_from: upgrade
+    apply:
+      tags: [base]
 
-# --- 6. Deploy user, sudoers, sysctl (unchanged in 0.5) -----------------------------
+# --- 6. The account and its sudo rule (deploy_user_account: create) ---------------
 
-- name: "Base 6: create the deploy user"
-  ansible.builtin.user:
-    name: "{{ deploy_user }}"
-    shell: /bin/bash
-    groups: sudo
-    append: true
-    create_home: true
+# 6a. Only a missing account is created. The user module would change the
+# shell of an existing one, so the account is looked up again first.
+- name: "Base 6a: the account"
+  when: _base_user_plan == 'create'
+  block:
+    - name: "Base 6a: does the account exist now?"
+      ansible.builtin.command:
+        argv: [getent, passwd, "{{ deploy_user }}"]
+      register: _base_m_user
+      changed_when: false
+      failed_when: false
+      check_mode: false
 
-- name: "Base 6: passwordless sudo for the deploy user"
-  ansible.builtin.copy:
-    dest: "/etc/sudoers.d/{{ deploy_user }}"
-    mode: "0440"
-    validate: "visudo -cf %s"
-    content: "{{ deploy_user }} ALL=(ALL) NOPASSWD:ALL\n"
+    - name: "Base 6a: it was created in the meantime"
+      when: _base_m_user.rc == 0
+      ansible.builtin.debug:
+        msg: >-
+          [N01-A1] INFO: {{ deploy_user }} exists on {{ inventory_hostname }} (created since the
+          preflight). auto_sec never changes an existing account.
 
-- name: "Base 6: kernel hardening via sysctl"
-  ansible.posix.sysctl:
-    name: "{{ item.key }}"
-    value: "{{ item.value }}"
-    state: present
-    sysctl_set: true
-  loop:
-    - { key: "net.ipv4.tcp_syncookies", value: "1" }
-    - { key: "net.ipv4.icmp_echo_ignore_broadcasts", value: "1" }
-    - { key: "net.ipv4.conf.all.log_martians", value: "1" }
-    - { key: "net.ipv4.conf.all.accept_redirects", value: "0" }
-    - { key: "net.ipv4.conf.all.send_redirects", value: "0" }
-    - { key: "net.ipv4.conf.all.accept_source_route", value: "0" }
-    - { key: "kernel.dmesg_restrict", value: "1" }
+    # No groups, no password (useradd locks it: key login only).
+    - name: "Base 6a: create {{ deploy_user }}"
+      when: _base_m_user.rc != 0
+      ansible.builtin.user:
+        name: "{{ deploy_user }}"
+        shell: /bin/bash
+        create_home: true
+
+# 6b. The same reads as the preflight, right before the write; any
+# difference stops the run (M01-A1, sudo_check.yml), and the preflight's
+# refusals apply again. The file is written with visudo's check, then
+# proven: the account must now get passwordless sudo (M01-A2).
+- name: "Base 6b: auto_sec's sudo file"
+  when: _base_sudo_write | bool
+  block:
+    - name: "Base 6b: read sudo's files again"
+      ansible.builtin.import_tasks: sudo.yml
+      vars:
+        _base_sudo_scan: "{{ _base_sudo_installed | bool }}"
+
+    # Groups are read only for an account that exists: a new account's
+    # groups are checked here for the first time.
+    - name: "Base 6b: nothing changed since the preflight, and its checks again"
+      ansible.builtin.import_tasks: sudo_check.yml
+      vars:
+        _base_sudo_cmp: true
+        _base_sudo_end: >-
+          Nothing in sudo has been changed{{ (' (this run created ' ~ deploy_user ~ ')')
+          if _base_user_plan == 'create' else '' }}.
+
+    - name: "Base 6b: write {{ _base_sudo_file }}"
+      ansible.builtin.template:
+        src: sudoers-autosec.j2
+        dest: "{{ _base_sudo_file }}"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: visudo -cf %s
+
+    - name: "Base 6b: the account has passwordless sudo now"
+      when: not ansible_check_mode
+      ansible.builtin.command:
+        argv: [runuser, -u, "{{ deploy_user }}", --, sudo, -n, "true"]
+      register: _base_m_sudo
+      changed_when: false
+      failed_when: false
+
+    - name: "Base 6b: the rule works (M01-A2)"
+      when: not ansible_check_mode
+      ansible.builtin.assert:
+        quiet: true
+        that: _base_m_sudo.rc == 0
+        fail_msg: >-
+          [M01-A2] auto_sec wrote {{ _base_sudo_file }} on {{ inventory_hostname }}, but "sudo -n true" as
+          {{ deploy_user }} still fails ({{ (_base_m_sudo.stderr_lines | default([]) | first | default('exit ' ~ _base_m_sudo.rc))
+          | regex_replace('[^ -~]', '?') | regex_replace('[{}]', '?') | truncate(200) }}). A rule read later
+          probably overrides it. The file stays. Check "sudo -l -U {{ deploy_user }}".
 
 # --- 7, 8. Hostname and timezone (only when you set them) ---------------------------
 

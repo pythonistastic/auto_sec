@@ -1,0 +1,25 @@
+---
+# The shared package guard exactly as the roles use it: its preflight in
+# pre_tasks (tags always), then one role's install (include_role, tasks_from
+# install). Used by tests/autosec-apt/live/run.sh, which points
+# ANSIBLE_ROLES_PATH at the repository's roles/ and passes the wanted
+# packages as -e '{"_base_pkg_want": [...]}' (the preflight reads them as
+# role 01's wants).
+- name: Package guard live test
+  hosts: all
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: "Preflight: packages (read-only)"
+      ansible.builtin.import_role:
+        name: autosec-apt
+        tasks_from: preflight
+      tags: [always]
+  tasks:
+    - name: "Install through the guard"
+      ansible.builtin.include_role:
+        name: autosec-apt
+        tasks_from: install
+      vars:
+        _aptg_want: "{{ _base_pkg_want }}"
+        _aptg_who: apt-guard-live

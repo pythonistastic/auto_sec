@@ -1,0 +1,67 @@
+---
+# roles/autosec-apt/tasks/preflight.yml - the package check of the whole
+# run. site.yml imports this file in pre_tasks (tags always), after every
+# role's preflight and before the plan summary. Read-only; also in --check.
+#
+# It collects the packages every selected role wants (_aptg_sources in
+# vars/main.yml): a role that is off leaves its list empty, and a role the
+# tags do not select is left out here as well. Then one simulation for all
+# of them together (plan.yml), so a refusal comes before any role changes
+# the server. With every choice keep, no role wants anything and apt is not
+# asked at all.
+#
+# Facts for the plan summary (00-plan). The roles' own plan lines carry
+# the install items; these only describe them:
+#   _aptg_pf_req      [{who, pkgs}] what the selected roles want
+#   _aptg_pf_missing  the packages this run installs
+#   _aptg_pf_by_who   [[who, [packages]], ...] the same, by role
+#   _aptg_pf_deps     new dependencies apt would add
+#   _aptg_plan_line   "nothing to install", or who installs what
+
+- name: "Packages preflight: start"
+  ansible.builtin.set_fact:
+    _aptg_pf_req: []
+    _aptg_pf_allow: false
+
+- name: "Packages preflight: what the selected roles want"
+  when:
+    - ('all' in ansible_run_tags) or ('tagged' in ansible_run_tags) or (item.tags | intersect(ansible_run_tags) | length > 0)
+    - item.tags | intersect(ansible_skip_tags) | length == 0
+    - ('all' not in ansible_skip_tags) and ('tagged' not in ansible_skip_tags)
+  ansible.builtin.set_fact:
+    _aptg_pf_req: "{{ _aptg_pf_req + ([{'who': item.who, 'pkgs': _aptg_pf_want}] if (_aptg_pf_want | length > 0) else []) }}"
+    # The full upgrade also reloads systemd: its unit check runs too.
+    _aptg_pf_allow: >-
+      {{ (_aptg_pf_allow | bool)
+         or ((item.allow is defined) and (lookup('ansible.builtin.vars', item.allow, default=false) | bool)) }}
+  loop: "{{ _aptg_sources }}"
+  loop_control:
+    label: "{{ item.who }}"
+  vars:
+    _aptg_pf_want: "{{ lookup('ansible.builtin.vars', item.var, default=[]) }}"
+
+- name: "Packages preflight: one check for all of them"
+  ansible.builtin.import_tasks: plan.yml
+  vars:
+    _aptg_req: "{{ _aptg_pf_req }}"
+    _aptg_ctx: preflight
+    _aptg_allow_changes: "{{ _aptg_pf_allow }}"
+    _aptg_check_units: "{{ _aptg_pf_allow }}"
+
+- name: "Packages preflight: remember the result"
+  ansible.builtin.set_fact:
+    _aptg_pf_missing: "{{ _aptg_missing }}"
+    _aptg_pf_by_who: "{{ _aptg_by_who }}"
+    _aptg_pf_deps: "{{ _aptg_deps }}"
+    _aptg_plan_line: >-
+      {{ 'nothing to install' if (_aptg_missing | length == 0)
+         else (_aptg_by_who | map('first') | zip(_aptg_by_who | map('last') | map('join', ' ')) | map('join', ': ') | join('; ')
+               ~ ((' (+ new dependencies ' ~ (_aptg_deps | join(' ')) ~ ')') if (_aptg_deps | length > 0) else '')) }}
+
+- name: "Packages preflight: what this run installs"
+  ansible.builtin.debug:
+    msg: >-
+      {% if _aptg_pf_missing | length == 0 %}packages: nothing to install{% else %}[N-P1] INFO: packages
+      this run installs on {{ inventory_hostname }}, without their recommended packages:
+      {{ _aptg_plan_line }}. needrestart is held back during these installs; a newly installed package
+      may start its own service.{% endif %}

@@ -1,0 +1,45 @@
+---
+# roles/01-base/tasks/admin.yml - preflight B12: the account role 02 logs
+# in as. Runs whenever role 02 runs (ssh_hardening_enabled, tag "ssh") and
+# that account is not root, whatever role 01's tags. Role 02 adds its keys
+# to the account's ~/.ssh and tests a login, so a missing account is
+# refused here, before role 01 changes anything (R01-A6), and so is a new
+# one that sshd would not let in (R01-A7). Read-only.
+
+- name: "Base B12: does ssh_admin_user exist?"
+  when: _base_b12 | bool
+  ansible.builtin.command:
+    argv: [getent, passwd, "{{ _base_admin }}"]
+  register: _base_pf_admin
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Base B12: ssh_admin_user exists or this run creates it (R01-A6)"
+  when: _base_b12 | bool
+  ansible.builtin.assert:
+    quiet: true
+    that: _base_pf_admin.rc == 0 or (_base_admin_created | bool)
+    fail_msg: >-
+      [R01-A6] ssh_admin_user is {{ _base_admin }}, but {{ _base_admin }} does not exist on
+      {{ inventory_hostname }}, and this run does not create it ({% if _base_admin != deploy_user %}it is
+      not deploy_user{% elif not (_base_role_runs | bool) %}role 01 is not in this run's
+      tags{% else %}deploy_user_account is keep{% endif %}). Set deploy_user_account: create with
+      deploy_user: {{ _base_admin }}, or set ssh_admin_user and ansible_user to an account that exists,
+      for example root. Nothing has been changed.
+
+# A new account is password-locked: key login only, which sshd allows for a
+# locked account only through PAM. UsePAM is global (no Match block can set
+# it); role 02's preflight read it with `sshd -T`.
+- name: "Base B12: a new ssh_admin_user can log in with a key (R01-A7)"
+  when:
+    - _base_b12 | bool
+    - _base_pf_admin.rc != 0
+    - _base_admin_created | bool
+  ansible.builtin.assert:
+    quiet: true
+    that: (_ssh_before.admin.usepam | default(_ssh_before.root.usepam | default('')) | lower) != 'no'
+    fail_msg: >-
+      [R01-A7] {{ _base_admin }} would be created password-locked (key login only), but sshd on
+      {{ inventory_hostname }} has UsePAM no, which refuses locked accounts. Create the account
+      yourself, or set UsePAM yes. Nothing has been changed.

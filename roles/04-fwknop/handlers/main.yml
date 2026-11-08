@@ -1,5 +1,8 @@
 ---
+# Only a fwknopd that runs (or that this run installed) is restarted: a
+# restart would start one you stopped.
 - name: restart fwknopd
+  when: (_l04_active_before | default(false) | bool) or not (_l04_installed_before | default(true) | bool)
   ansible.builtin.service:
     name: fwknop-server
     state: restarted

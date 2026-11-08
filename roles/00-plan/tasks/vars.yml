@@ -1,0 +1,46 @@
+---
+# roles/00-plan/tasks/vars.yml - the run-wide variable checks. No host access.
+#
+# site.yml imports this file as part of pre-task 2 (tags always), before
+# the first connection to the host, so a wrong value stops every run,
+# whatever the tags, before anything is read or changed.
+#
+#   R00-1  autosec_server is set, to exactly existing or new
+#   and the shape of the plan switches (autosec_plan_only,
+#   autosec_require_approval, autosec_approve, autosec_confirm_hosts,
+#   autosec_serial).
+
+# The per-feature defaults follow this one value (group_vars/all.yml):
+# existing changes nothing unless you name it, new sets up a brand-new
+# server. A YAML boolean (yes, true) is refused: it is not a choice.
+- name: "Plan R00-1: autosec_server is existing or new"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - autosec_server is defined
+      - autosec_server is string
+      - autosec_server in ['existing', 'new']
+    fail_msg: >-
+      [R00-1] autosec_server is not set for {{ inventory_hostname }}{{ (' (or is "' ~ (autosec_server | string | regex_replace('[{}]', '?') | truncate(30)) ~ '")') if autosec_server is defined else '' }}.
+      Set it in host_vars: existing (a server that already runs something: auto_sec changes only
+      what you name) or new (a brand-new server: auto_sec turns on ufw, fail2ban, automatic
+      updates and the admin account). Nothing has been changed.
+
+- name: "Plan: the plan switches have a valid shape"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (autosec_plan_only | default(false) | string | lower) in _plan_bool_words
+      - (autosec_require_approval | default(false) | string | lower) in _plan_bool_words
+      - >-
+        autosec_approve is not defined
+        or ((autosec_approve | string).split(',') | map('trim') | reject('match', _plan_id_re) | list | length == 0)
+      - (autosec_confirm_hosts is not defined) or (autosec_confirm_hosts | string is match('^[0-9]{1,5}$'))
+      - >-
+        (autosec_serial is not defined)
+        or (autosec_serial | string is match('^[0-9]{1,4}$') and (autosec_serial | int) >= 1)
+    fail_msg: >-
+      autosec_plan_only and autosec_require_approval must be true or false; autosec_approve
+      one plan id or several, separated by commas (12 characters 0-9 and a-f each, as the plan
+      prints them); autosec_confirm_hosts the number of hosts; autosec_serial a whole number of
+      at least 1 (pass it with -e). Nothing has been changed.

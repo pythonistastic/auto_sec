@@ -1,0 +1,64 @@
+---
+# roles/04-fwknop/tasks/read.yml - what is on the host now (read-only).
+#
+# Included by plan.yml (site.yml pre_tasks) and by main.yml right before it
+# writes. One word per config file comes back (absent, pristine, ours,
+# legacy, foreign, other): the access.conf keys never leave the host.
+# Sets _l04_now: {pkg, active, enabled, access.conf, fwknopd.conf}.
+
+- name: "fwknop: package, service and config files (read-only)"
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - |
+        H=$1
+        st=$(dpkg-query -W -f='${db:Status-Abbrev}' fwknop-server 2>/dev/null) || st=
+        echo "pkg ${st:-none}"
+        echo "active $(systemctl is-active fwknop-server.service 2>/dev/null)"
+        echo "enabled $(systemctl is-enabled fwknop-server.service 2>/dev/null)"
+        cf=$(dpkg-query -W -f='${Conffiles}\n' fwknop-server 2>/dev/null) || cf=
+        shape() { # file pattern... : 0 when the file has exactly these lines
+          f=$1; shift
+          [ "$(wc -l < "$f")" -eq $# ] || return 1
+          i=0
+          for p in "$@"; do
+            i=$((i + 1))
+            sed -n "${i}p" "$f" | grep -Eqx -- "$p" || return 1
+          done
+        }
+        for f in /etc/fwknop/access.conf /etc/fwknop/fwknopd.conf; do
+          n=${f##*/}
+          if [ -L "$f" ]; then echo "$n other"; continue; fi
+          if [ ! -e "$f" ]; then echo "$n absent"; continue; fi
+          if [ ! -f "$f" ]; then echo "$n other"; continue; fi
+          if [ "$(head -n 1 -- "$f")" = "$H" ]; then echo "$n ours"; continue; fi
+          m=$(md5sum < "$f" | cut -d' ' -f1)
+          if printf '%s\n' "$cf" | grep -Eq "^ $f $m( |$)"; then echo "$n pristine"; continue; fi
+          case $n in
+            access.conf) shape "$f" '# Managed by Ansible' 'SOURCE +ANY' 'OPEN_PORTS +tcp/[0-9]{1,5}' \
+                           'KEY_BASE64 +[A-Za-z0-9+/=]{16,}' 'HMAC_KEY_BASE64 +[A-Za-z0-9+/=]{16,}' \
+                           'FW_ACCESS_TIMEOUT +[0-9]{1,5}' 'REQUIRE_SOURCE_ADDRESS +Y' ;;
+            *) shape "$f" '# Managed by Ansible' 'PCAP_INTF +[A-Za-z0-9_.:@-]{1,15}' 'ENABLE_IPT_FORWARDING +N' ;;
+          esac && { echo "$n legacy"; continue; }
+          echo "$n foreign"
+        done
+      - sh
+      - "{{ _l04_header }}"
+  environment:
+    LC_ALL: C
+  register: _l04_read
+  changed_when: false
+  check_mode: false
+
+- name: "fwknop: remember what is there"
+  ansible.builtin.set_fact:
+    _l04_now: >-
+      {%- set out = {} -%}
+      {%- for ln in _l04_lines -%}
+      {%- set f = ln.split(' ', 1) -%}
+      {%- set _ = out.update({f[0]: (f[1] if f | length > 1 else '')}) -%}
+      {%- endfor -%}
+      {{ out }}
+  vars:
+    _l04_lines: "{{ _l04_read.stdout_lines | select('match', '^(pkg|active|enabled|access.conf|fwknopd.conf) ') | map('regex_replace', '[^ -~]', '?') | list }}"

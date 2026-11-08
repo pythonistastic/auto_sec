@@ -10,7 +10,7 @@
 # (no app_type) never gets them. Writes only
 # /etc/fail2ban/jail.d/00-autosec-nginx.conf (nginx-http-auth and
 # nginx-botsearch, backend = auto), after the same trial and checks as
-# 00-autosec.conf (R1, R2, R3, R5, R6, R7), and reloads fail2ban only when
+# 00-autosec.conf (R03-F1, R03-F2, R03-F3, R03-F5, R03-F6, R03-F7), and reloads fail2ban only when
 # the effective config changes.
 
 - name: "fail2ban nginx: the fail2ban preflight must have run in this play"

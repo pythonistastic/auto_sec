@@ -1,34 +1,52 @@
 # Contributing
 
-This project is deliberately small, readable, and honest about its
-limits. Contributions that add detection techniques, close evasion
-gaps, or broaden OS support are very welcome.
+auto_sec is a personal research project: deliberately small, readable,
+and honest about its limits. Contributions that close gaps, add tests,
+or broaden OS support are welcome.
 
 ## Good first contributions
 
-- **New detectors** for role 09. Each is a standalone script under
-  `roles/09-watcher/templates/` that imports `sentinel_lib` and calls
-  `S.respond(...)`. Ideas the community has raised: eBPF-based syscall
-  monitoring, outbound-connection anomaly detection, LD_PRELOAD /
-  `/etc/ld.so.preload` tampering watches, SUID-binary change detection,
-  cron/systemd-timer persistence diffing.
-- **Evasion notes.** If you can slip past a detector, document how in an
-  issue (or add a failing case). Knowing the gaps is more valuable than
-  pretending they don't exist.
+- **Detection ideas for 0.7.** The 0.1–0.5 detectors did not work as
+  documented ([#18](https://github.com/pythonistastic/auto_sec/issues/18)),
+  so 0.6 ships none. Ideas, test cases and evasion notes for the rewrite
+  are welcome as issues: eBPF-based syscall monitoring, outbound-connection
+  anomalies, `/etc/ld.so.preload` tampering, SUID-binary changes,
+  cron/systemd-timer persistence.
+- **Run a live job.** 0.6's live test jobs in CI are written but have not
+  run yet. A run on a fork, with its logs, helps a lot.
 - **Distro support.** Currently targets Ubuntu 22.04/24.04. Debian 12
   and 13 are tested in CI only. RHEL/Alma/Rocky ports (dnf, firewalld
   instead of ufw, SELinux) are welcome as parallel task files.
 
 ## Ground rules
 
-- **Detectors default to `alert` mode.** Automated killing is opt-in
-  (`watcher_mode: active`) and must always capture evidence *before*
-  acting — use `S.respond()`, never call `kill`/`ufw` directly from a
-  detector.
-- **Never crash the loop.** Detectors wrap their work so a bad scan
-  logs nothing and continues. Alerting failures must be swallowed.
+- **Every role states its plan.** Each role's preflight or `plan.yml`
+  sets `_plan_NN`, a list of `{role, part, do, what, note}` (see
+  `roles/00-plan/tasks/summary.yml`). "what" is built from the
+  operator's values and constant names only; host details go in "note".
+  A change the plan does not list is a bug. CI checks that every role
+  sets its `_plan_NN`.
+- **Refusal IDs are namespaced.** `R<role>-...` (refuse before any
+  change), `M<role>-...` (the host changed during the run), `N<role>-...`
+  and `W<role>-...` (notes and warnings) live only in that role's
+  directory; `P1`–`P5`, `M-P*` and `N-P*` only in `roles/autosec-apt`.
+  Every preflight refusal ends with "Nothing has been changed." CI checks
+  the namespaces.
+- **`existing` means change nothing unless named.** A new feature that
+  installs, writes or starts something needs its own setting, with
+  `keep` (or off) as the default for `autosec_server: existing`.
+- **Never replace a file auto_sec cannot prove is its own** (a header
+  line, or the exact bytes of an older release). Otherwise refuse, and
+  say how to proceed.
+- **Packages only through `roles/autosec-apt`.** No `apt` module: the
+  guard simulates first, refuses upgrades and removals, and holds
+  needrestart back. CI greps for the apt module.
+- **No ufw command on an active ufw**, no `ufw default` on its own, no
+  `systemctl enable` (it reloads systemd). CI checks the `ufw`, `sysctl`
+  and `apt` modules, `augenrules`, and `enabled: true` outside roles
+  04-07.
 - **No secrets in git.** `host_vars/*`, `inventory/*`, `secrets/`,
-  and all keys are gitignored. Keep it that way.
+  `reports/` and all keys are gitignored. Keep it that way.
 - **Keep it idempotent.** Re-running the playbook must converge, not
   duplicate. Test with `--check` where practical.
 - **SSH changes go through the guard.** Role 02 writes only
@@ -52,9 +70,9 @@ gaps, or broaden OS support are very welcome.
   missing packages only, without recommendations, and never one whose
   install upgrades or removes another. The base-semantics tests check
   all of this.
-- **Public variables live in `group_vars/all.yml`.** Roles 01 and 03
-  keep the same values in their `defaults/main.yml`, so their tests run
-  without group_vars. CI fails when the two differ.
+- **Public variables live in `group_vars/all.yml`.** Roles 00-plan, 01,
+  03 and 11 keep the same values in their `defaults/main.yml`, so their
+  tests run without group_vars. CI fails when the two differ.
 - **Host data is not input.** Values read from a managed host may be
   compared, shown, or used to refuse a run. They never become variables,
   file content or command arguments without a written exception in
@@ -68,13 +86,16 @@ ansible-playbook site.yml -i inventory/hosts.yml --syntax-check
 ansible-lint
 # default severity, same files as CI (bash, for **):
 shopt -s globstar
-shellcheck scripts/*.sh tests/**/*.sh tests/guard/stubs/* \
+shellcheck -x scripts/*.sh tests/**/*.sh tests/guard/stubs/* tests/legacy/stubs/* \
   roles/02-ssh-hardening/files/auto-sec-ssh-guard \
-  roles/01-base/files/autosec-apt-sim
-python3 -m py_compile roles/09-watcher/templates/*.py.j2   # after stripping {{ }}
+  roles/01-base/files/autosec-apt-sim roles/01-base/files/autosec-sudo-scan
+# the run-wide checks and the plan, without root (current ansible-core):
+bash tests/site/semantics/run.sh
 ```
 
-CI runs all of these on every push and pull request.
+CI runs all of these on every push and pull request, and the lab suites
+of each role (`tests/*/semantics`, `tests/legacy`) on the current
+ansible-core and on 2.16.
 
 If you touch SSH (role 02, the guard script, roles 03 or 04, or the
 preflight in `site.yml`), also run the two SSH test suites below. If you
@@ -171,9 +192,26 @@ The update suite also needs `python3-apt`, `python3-distro-info` and
 unattended-upgrades checks print SKIP. `--cache DIR` reuses downloaded
 packages.
 
-To validate a detector end-to-end on real hardware, run
-`sudo tests/redteam.sh` on a throwaway server the playbook has hardened.
-If you add a detector, add a matching trigger + assertion there.
+`tests/redteam.sh` belongs to the 0.1–0.5 detectors, which 0.6 no
+longer installs. It stays as a starting point for the 0.7 rewrite.
+
+### The full-run tests
+
+- **`full-adopt-live`** (`tests/full-adopt-live/`): a runner set up like
+  a server already in use (active ufw, fail2ban with its own
+  `jail.local`, auditd rules, an app port, root as the admin). Plan-only,
+  `--check` and two real runs with `autosec_server: existing` must leave
+  every file under `/etc` and `/opt`, every service and the firewall
+  counters as they were. Only the report on the controller is new.
+- **`full-new-live`** (`tests/full-new-live/`): a runner without ufw,
+  `autosec_server: new`. ufw is turned on under the undo, `deploy` and
+  its sudo file are created, fail2ban is installed; the second run
+  changes nothing; an injected login failure turns ufw back off.
+- **`legacy-live`** (`tests/full-legacy-live/`): 0.5's detectors in active
+  mode stop the run before fact gathering (R00-3); in alert mode the run
+  warns and changes nothing.
+
+GitHub runners only: they change the machine they run on.
 
 ## Cutting a release
 

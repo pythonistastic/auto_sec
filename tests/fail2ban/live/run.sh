@@ -148,6 +148,8 @@ all:
       ansible_connection: local
       ansible_python_interpreter: /usr/bin/python3
       deploy_user: deploy
+      autosec_server: existing
+      fail2ban_hardening_enabled: true
       ssh_hardening_enabled: false
       ssh_port: 22
       paranoia_level: standard

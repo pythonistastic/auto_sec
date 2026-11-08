@@ -1,0 +1,92 @@
+---
+# roles/07-backups/tasks/read.yml - are the files layer 07 writes auto_sec's?
+# (read-only)
+#
+# Included by plan.yml (site.yml pre_tasks) and again by main.yml right
+# before the write. Prints one "<name> <word>" line per file; the keys and
+# tokens in them never leave the host. Words: absent, ours, legacy (the
+# exact file auto_sec 0.1-0.5 wrote), foreign (someone else's), other (not
+# a plain file). Sets _l07_now (rclone.conf's word) and _l07_files (every
+# file's word).
+
+- name: "Backups: the files layer 07 writes (read-only)"
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - |
+        H=$1; LR=$2; RC=$3; d=$4; SCRIPT=$5; REC=$6; TOK=$7; CHAT=$8; LOGR=$9
+        kind() {  # path: absent | other | file
+          if [ -L "$1" ]; then echo other
+          elif [ ! -e "$1" ]; then echo absent
+          elif [ -f "$1" ]; then echo file
+          else echo other
+          fi
+        }
+        f=$RC; k=$(kind "$f")
+        if [ "$k" != file ]; then echo "rclone $k"
+        elif [ "$(head -n 1 -- "$f")" = "$H" ]; then echo "rclone ours"
+        elif [ "$(wc -l < "$f")" -eq 4 ] \
+             && [ "$(sed -n 1p "$f")" = '[b2]' ] && [ "$(sed -n 2p "$f")" = 'type = b2' ] \
+             && sed -n 3p "$f" | grep -Eqx 'account = [A-Za-z0-9+/=_.-]{1,128}' \
+             && sed -n 4p "$f" | grep -Eqx 'key = [A-Za-z0-9+/=_.-]{1,256}'; then echo "rclone legacy"
+        else echo "rclone foreign"
+        fi
+        # /opt/backup: a folder of the user this runs as, root (layer 07
+        # makes it root:root 0700).
+        if [ -L "$d" ]; then echo "dir other"
+        elif [ -d "$d" ]; then
+          if [ "$(stat -c %u -- "$d")" = "$(id -u)" ]; then echo "dir ours"; else echo "dir foreign"; fi
+        elif [ -e "$d" ]; then echo "dir other"; else echo "dir absent"; fi
+        # backup.sh: the first two lines of auto_sec's template (0.1-0.6).
+        f=$SCRIPT; k=$(kind "$f")
+        if [ "$k" != file ]; then echo "script $k"
+        elif [ "$(sed -n 1p "$f")" = '#!/usr/bin/env bash' ] \
+             && sed -n 2p "$f" | grep -Fq '# Nightly backup: dump DB + app uploads, encrypt client-side with age,'; then
+          echo "script ours"
+        else echo "script foreign"
+        fi
+        # One value each, of the shape auto_sec writes (0.3-0.6).
+        one() {  # name path pattern
+          k=$(kind "$2")
+          if [ "$k" != file ]; then echo "$1 $k"
+          elif [ "$(wc -l < "$2")" -le 1 ] && { [ ! -s "$2" ] || grep -Eqx -- "$3" "$2"; }; then echo "$1 ours"
+          else echo "$1 foreign"
+          fi
+        }
+        one recipients "$REC" 'age1[02-9ac-hj-np-z]{10,100}'
+        one tg_token "$TOK" 'CHANGE_ME|[0-9]{5,}:[A-Za-z0-9_-]{20,}'
+        one tg_chat "$CHAT" 'CHANGE_ME|-?[0-9]{1,32}'
+        f=$LOGR; k=$(kind "$f")
+        if [ "$k" != file ]; then echo "logrotate $k"
+        elif [ "$(head -n 1 -- "$f")" = "$H" ]; then echo "logrotate ours"
+        elif [ "$(sha256sum < "$f" | cut -d' ' -f1)" = "$LR" ]; then echo "logrotate legacy"
+        else echo "logrotate foreign"
+        fi
+      - sh
+      - "{{ _l07_header }}"
+      - "{{ _l07_logrotate_legacy_sha256 }}"
+      - "{{ _l07_paths.rclone }}"
+      - "{{ _l07_paths.dir }}"
+      - "{{ _l07_paths.script }}"
+      - "{{ _l07_paths.recipients }}"
+      - "{{ _l07_paths.tg_token }}"
+      - "{{ _l07_paths.tg_chat }}"
+      - "{{ _l07_paths.logrotate }}"
+  environment:
+    LC_ALL: C
+  register: _l07_read
+  changed_when: false
+  check_mode: false
+
+- name: "Backups: remember what is there"
+  ansible.builtin.set_fact:
+    _l07_files: >-
+      {%- set out = {} -%}
+      {%- for ln in _l07_read.stdout_lines | select('match', '^[a-z_]+ (absent|ours|legacy|foreign|other)$') -%}
+      {%- set _ = out.update({ln.split(' ')[0]: ln.split(' ')[1]}) -%}
+      {%- endfor -%}
+      {{ out }}
+    _l07_now: >-
+      {{ _l07_read.stdout_lines | select('match', '^rclone (absent|ours|legacy|foreign|other)$')
+         | map('regex_replace', '^rclone ', '') | first | default('other') }}

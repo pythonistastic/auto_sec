@@ -1,0 +1,162 @@
+---
+# roles/03-firewall/tasks/vars.yml - ufw variable checks (U1). No host access.
+#
+# Imported at the start of preflight.yml (site.yml pre_tasks, tags always),
+# so a wrong value stops every run, whatever the tags, before anything
+# changes. site.yml may also import it earlier (import_role
+# tasks_from=vars): it only reads variables.
+#
+# Sets:
+#   _fw_state     str   keep | enabled
+#   _fw_egress    bool  egress_lockdown
+#   _fw_inbound   list  firewall_inbound, each {port, proto, from, rule} as strings
+#   _fw_egress_extra list egress_allow_extra, each {port, proto}
+
+- name: "ufw U1: firewall_state is keep or enabled"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - firewall_state is string
+      - firewall_state in ['keep', 'enabled']
+    fail_msg: >-
+      firewall_state is {{ firewall_state | string | truncate(40) }}{{ ' (a YAML boolean)' if firewall_state is boolean else '' }}.
+      Write keep (leave ufw as it is) or enabled (turn an inactive ufw on), not
+      true/false/yes/no. Nothing has been changed.
+
+- name: "ufw U1: firewall_ssh_rule, firewall_revert_seconds and egress_lockdown"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - firewall_ssh_rule is string
+      - firewall_ssh_rule in ['limit', 'allow', 'keep']
+      - firewall_revert_seconds | string is match('^[0-9]{1,4}$')
+      - (firewall_revert_seconds | int) >= 120 and (firewall_revert_seconds | int) <= 3600
+      - (egress_lockdown | default(false) | string | lower) in ['true', 'false', 'yes', 'no', '1', '0', 'on', 'off']
+    fail_msg: >-
+      firewall_ssh_rule must be limit, allow or keep (got {{ firewall_ssh_rule | string | truncate(40) }}),
+      firewall_revert_seconds a whole number from 120 to 3600 (got {{ firewall_revert_seconds | string | truncate(20) }})
+      and egress_lockdown true or false (got {{ egress_lockdown | default(false) | string | truncate(20) }}).
+      Nothing has been changed.
+
+# The office rule is prepended to ufw when this run turns it on.
+- name: "ufw U1: office_static_ip is one address or network (or empty)"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_office | length == 0 or _fw_office is match(_f2b_cidr_re)
+    fail_msg: >-
+      office_static_ip ("{{ _fw_office | truncate(60) }}") must be an IPv4/IPv6 address or network,
+      for example "203.0.113.7", or "" for none. Nothing has been changed.
+  vars:
+    _fw_office: "{{ office_static_ip | default('') | string | trim }}"
+
+# CI only (full-new-live): the login test after the turn-on counts as
+# failed, so the undo runs on a real runner. Honoured only for a host with
+# autosec_ci: true, on a GitHub Actions controller that also sets
+# AUTOSEC_CI_INJECT_FAILURE=ufw. Anywhere else it stops the run.
+- name: "ufw U1: autosec_ci_inject_ufw_fail is a CI-only test switch"
+  when: autosec_ci_inject_ufw_fail is defined
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - autosec_ci | default(false) | bool
+      - lookup('ansible.builtin.env', 'GITHUB_ACTIONS') == 'true'
+      - lookup('ansible.builtin.env', 'AUTOSEC_CI_INJECT_FAILURE') == 'ufw'
+    fail_msg: >-
+      autosec_ci_inject_ufw_fail is set. It is a test switch for auto_sec's own CI that makes
+      the login test after turning ufw on fail on purpose, and it works only there. Remove it.
+      Nothing has been changed.
+
+- name: "ufw U1: firewall_inbound, firewall_closed_ok and egress_allow_extra are lists"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - firewall_inbound is sequence and firewall_inbound is not string and firewall_inbound is not mapping
+      - firewall_inbound | length <= 64
+      - firewall_closed_ok is sequence and firewall_closed_ok is not string and firewall_closed_ok is not mapping
+      - egress_allow_extra | default([]) is sequence
+      - egress_allow_extra | default([]) is not string and egress_allow_extra | default([]) is not mapping
+      - egress_allow_extra | default([]) | length <= 64
+    fail_msg: >-
+      firewall_inbound and egress_allow_extra must be lists of at most 64 items, for example
+      [{port: 443}, {port: 51820, proto: udp}], and firewall_closed_ok a list like ["3000/tcp"].
+      Nothing has been changed.
+
+# Every item is checked here; the error list names each bad one. A port is
+# 1-65535 or "A:B" (A < B, with an explicit proto, as ufw requires).
+- name: "ufw U1: check every item"
+  ansible.builtin.set_fact:
+    _fw_var_errors: >-
+      {%- set errs = [] -%}
+      {%- set seen = [] -%}
+      {%- for spec in [['firewall_inbound', firewall_inbound, ['port', 'proto', 'from', 'rule']],
+                       ['egress_allow_extra', egress_allow_extra | default([]), ['port', 'proto']]] -%}
+      {%- for it in spec[1] -%}
+      {%- set where = spec[0] ~ ' item ' ~ loop.index -%}
+      {%- if it is not mapping -%}
+      {%- set _ = errs.append(where ~ ' is not a mapping like {port: 443}') -%}
+      {%- else -%}
+      {%- set extra = it.keys() | map('string') | reject('in', spec[2]) | list -%}
+      {%- if extra | length > 0 -%}{%- set _ = errs.append(where ~ ': unknown key(s) ' ~ (extra | join(', ') | truncate(60)) ~ ' (allowed: ' ~ (spec[2] | join(', ')) ~ ')') -%}{%- endif -%}
+      {%- set p = it.port | default('') | string -%}
+      {%- set proto = it.proto | default('tcp') | string -%}
+      {%- set src = it['from'] | default('') | string | trim -%}
+      {%- set ports = p.split(':') -%}
+      {%- if p is match('^[0-9]{1,5}$') -%}
+      {%- if (p | int) < 1 or (p | int) > 65535 -%}{%- set _ = errs.append(where ~ ': port ' ~ p ~ ' is not 1-65535') -%}{%- endif -%}
+      {%- elif p is match('^[0-9]{1,5}:[0-9]{1,5}$') -%}
+      {%- if (ports[0] | int) < 1 or (ports[1] | int) > 65535 or (ports[0] | int) >= (ports[1] | int) -%}{%- set _ = errs.append(where ~ ': range ' ~ p ~ ' must be A:B with 1 <= A < B <= 65535') -%}{%- endif -%}
+      {%- if 'proto' not in it -%}{%- set _ = errs.append(where ~ ': a port range needs proto (tcp or udp)') -%}{%- endif -%}
+      {%- else -%}
+      {%- set _ = errs.append(where ~ ': port must be a number 1-65535 or a range "A:B" (got ' ~ (p | truncate(20)) ~ ')') -%}
+      {%- endif -%}
+      {%- if proto not in ['tcp', 'udp'] -%}{%- set _ = errs.append(where ~ ': proto must be tcp or udp') -%}{%- endif -%}
+      {%- if spec[0] == 'firewall_inbound' -%}
+      {%- if (it.rule | default('allow') | string) not in ['allow', 'limit'] -%}{%- set _ = errs.append(where ~ ': rule must be allow or limit') -%}{%- endif -%}
+      {%- if src | length > 0 and (src is not match(_f2b_cidr_re) or src in ['0.0.0.0/0', '::/0', '0::/0']) -%}
+      {%- set _ = errs.append(where ~ ': from must be one IPv4/IPv6 address or network (leave from out for every address)') -%}
+      {%- endif -%}
+      {%- if proto == 'tcp' and (p is match('^[0-9]{1,5}$') and (p | int) == (ssh_port | int)
+            or p is match('^[0-9]{1,5}:[0-9]{1,5}$') and (ports[0] | int) <= (ssh_port | int) <= (ports[1] | int)) -%}
+      {%- set _ = errs.append(where ~ ': port ' ~ p ~ '/tcp is SSH (ssh_port); use firewall_ssh_rule for it') -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- set k = spec[0] ~ ' ' ~ p ~ '/' ~ proto ~ ' ' ~ src -%}
+      {%- if k in seen -%}{%- set _ = errs.append(where ~ ': ' ~ p ~ '/' ~ proto ~ (' from ' ~ src if src else '') ~ ' is listed twice') -%}{%- endif -%}
+      {%- set _ = seen.append(k) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- for c in firewall_closed_ok -%}
+      {%- if c is not string or c is not match('^[0-9]{1,5}/(tcp|udp)$') or (c.split('/')[0] | int) < 1 or (c.split('/')[0] | int) > 65535 -%}
+      {%- set _ = errs.append('firewall_closed_ok item ' ~ loop.index ~ ' must look like "3000/tcp"') -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ errs }}
+
+- name: "ufw U1: firewall_inbound, firewall_closed_ok and egress_allow_extra items are valid"
+  ansible.builtin.assert:
+    quiet: true
+    that: _fw_var_errors | length == 0
+    fail_msg: >-
+      {{ _fw_var_errors | join('; ') | regex_replace('[{}]', '?') }}. Example:
+      firewall_inbound: [{port: 443}, {port: 51820, proto: udp}, {port: "6000:6010", proto: tcp},
+      {port: 5432, from: "203.0.113.0/24"}]. Nothing has been changed.
+
+- name: "ufw U1: the checked values"
+  ansible.builtin.set_fact:
+    _fw_state: "{{ firewall_state }}"
+    _fw_egress: "{{ (egress_lockdown | default(false) | string | lower) in ['true', 'yes', '1', 'on'] }}"
+    _fw_inbound: >-
+      {%- set out = [] -%}
+      {%- for it in firewall_inbound -%}
+      {%- set _ = out.append({'port': it.port | string, 'proto': it.proto | default('tcp') | string,
+                              'from': it['from'] | default('') | string | trim,
+                              'rule': it.rule | default('allow') | string}) -%}
+      {%- endfor -%}
+      {{ out }}
+    _fw_egress_extra: >-
+      {%- set out = [] -%}
+      {%- for it in egress_allow_extra | default([]) -%}
+      {%- set _ = out.append({'port': it.port | string, 'proto': it.proto | default('tcp') | string}) -%}
+      {%- endfor -%}
+      {{ out }}

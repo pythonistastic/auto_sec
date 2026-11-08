@@ -1,0 +1,39 @@
+---
+# Role 08 (detection) defaults.
+#
+# auto_sec 0.6 does not manage detection. Role 08 installs nothing and
+# writes nothing; it only looks for the audit rules file that auto_sec
+# 0.1-0.5 wrote and warns when it is still there (tasks/legacy.yml). The
+# rewritten detection comes in 0.7. Role 08 has no settings in 0.6.
+
+# --- Role-internal constants. These are not settings: do not override. ---
+
+# Where augenrules reads its rule files.
+_l08_rules_dir: /etc/audit/rules.d
+
+# The audit rules file each old release wrote, and the SHA-256 of its
+# content after the authorized_keys line is normalized (below). These are
+# the only two contents any release ever wrote (rendered from every tag,
+# v0.1.0 to 0.5, with ansible-core 2.16 and 2.21: tests/legacy).
+#   0.1.0-0.2.1  hardening.rules, always with the authorized_keys line
+#   0.3.0-0.5    90-autosec.rules, with the line only when the deploy
+#                user's authorized_keys existed
+# Any other content is yours. auto_sec 0.6 never deletes either file.
+_l08_legacy_files:
+  - name: hardening.rules
+    versions: "0.1-0.2"
+    sha256:
+      - 6c614ce52a4777ec85a62deb66930ae4462e97c1c9c813716db2203bb5e9ba6d
+  - name: 90-autosec.rules
+    versions: "0.3-0.5"
+    sha256:
+      - 6c614ce52a4777ec85a62deb66930ae4462e97c1c9c813716db2203bb5e9ba6d
+      - 1193e516be79c4c9b8b4a025a8cce29546122222f3f60f3579a0349819409931
+
+# The one line that differs between servers: deploy_user's name. It is
+# replaced by @USER@ before hashing.
+_l08_ak_re: '(?m)^-w /home/[^/\n]*/\.ssh/authorized_keys -p wa -k ssh_trust$'
+_l08_ak_norm: '-w /home/@USER@/.ssh/authorized_keys -p wa -k ssh_trust'
+
+# The old files are about 1 KB. A larger file is yours and is not read.
+_l08_max_bytes: 4096

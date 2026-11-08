@@ -12,15 +12,21 @@
 #   check    the undo must still be armed, by _ssh_guard_id.
 #   disarm   keep the change (rc 3: the timer already put the files back).
 #   revert   put the files back now (never fails the task; sets
-#            _ssh_guard_revert_rc).
+#            _ssh_guard_revert_rc). rc 0 also when the timer already did.
+#   status   read-only: registers _ssh_guard_status and sets
+#            _ssh_guard_still_pending (the change of _ssh_guard_id is still
+#            waiting for its undo). Role 03 reads it right before ufw goes
+#            on (U8) and in its rescue, before the revert.
 #
 # Guard CLI (files/auto-sec-ssh-guard, installed as _ssh_guard_bin):
-#   arm <id> <deadline_epoch_utc> [--f2b-ignore <ip>] -- <path>...
+#   arm <id> <deadline_epoch_utc> [--f2b-ignore <ip>] [--ufw] -- <path>...
+#     (--ufw: role 03 turning ufw on; a revert runs `ufw --force disable`
+#     first, and sshd is checked and reloaded only for paths in /etc/ssh/)
 #     rc 0 armed, 7 another change pending, 8 current config fails sshd -t,
 #     9 deadline out of range, 2 usage
-#   check <id>   rc 0 armed by <id>
+#   check <id>   rc 0 armed by <id>; prints "armed <id>: <n>s left"
 #   disarm <id>  rc 0 disarmed, 3 already reverted, 4 not pending
-#   revert <id> | revert --boot | status
+#   revert <id> | revert --boot | status (line 1: "idle" or "pending <id>")
 
 # --- fresh ----------------------------------------------------------------
 
@@ -266,3 +272,22 @@
   ansible.builtin.set_fact:
     _ssh_guard_revert_rc: "{{ _ssh_guard_revert.rc | default(-1) }}"
     _ssh_guard_revert_err: "{{ _ssh_guard_revert.stderr | default('') | regex_replace('[{}]', '?') | trim }}"
+
+# --- status ---------------------------------------------------------------
+
+- name: "SSH guard: is this run's change still waiting for its undo? (read-only)"
+  when: _ssh_guard_action == 'status'
+  ansible.builtin.command:
+    argv: ["{{ _ssh_guard_bin }}", status]
+  register: _ssh_guard_status
+  changed_when: false
+  failed_when: false
+
+# A status that could not be read counts as pending: the caller then goes
+# by the revert's own exit code.
+- name: "SSH guard: remember the answer"
+  when: _ssh_guard_action == 'status'
+  ansible.builtin.set_fact:
+    _ssh_guard_still_pending: >-
+      {{ (_ssh_guard_status.rc | default(1)) != 0
+         or (_ssh_guard_status.stdout_lines | default([]) | first | default('')) == 'pending ' ~ _ssh_guard_id }}

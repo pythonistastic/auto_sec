@@ -1,0 +1,127 @@
+---
+# roles/09-watcher/tasks/legacy.yml
+#
+# Role 09 in auto_sec 0.6: read-only. It installs nothing, writes nothing,
+# starts and stops nothing. Detection returns, rewritten, in 0.7.
+#
+# site.yml imports this file in pre_tasks (tags always), after role 08's
+# legacy.yml, and includes it again as layer 09 (tag watcher). Only the
+# first pass works; the second does nothing. Also runs in --check.
+# Detectors in active mode were already refused before fact gathering
+# (legacy_active.yml, R00-3).
+#
+# W09-1: a warning when the files of auto_sec 0.1-0.5's detectors are
+# still there: /opt/watcher, /opt/detect, their four unit files in
+# /etc/systemd/system, or the 5-minute audit scan in root's crontab (the
+# line Ansible's cron module wrote above it). Those detectors do not work
+# as documented, so the warning asks you to remove them by hand.
+# N09-1: the 0.1-0.5 detector variables that are set do nothing in 0.6.
+#
+# Trust boundary (SECURITY.md): only names and states are read. Root's
+# crontab is searched with grep -Fx for the one fixed line (yes or no), so
+# nothing of it leaves the host. Unit states are compared with fixed words.
+#
+# Facts set on every host:
+#   _plan_09        list  [] (role 09 changes nothing in 0.6)
+#   _l09_role_runs  bool  the tags select role 09 ("watcher" or "detection")
+#   _l09_found      list  what was found, as shown in W09-1
+#   _l09_report     str   one line for the report (role 10)
+#
+# The host reads run only when the tags select role 09, like the other
+# role preflights. N09-1 needs no host and runs with every tag.
+
+- name: "Watcher (0.6: not managed): look for auto_sec 0.1-0.5's detectors"
+  when: not (_l09_done | default(false) | bool)
+  block:
+    - name: "Watcher legacy: start every role 09 fact from a safe value"
+      ansible.builtin.set_fact:
+        _plan_09: []
+        _l09_role_runs: >-
+          {{ (('all' in ansible_run_tags) or ('tagged' in ansible_run_tags)
+              or ('watcher' in ansible_run_tags) or ('detection' in ansible_run_tags))
+             and ('watcher' not in ansible_skip_tags) and ('detection' not in ansible_skip_tags)
+             and ('tagged' not in ansible_skip_tags) and ('all' not in ansible_skip_tags) }}
+        _l09_found: []
+        _l09_report: "not managed by auto_sec 0.6"
+
+    - name: "Watcher legacy N09-1: detector variables that do nothing in 0.6"
+      when: _l09_set_vars | length > 0
+      ansible.builtin.debug:
+        msg: >-
+          INFO: {{ _l09_set_vars | join(', ') }} {{ 'is' if (_l09_set_vars | length == 1) else 'are' }}
+          set but {{ 'does' if (_l09_set_vars | length == 1) else 'do' }} nothing in 0.6 (detection
+          returns in 0.7).
+      vars:
+        _l09_set_vars: "{{ query('varnames', '^(' ~ (_l09_ignored_vars | join('|')) ~ ')$') | sort }}"
+
+    - name: "Watcher legacy: directories and unit files of 0.1-0.5"
+      when: _l09_role_runs | bool
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      loop: "{{ [_l09_watcher_dir, _l09_detect_dir] + (_l09_units | map('regex_replace', '^', _l09_unit_dir ~ '/') | list) }}"
+      register: _l09_st
+
+    - name: "Watcher legacy: the 5-minute audit scan in root's crontab"
+      when: _l09_role_runs | bool
+      ansible.builtin.command:
+        argv: [grep, -Fxq, -e, "{{ _l09_cron_marker }}", --, "{{ _l09_crontab }}"]
+      register: _l09_cron
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Watcher legacy: which detectors run"
+      when:
+        - _l09_role_runs | bool
+        - >-
+          _l09_st.results | default([]) | selectattr('stat', 'defined') | selectattr('stat.exists')
+          | map(attribute='item') | map('basename') | select('in', _l09_units) | list | length > 0
+      ansible.builtin.command:
+        argv: "{{ ['systemctl', 'is-active'] + _l09_units }}"
+      register: _l09_units_state
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Watcher legacy: what was found, with the state of each unit"
+      when:
+        - _l09_role_runs | bool
+        - item.stat.exists | default(false)
+      ansible.builtin.set_fact:
+        _l09_found: >-
+          {{ _l09_found + [item.item ~ ((' (' ~ _l09_state ~ ')')
+             if _l09_state not in (_l09_stopped_words + ['']) else '')] }}
+      vars:
+        _l09_state: >-
+          {{ ((_l09_units_state.stdout_lines | default([]))[_l09_units.index(item.item | basename)] | default(''))
+             if (item.item | basename) in _l09_units else '' }}
+      loop: "{{ _l09_st.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: "Watcher legacy: the crontab line"
+      when:
+        - _l09_role_runs | bool
+        - (_l09_cron.rc | default(1)) == 0
+      ansible.builtin.set_fact:
+        _l09_found: "{{ _l09_found + ['root crontab: ' ~ _l09_cron_marker] }}"
+
+    - name: "Watcher legacy W09-1: auto_sec 0.1-0.5's detectors are still there"
+      when: _l09_found | length > 0
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: auto_sec 0.1-0.5's detectors are on {{ inventory_hostname }}
+          ({{ _l09_found | join(', ') }}). They do not work as documented: the ransomware canary never
+          alerts, the 5-minute audit scan worked once, and recon fires on every auto_sec run. Remove
+          them by hand: README "Removing the 0.1-0.5 detection suite".
+
+    - name: "Watcher legacy: report line, and mark this pass done"
+      ansible.builtin.set_fact:
+        _l09_report: >-
+          {{ 'not managed by auto_sec 0.6' ~ ('; files of the auto_sec 0.1-0.5 detectors are still there'
+             if (_l09_found | length > 0) else '') }}
+        _l09_done: true
