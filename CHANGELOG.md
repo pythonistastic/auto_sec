@@ -211,28 +211,16 @@ server that already exists.
 - The key test covers only the controller's path: its key and its IP.
   VS Code and other clients can still break in stage 2. Test them
   yourself first.
-- **Debian 12 and 13 are CI-tested only.** Their real OpenSSH packages
-  are checked, unprivileged, for how they read the config. There has
-  been no live run on Debian.
-- **Verified only in a lab** (OpenSSH builds unpacked from the distro
-  packages and run unprivileged in WSL, not on a real server):
-  - a keep-everything file changes no `sshd -T` value, on five builds,
-    with stock and cloud-image layouts;
-  - stage 2 changes exactly `permitrootlogin` and
-    `passwordauthentication`;
-  - `sshd -T` works for an account that does not exist yet;
-  - the undo timer's absolute deadline holds across a `daemon-reload`
-    (tested with the user manager, not the system one);
-  - open sessions survive a reload.
-- **Not yet verified on a real server:** the boot-time undo after a
-  reboot; migrating a real 0.1–0.3 host; the "files changed after the
-  last load" check on a real
-  `ssh.service` (Ubuntu 22.04's systemd 249 rejects
-  `systemctl show --timestamp=unix`, so there the check falls back to
-  parsing the plain timestamp, tested only with a stub); the fail2ban ignore; test retries
-  together with ufw's `limit` rule; the fwknop role end to end; the
-  ufw-rule and "sshd is ssh.service's main process" checks against real
-  `ufw show added` and `ss -p` output (lab stubs only).
+- **Tested on:** GitHub's Ubuntu 22.04 (ssh.service) and 24.04
+  (ssh.socket) runners with a real sshd and systemd, on ansible-core
+  2.16 and current, including a change that locks root out (undone),
+  and a run killed mid-change (the timer reverts it, also across a
+  `daemon-reload`). And on one real Ubuntu 24.04 server: stage 1, plus
+  a reboot inside the undo window (the boot unit restored the file
+  before `ssh.socket` started).
+- **Not tested live:** Debian 12 and 13 (only their OpenSSH packages,
+  unprivileged), stage 2 on a real server, migrating a real 0.1–0.3
+  host, and the fwknop role.
 - `--check` of a **full** run fails on a fresh server at role 03, which
   needs ufw and fail2ban already installed (older than 0.4.0). Preview
   the SSH part with `--check --diff --tags ssh`.
