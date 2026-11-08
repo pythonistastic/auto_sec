@@ -139,11 +139,28 @@ play() { # log-name ansible-playbook-args...: returns its rc
 }
 
 # --- setup and baseline -----------------------------------------------------------
+# The runner image's own sudo files (as in tests/full-live/lib.sh): role
+# 01 refuses (R01-A5) while `visudo -c` fails; a wrong mode or owner left
+# by the image is fixed the way an operator would.
+sudo_ready() {
+  local out f
+  out=$(sudo -n visudo -c 2>&1) && return 0
+  echo "INFO  visudo -c on this runner: $(printf '%s\n' "$out" | grep -v 'parsed OK$' | head -n 5 | paste -sd' ' -)"
+  printf '%s\n' "$out" | sed -n 's/^\(\/etc\/sudoers[^:]*\): bad permissions.*$/\1/p' | while IFS= read -r f; do
+    sudo -n chmod 0440 -- "$f" && echo "INFO  chmod 0440 $f (runner image)"
+  done
+  printf '%s\n' "$out" | sed -n 's/^\(\/etc\/sudoers[^:]*\): wrong owner.*$/\1/p' | while IFS= read -r f; do
+    sudo -n chown root:root -- "$f" && echo "INFO  chown root:root $f (runner image)"
+  done
+  out=$(sudo -n visudo -c 2>&1) \
+    || die "visudo -c still fails on this runner: $(printf '%s\n' "$out" | grep -v 'parsed OK$' | head -n 5 | paste -sd' ' -)"
+}
 setup() {
   echo "== setup"
   for _ in 1 2 3; do sudo -n apt-get update -qq && break; sleep 10; done
   sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unattended-upgrades \
     || die "cannot install unattended-upgrades"
+  sudo_ready
   ORIG_HOST=$(hostnamectl --static status)
   ORIG_TZ=$(timedatectl show -p Timezone --value)
   cat >"$INV" <<EOF

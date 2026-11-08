@@ -40,8 +40,11 @@ def git(root, *args):
 
 
 def legacy_files(root):
-    """{'scanner': {sha: bytes}, 'service': ..., 'timer': ...} from git history, or None."""
-    log = git(root, "log", "--format=%h", "--", "roles/11-cve-watch")
+    """{'scanner': {sha: bytes}, 'service': ..., 'timer': ...} that auto_sec 0.2-0.5 wrote:
+    git history up to the v0.5.0 tag (0.6 writes its own files), or None."""
+    if git(root, "rev-parse", "-q", "--verify", "v0.5.0^{commit}").returncode != 0:
+        return None
+    log = git(root, "log", "--format=%h", "v0.5.0", "--", "roles/11-cve-watch")
     commits = log.stdout.decode().split()
     if log.returncode != 0 or len(commits) < 2:
         return None
@@ -78,7 +81,7 @@ def main():
 
     legacy = legacy_files(a.root)
     if legacy is None:
-        print("SKIP  h1-h3 and p2: no git history of roles/11-cve-watch here (CI: fetch-depth: 0)")
+        print("SKIP  h1-h3 and p2: no v0.5.0 tag or no git history of roles/11-cve-watch here (CI: fetch-depth: 0)")
     else:
         for n in ("scanner", "service", "timer"):
             check("h %s: the known sha256 are exactly the git history's files (%d)" % (n, len(legacy[n])),

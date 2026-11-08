@@ -100,7 +100,39 @@ play() {
   shift
   (cd "$ROOT" && ansible-playbook -i "$INV" site.yml "$@") >"$LOGS/$name.log" 2>&1 || rc=$?
   echo "      ansible-playbook rc=$rc, log $LOGS/$name.log"
+  if [ "$rc" != 0 ]; then
+    grep -E '^(fatal|failed):|^\[ERROR\]' "$LOGS/$name.log" | head -n 4 | cut -c1-500 | sed 's/^/      | /'
+  fi
   return "$rc"
+}
+
+# The runner image's own sudo files. Role 01 refuses (R01-A5) while
+# `visudo -c` fails; a file the image left with a wrong mode or owner is
+# fixed the way an operator would (chmod 0440, chown root:root), anything
+# else stops the test with visudo's own words.
+sudo_ready() {
+  local out f
+  out=$(sudo -n visudo -c 2>&1) && return 0
+  info setup "visudo -c on this runner: $(printf '%s\n' "$out" | grep -v 'parsed OK$' | head -n 5 | paste -sd' ' -)"
+  printf '%s\n' "$out" | sed -n 's/^\(\/etc\/sudoers[^:]*\): bad permissions.*$/\1/p' | while IFS= read -r f; do
+    sudo -n chmod 0440 -- "$f" && info setup "chmod 0440 $f (runner image)"
+  done
+  printf '%s\n' "$out" | sed -n 's/^\(\/etc\/sudoers[^:]*\): wrong owner.*$/\1/p' | while IFS= read -r f; do
+    sudo -n chown root:root -- "$f" && info setup "chown root:root $f (runner image)"
+  done
+  out=$(sudo -n visudo -c 2>&1) \
+    || die "visudo -c still fails on this runner: $(printf '%s\n' "$out" | grep -v 'parsed OK$' | head -n 5 | paste -sd' ' -)"
+}
+
+# What role 02's freshness check (P6) will read: when ssh.service started
+# and the reloads ("Received SIGHUP") its journal still has.
+ssh_load_info() {
+  local start hups usage
+  start=$(systemctl show -p ExecMainStartTimestamp --value ssh.service 2>/dev/null)
+  hups=$(sudo -n journalctl -u ssh.service -o short-iso --no-pager 2>/dev/null \
+    | grep -F 'Received SIGHUP; restarting.' | cut -d' ' -f1 | tail -n 3 | paste -sd' ' -)
+  usage=$(sudo -n journalctl --disk-usage 2>/dev/null | tr -d '\n')
+  info "$1" "ssh.service started ${start:-?}; last reloads in its journal: ${hups:-none}; $usage"
 }
 
 # changed_tasks log-name: the TASK names that reported "changed", one per line.
@@ -125,12 +157,17 @@ net.ipv4.conf.all.rp_filter net.ipv4.ip_forward kernel.dmesg_restrict'
 # symlinks, packages, accounts, running services (MainPID and start time),
 # firewall rules (without counters) and counters, audit rules, kernel
 # values, root's crontab, apt's history.
+# The runner image's tool folders under /opt (gigabytes; auto_sec never
+# touches them) are left out: hashing them took 15-20 minutes per snapshot.
+OPT_SKIP='/opt/(hostedtoolcache|microsoft|google|az|pipx|pipx_bin|actionarchivecache|mssql-tools)(/|$)'
 snapshot() {
   local d=$WORK/snap-$1 units
   mkdir -p "$d"
-  sudo -n find /etc /opt /usr/local/sbin /usr/local/bin /var/lib/auto-sec /root/.ssh -xdev -type f -print0 2>/dev/null \
+  sudo -n find /etc /opt /usr/local/sbin /usr/local/bin /var/lib/auto-sec /root/.ssh -xdev \
+    -regextype posix-extended -regex "$OPT_SKIP" -prune -o -type f -print0 2>/dev/null \
     | sudo -n xargs -0 -r sha256sum 2>/dev/null | sort -k2 >"$d/files"
-  sudo -n find /etc /opt -xdev -type l -printf '%p -> %l\n' 2>/dev/null | sort >"$d/links"
+  sudo -n find /etc /opt -xdev -regextype posix-extended -regex "$OPT_SKIP" -prune -o -type l -printf '%p -> %l\n' 2>/dev/null \
+    | sort >"$d/links"
   dpkg-query -W -f='${Package}:${Architecture} ${Version} ${db:Status-Abbrev}\n' | sort >"$d/packages"
   getent passwd | sort >"$d/passwd"
   getent group | sort >"$d/group"

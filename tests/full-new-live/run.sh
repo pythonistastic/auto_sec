@@ -48,6 +48,7 @@ setup() {
   echo "== setup (a new server)"
   apt_update || die "apt-get update"
   ssh_setup
+  sudo_ready
   apt_purge ufw fail2ban
   sudo -n rm -rf /etc/ufw /etc/fail2ban
   if id deploy >/dev/null 2>&1; then sudo -n userdel -r deploy >/dev/null 2>&1 || die "userdel deploy"; fi

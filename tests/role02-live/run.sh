@@ -333,10 +333,14 @@ case_g() {
       fail g "the refusal names neither port 2222 nor 10-ci-port.conf"
     fi
   fi
-  if grep -Eq 'TASK \[(01-base|03-firewall) :' "$LOGS/g-port.log"; then
-    fail g "a role task ran after the refusal"
+  # 0.6 also runs the read-only checks of roles 01 and 03 in pre_tasks: the
+  # refusal must come before any change, and no task may run after it.
+  if grep -q '^changed: \[' "$LOGS/g-port.log"; then
+    fail g "a task reported a change before the refusal"
+  elif awk '/^fatal: / { f = 1; next } f && /^TASK \[/ { bad = 1 } END { exit !bad }' "$LOGS/g-port.log"; then
+    fail g "a task ran after the refusal"
   else
-    pass g "refused in pre_tasks: no role 01/03 task ran"
+    pass g "refused before any change; no task ran after the refusal"
   fi
   expect g "drop-in unchanged" "$(dropin_sum)" absent
   expect g "undo guard" "$(guard_state)" idle

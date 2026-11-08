@@ -19,7 +19,8 @@ jobs:
       - name: Install Ansible and ansible-lint
         run: pip install ansible ansible-lint
       - name: Install Galaxy collections
-        run: ansible-galaxy collection install -r requirements.yml
+        run: |
+          for i in 1 2 3; do ansible-galaxy collection install -r requirements.yml && exit 0; sleep 15; done; exit 1
       - name: Syntax check main playbook
         run: ansible-playbook site.yml -i inventory/hosts.yml --syntax-check
       - name: Syntax check restore-test playbook
@@ -143,7 +144,8 @@ jobs:
           sudo apt-get install -y -qq ansible
           ansible --version
       - name: Install pinned Galaxy collections
-        run: ansible-galaxy collection install -r requirements.yml
+        run: |
+          for i in 1 2 3; do ansible-galaxy collection install -r requirements.yml && exit 0; sleep 15; done; exit 1
       - name: Syntax check with distro ansible-core
         run: ansible-playbook site.yml -i inventory/hosts.yml --syntax-check
       - name: Syntax check restore-test playbook
@@ -333,7 +335,7 @@ jobs:
         run: |
           pip install "$ANSIBLE_CORE_SPEC"
           ansible --version
-          ansible-galaxy collection install -r requirements.yml
+          for i in 1 2 3; do ansible-galaxy collection install -r requirements.yml && break; [ "$i" = 3 ] && exit 1; sleep 15; done
       - name: Live role 02 tests against this runner
         env:
           SSH_MODE: ${{ matrix.ssh_mode }}
@@ -446,7 +448,7 @@ jobs:
         run: |
           pip install ansible-core
           ansible --version
-          ansible-galaxy collection install -r requirements.yml
+          for i in 1 2 3; do ansible-galaxy collection install -r requirements.yml && break; [ "$i" = 3 ] && exit 1; sleep 15; done
       - name: Live fail2ban tests against this runner
         run: bash tests/fail2ban/live/run.sh
       - name: Keep the logs
@@ -491,7 +493,7 @@ jobs:
         run: |
           pip install "$ANSIBLE_CORE_SPEC"
           ansible --version
-          ansible-galaxy collection install -r requirements.yml
+          for i in 1 2 3; do ansible-galaxy collection install -r requirements.yml && break; [ "$i" = 3 ] && exit 1; sleep 15; done
       - name: Live role 01 tests against this runner
         run: bash tests/base/live/run.sh
       - name: Keep the logs
@@ -522,7 +524,7 @@ jobs:
           pip install ansible-core
           python -m venv "$RUNNER_TEMP/ac216"
           "$RUNNER_TEMP/ac216/bin/pip" install -q "ansible-core>=2.16,<2.17"
-          ansible-galaxy collection install -r requirements.yml
+          for i in 1 2 3; do ansible-galaxy collection install -r requirements.yml && break; [ "$i" = 3 ] && exit 1; sleep 15; done
       - name: Run-wide checks and the plan
         run: >
           bash tests/site/semantics/run.sh
@@ -683,7 +685,7 @@ jobs:
         run: |
           pip install ansible-core
           ansible --version
-          ansible-galaxy collection install -r requirements.yml
+          for i in 1 2 3; do ansible-galaxy collection install -r requirements.yml && break; [ "$i" = 3 ] && exit 1; sleep 15; done
       - name: Full run on an existing server
         run: bash tests/full-adopt-live/run.sh
       - name: Keep the logs
@@ -712,7 +714,7 @@ jobs:
         run: |
           pip install ansible-core
           ansible --version
-          ansible-galaxy collection install -r requirements.yml
+          for i in 1 2 3; do ansible-galaxy collection install -r requirements.yml && break; [ "$i" = 3 ] && exit 1; sleep 15; done
       - name: Full run on a new server
         run: bash tests/full-new-live/run.sh
       - name: Keep the logs
@@ -771,7 +773,7 @@ jobs:
         run: |
           pip install ansible-core
           ansible --version
-          ansible-galaxy collection install -r requirements.yml
+          for i in 1 2 3; do ansible-galaxy collection install -r requirements.yml && break; [ "$i" = 3 ] && exit 1; sleep 15; done
       - name: Old detectors against a 0.6 run
         run: bash tests/full-legacy-live/run.sh
       - name: Keep the logs

@@ -102,18 +102,23 @@ else
 fi
 
 echo "== case 2: no python3-apt, no unattended-upgrades"
-sudo -n env DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq hello python3-apt unattended-upgrades >"$LOGS/c2-purge.log" 2>&1 \
-  || fail 2 "cannot purge (log $LOGS/c2-purge.log)"
-expect 2 "python3-apt absent" "$(installed python3-apt)" no
-rc=0
-play c2-check --check || rc=$?
-expect 2 "--check: rc" "$rc" 0
-expect 2 "--check: hello not installed" "$(installed hello)" no
-rc=0
-play c2 || rc=$?
-expect 2 "real run: rc" "$rc" 0
-expect 2 "real run: hello installed" "$(installed hello)" yes
-expect 2 "python3-apt still absent" "$(installed python3-apt)" no
+# Some runner images cannot drop python3-apt (other packages of the image
+# need it; apt: "pkgProblemResolver::Resolve generated breaks"). The case
+# is then skipped on that image; the other image still runs it.
+if sudo -n env DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq hello python3-apt unattended-upgrades >"$LOGS/c2-purge.log" 2>&1; then
+  expect 2 "python3-apt absent" "$(installed python3-apt)" no
+  rc=0
+  play c2-check --check || rc=$?
+  expect 2 "--check: rc" "$rc" 0
+  expect 2 "--check: hello not installed" "$(installed hello)" no
+  rc=0
+  play c2 || rc=$?
+  expect 2 "real run: rc" "$rc" 0
+  expect 2 "real run: hello installed" "$(installed hello)" yes
+  expect 2 "python3-apt still absent" "$(installed python3-apt)" no
+else
+  echo "SKIP  [2] apt cannot remove python3-apt on this runner image: $(tail -n 1 "$LOGS/c2-purge.log" | cut -c1-200)"
+fi
 
 echo "== cleanup"
 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq hello >/dev/null 2>&1

@@ -110,6 +110,7 @@ EOF
   play setup-stage1 -l "$HOST" --tags ssh -e autosec_require_approval=false || die "SSH stage 1 (setup) failed"
   sudo -n test -f /etc/ssh/sshd_config.d/00-autosec.conf || die "setup: no 00-autosec.conf after stage 1"
   rm -f "$REPORT"
+  ssh_load_info setup
 }
 
 case_a() {
@@ -166,6 +167,7 @@ case_c() {
 
 setup
 snapshot before
+ssh_load_info a
 echo "== case a"; case_a
 echo "== case b"; case_b
 echo "== case c"; case_c

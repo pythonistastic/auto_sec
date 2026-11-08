@@ -98,10 +98,8 @@
       checked: "{{ _base_sudo_scan | default(false) | bool }}"
       visudo_rc: "{{ _base_s_visudo.rc | default(-1) }}"
       visudo_err: >-
-        {{ (_base_s_visudo.stderr_lines | default([]) + _base_s_visudo.stdout_lines | default([]))
-           | reject('search', 'parsed OK$') | select('search', '(error|unable|Permission|not found)')
-           | map('regex_replace', '[^ -~]', '?') | map('regex_replace', '[{}]', '?')
-           | first | default('exit ' ~ (_base_s_visudo.rc | default(-1)), true) | truncate(200) }}
+        {{ (_base_s_vlines | select('search', '(error|unable|Permission|not found)') | list
+            + _base_s_vlines + ['exit ' ~ (_base_s_visudo.rc | default(-1))]) | first | truncate(200) }}
       includedir: "{{ 'I yes' in _base_s_lines }}"
       user_lines: >-
         {{ _base_s_lines | select('match', '^U [0-9]+ \S') | map('regex_replace', '^U ([0-9]+) (.*)$', '\2:\1') | unique | list }}
@@ -117,6 +115,13 @@
       bad_groups: >-
         {{ _base_s_group_names | reject('match', _base_user_re) | map('regex_replace', '[^ -~]|[{}]', '?') | list }}
   vars:
+    # visudo -c's own lines without "parsed OK": an error line is shown
+    # first, else any other line (for example "<file>: bad permissions,
+    # should be mode 0440"), else the exit code.
+    _base_s_vlines: >-
+      {{ (_base_s_visudo.stderr_lines | default([]) + _base_s_visudo.stdout_lines | default([]))
+         | reject('search', 'parsed OK$') | reject('match', '^\s*$')
+         | map('regex_replace', '[^ -~]', '?') | map('regex_replace', '[{}]', '?') | list }}
     # File names come from the host: only these characters are shown.
     _base_s_lines: >-
       {{ ((_base_s_scan.stdout_lines | default([])) if (_base_sudo_scan | default(false) | bool) else [])
