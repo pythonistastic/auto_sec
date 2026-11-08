@@ -10,6 +10,10 @@ changes. Treat it as early-stage — see the
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.5.0] - 2026-11-08
+
 **fail2ban, automatic updates, hostname and timezone (#2, #3, #7).** A
 full run no longer replaces your fail2ban or update files, no longer
 turns on automatic reboots, and leaves the hostname and timezone alone.
@@ -741,7 +745,8 @@ Backups/restore, fwknop, app/DB/TLS roles, Telegram delivery, `active`
 mode, and non-Ubuntu-22.04 targets are shipped but **not yet validated
 end-to-end**. See [docs/RETROSPECTIVE.md](docs/RETROSPECTIVE.md).
 
-[Unreleased]: https://github.com/pythonistastic/auto_sec/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/pythonistastic/auto_sec/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.5.0
 [0.4.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.4.0
 [0.3.2]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.3.2
 [0.3.1]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.3.1
