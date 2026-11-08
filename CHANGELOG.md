@@ -135,16 +135,23 @@ personal research project, not a production service; read **Upgrading
   Ubuntu 24.04).
 - Sudo rules from LDAP/sssd, Runas aliases and `ALL` user lists are not
   scanned. A line with a netgroup (`+name`) counts as naming the account.
-- The ufw turn-on, and the undo guard's `--ufw` mode with its
-  `Before=ufw.service` boot ordering, were checked only in a lab (the ufw
-  code of Ubuntu 22.04/24.04 and Debian 12/13), never on a real server
-  yet.
+- The ufw turn-on and the undo guard's `--ufw` mode were checked in a lab
+  (the ufw code of Ubuntu 22.04/24.04 and Debian 12/13) and on GitHub's
+  Ubuntu 24.04 runner, never on a real server yet. Its
+  `Before=ufw.service` boot ordering has not been tested with a reboot.
 - Detection is not managed until 0.7.
-- 0.4's and 0.5's live jobs (`role02-live`, `fail2ban-live`, `base-live`)
-  ran on GitHub's runners for those releases, and 0.4's SSH undo once on
-  a real server with a reboot. 0.6's new live jobs (`full-adopt-live`,
-  `full-new-live`, `apt-guard-live`, `legacy-live`) and its changes to
-  the old ones have not run yet.
+- Tested on GitHub's Ubuntu 22.04 and 24.04 runners: every live job,
+  including a full run on an existing server set up like the canary
+  (`full-adopt-live`) and on a new server (`full-new-live`). Not yet run
+  on a real server, and not tested live on Debian.
+- Role 02's freshness check (P6) looks for sshd's last reload in the
+  journal. If the journal no longer has it, the run refuses and asks you
+  to reload sshd once. On a busy server that can happen quickly: in a
+  test on Ubuntu 22.04, an audit rule for every root command wrote
+  hundreds of MB into the journal in minutes.
+- Role 01 writes no sudo rule while `visudo -c` fails (R01-A5), also for
+  a sudo file that only has mode 0644 (sudo itself accepts it; GitHub's
+  runners ship one). The message shows visudo's own line.
 
 ## [0.5.0] - 2026-11-08
 

@@ -8,7 +8,7 @@
 # hello, python3-apt and unattended-upgrades. It refuses to start anywhere
 # else.
 #
-# UNVERIFIED: this script has not run on a runner yet.
+# Ran green on GitHub's Ubuntu 22.04 and 24.04 runners (0.6).
 #
 # Cases:
 #   1  hello installed through the guard: apt's output says "needrestart is

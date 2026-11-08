@@ -25,7 +25,7 @@
 #      this computer
 #
 # GITHUB-HOSTED RUNNERS ONLY (tests/full-live/lib.sh refuses elsewhere).
-# UNVERIFIED: written and linted, never run on a runner yet.
+# Ran green on GitHub's Ubuntu 22.04 and 24.04 runners (0.6).
 # Usage: bash tests/full-adopt-live/run.sh
 # Logs: $RUNNER_TEMP/full-adopt-live/logs. Exit 0 = every check passed.
 set -u -o pipefail

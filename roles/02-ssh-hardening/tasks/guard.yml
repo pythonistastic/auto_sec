@@ -122,9 +122,10 @@
       {% if _ssh_t_start | length == 0 %}Could not read when ssh.service started on
       {{ inventory_hostname }}, so auto_sec cannot tell whether sshd runs the files on disk.
       {% else %}On {{ inventory_hostname }}, {{ _ssh_t_stale | join(', ') }} changed after
-      sshd last loaded its config at {{ '%Y-%m-%d %H:%M:%S UTC' | strftime(_ssh_t_loaded | int, utc=True) }}.
-      sshd still runs the older settings, so these edits are not live yet, and
-      auto_sec's undo would bring back files sshd never ran. Check the files, reload
+      the last time sshd is known to have loaded its config: {{ '%Y-%m-%d %H:%M:%S UTC' | strftime(_ssh_t_loaded | int, utc=True) }}
+      (when ssh.service started, or its last reload in the journal). Either sshd still runs
+      older settings and these edits are not live yet, or the journal no longer has the
+      reload. Either way auto_sec's undo could bring back files sshd never ran. Check the files, reload
       them yourself with a second session open (`sudo sshd -t && sudo systemctl reload ssh`),
       test a new login, then run again. If this is a host set up by auto_sec 0.3
       whose sshd_config was written but never loaded: do not reload it unless the

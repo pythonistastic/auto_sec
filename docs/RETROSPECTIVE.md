@@ -27,8 +27,9 @@ Last updated: 2026-10 (0.6.0 work; the sections below 0.6 are older).
   `autosec_server: existing | new`, a plan before every run, and an
   optional approval step; on an existing server it changes only what is
   named.
-- auto_sec stays a personal research project. 0.4's and 0.5's live test
-  jobs ran on GitHub's runners; 0.6's have not run yet.
+- auto_sec stays a personal research project. Its live test jobs (0.4
+  to 0.6) ran on GitHub's runners; only 0.4's SSH step has also run on a
+  real server.
 
 ---
 

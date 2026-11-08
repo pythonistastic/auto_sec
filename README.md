@@ -925,15 +925,16 @@ tests/                   lab tests (no root) and live tests (CI runners only)
 ## Known limitations
 
 - **auto_sec is a personal research project.** Several parts are tested
-  only in a lab (real package code, run without root). 0.4's and 0.5's
-  live tests ran on GitHub's VMs; 0.6's, including the full runs
-  `full-adopt-live` and `full-new-live`, have not run yet.
+  only in a lab (real package code, run without root). The live tests,
+  including the full runs `full-adopt-live` and `full-new-live`, ran on
+  GitHub's Ubuntu 22.04 and 24.04 VMs; only 0.4's SSH step has also run
+  on a real server.
 - **Detection is not managed in 0.6** ([#18](https://github.com/pythonistastic/auto_sec/issues/18)).
   Old 0.1–0.5 detectors in alert mode keep firing on every run until you
   remove them.
-- Turning ufw on (new servers) was checked only in a lab, against the
-  ufw code of Ubuntu 22.04 and 24.04 and Debian 12 and 13; never on a
-  real server yet. ufw applies its own kernel settings at every start,
+- Turning ufw on (new servers) was checked in a lab, against the ufw
+  code of Ubuntu 22.04 and 24.04 and Debian 12 and 13, and on GitHub's
+  Ubuntu 24.04 VM; never on a real server yet. ufw applies its own kernel settings at every start,
   and those stay after an undo until the next reboot (the plan lists
   them).
 - needrestart is held back during auto_sec's installs, so services that

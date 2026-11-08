@@ -11,7 +11,7 @@
 # and alice and writes files in /etc/sudoers.d. It refuses to start anywhere
 # else.
 #
-# UNVERIFIED: this script has not run on a runner yet.
+# Ran green on GitHub's runners (0.5 and 0.6).
 #
 # Usage: bash tests/base/live/run.sh [--cases "LIST"]
 #   --cases  a subset of: i a r d l e o s f u h t p k n (default: all, in

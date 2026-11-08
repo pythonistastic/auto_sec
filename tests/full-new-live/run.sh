@@ -26,8 +26,8 @@
 # loopback) go into firewall_closed_ok: the test accepts that they close.
 #
 # GITHUB-HOSTED RUNNERS ONLY (tests/full-live/lib.sh refuses elsewhere).
-# UNVERIFIED: written and linted, never run on a runner yet. It uses role
-# 02's undo guard in its --ufw mode (plan 4.5).
+# Ran green on GitHub's Ubuntu 24.04 runner (0.6). It uses role 02's
+# undo guard in its --ufw mode (plan 4.5).
 # Usage: bash tests/full-new-live/run.sh
 # Logs: $RUNNER_TEMP/full-new-live/logs. Exit 0 = every check passed.
 set -u -o pipefail

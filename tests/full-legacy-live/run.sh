@@ -12,7 +12,7 @@
 #
 # GITHUB-HOSTED RUNNERS ONLY (tests/full-live/lib.sh refuses elsewhere).
 # Needs the git history with the tag (CI: actions/checkout fetch-depth: 0).
-# UNVERIFIED: written and linted, never run on a runner yet.
+# Ran green on GitHub's Ubuntu 24.04 runner (0.6).
 # Usage: bash tests/full-legacy-live/run.sh [--ref TAG]
 # Logs: $RUNNER_TEMP/full-legacy-live/logs. Exit 0 = every check passed.
 set -u -o pipefail

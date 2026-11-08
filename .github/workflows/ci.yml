@@ -305,8 +305,7 @@ jobs:
   # --tags ssh,firewall): keep-everything, stage 2, refusals, the injected
   # login failure and a killed run undone by the timer. Service mode on
   # 22.04, ssh.socket mode on 24.04, and once more on ansible-core 2.16.
-  # Ran on GitHub's runners for v0.4.0; 0.6's changes to it have not run
-  # yet (it needs root on a throwaway VM).
+  # Ran on GitHub's runners for v0.4.0, and with 0.6's changes.
   role02-live:
     name: role02-live (${{ matrix.os }}, ${{ matrix.ssh_mode }}, ${{ matrix.ansible_core }})
     strategy:
@@ -429,8 +428,7 @@ jobs:
   # come through unchanged (same dump, PID, bans, firewall set; no reload),
   # refusals, and the migration of a 0.3 jail.local. 22.04 has fail2ban
   # 0.11.2 with iptables, 24.04 fail2ban 1.0.2 with nftables.
-  # Ran on GitHub's runners for v0.5.0; 0.6's changes to it have not run
-  # yet (it needs root on a throwaway VM).
+  # Ran on GitHub's runners for v0.5.0, and with 0.6's changes.
   fail2ban-live:
     name: fail2ban-live (${{ matrix.os }})
     strategy:
@@ -466,8 +464,7 @@ jobs:
   # is what unattended-upgrade really schedules; Docker exclusion; the
   # 0.1-0.4 restore (only with its -e switch); a package install never
   # upgrades an installed package; refusals. Once more on ansible-core 2.16.
-  # Ran on GitHub's runners for v0.5.0; 0.6's changes to it have not run
-  # yet (it needs root on a throwaway VM).
+  # Ran on GitHub's runners for v0.5.0, and with 0.6's changes.
   base-live:
     name: base-live (${{ matrix.os }}, ${{ matrix.ansible_core }})
     strategy:
@@ -667,7 +664,7 @@ jobs:
   # The goal test: a runner set up like a server already in use (the
   # canary), a full site.yml run with autosec_server: existing (plan only,
   # --check, twice for real) must leave it exactly as it was.
-  # UNVERIFIED until it has run green on GitHub.
+  # Ran green on GitHub's runners for 0.6.
   full-adopt-live:
     name: full-adopt-live (${{ matrix.os }})
     strategy:
@@ -701,7 +698,7 @@ jobs:
   # listening 51820/udp refuse the turn-on. Then ufw on under the undo,
   # deploy with its sudo file, fail2ban; the second run changes nothing; an
   # injected login failure turns ufw off again.
-  # UNVERIFIED until it has run green on GitHub.
+  # Ran green on GitHub's runners for 0.6.
   full-new-live:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -727,7 +724,7 @@ jobs:
 
   # The shared package guard against the runner: needrestart held back,
   # services keep their PIDs, no python3-apt needed.
-  # UNVERIFIED until it has run green on GitHub.
+  # Ran green on GitHub's runners for 0.6.
   apt-guard-live:
     name: apt-guard-live (${{ matrix.os }})
     strategy:
@@ -758,7 +755,7 @@ jobs:
   # The detectors of the last release on the runner: in active mode the 0.6
   # run stops before fact gathering (R00-3) and the SSH session survives; in
   # alert mode it warns and changes nothing.
-  # UNVERIFIED until it has run green on GitHub.
+  # Ran green on GitHub's runners for 0.6.
   legacy-live:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
