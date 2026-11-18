@@ -95,6 +95,9 @@ case_b() {
   n=$(changed_tasks b-alert | grep -v '^10-report : Report: ' | paste -sd'|' -)
   expect b "tasks that changed something, apart from the report" "${n:-none}" none
   snapshot b-after
+  # The old detectors' audit scan (cron, every 5 minutes) rewrites its own
+  # state file; that is the old detector at work, not this run.
+  sed -i '\#  /opt/detect/\.last_check$#d' "$WORK/snap-b-before/files" "$WORK/snap-b-after/files"
   same b b-before b-after
 }
 
