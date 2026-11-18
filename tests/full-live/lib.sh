@@ -157,9 +157,10 @@ net.ipv4.conf.all.rp_filter net.ipv4.ip_forward kernel.dmesg_restrict'
 # symlinks, packages, accounts, running services (MainPID and start time),
 # firewall rules (without counters) and counters, audit rules, kernel
 # values, root's crontab, apt's history.
-# The runner image's tool folders under /opt (gigabytes; auto_sec never
-# touches them) are left out: hashing them took 15-20 minutes per snapshot.
-OPT_SKIP='/opt/(hostedtoolcache|microsoft|google|az|pipx|pipx_bin|actionarchivecache|mssql-tools)(/|$)'
+# The runner image's own folders under /opt are left out; auto_sec never
+# touches them. Its tool cache is gigabytes (hashing it took 15-20 minutes
+# per snapshot), and its agent (/opt/hca) writes logs while the test runs.
+OPT_SKIP='/opt/(hostedtoolcache|microsoft|google|az|pipx|pipx_bin|actionarchivecache|mssql-tools|hca)(/|$)'
 snapshot() {
   local d=$WORK/snap-$1 units
   mkdir -p "$d"

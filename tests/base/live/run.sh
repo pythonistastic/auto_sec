@@ -259,7 +259,9 @@ case_d() {
   case_vars d "unattended_exclude_docker: true"
   play d -e "@$WORK/d.yml" || rc=$?
   expect d "Docker excluded: run rc" "$rc" 0
-  sudo -n unattended-upgrade --dry-run -d >"$LOGS/d-uu.log" 2>&1
+  # Only the start of the dry run is needed: the blacklist is read first.
+  # Its download of the runner's waiting updates can stall, so 3 minutes.
+  sudo -n timeout -k 10 180 unattended-upgrade --dry-run -d >"$LOGS/d-uu.log" 2>&1
   log_has d d-uu 'containerd\.io$' "unattended-upgrade reads the Docker blacklist"
 }
 case_l() {
