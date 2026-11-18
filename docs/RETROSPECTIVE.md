@@ -28,8 +28,9 @@ Last updated: 2026-10 (0.6.0 work; the sections below 0.6 are older).
   optional approval step; on an existing server it changes only what is
   named.
 - auto_sec stays a personal research project. Its live test jobs (0.4
-  to 0.6) ran on GitHub's runners; only 0.4's SSH step has also run on a
-  real server.
+  to 0.6) ran on GitHub's runners. On one real server already in use,
+  0.4's SSH step ran, and so did a full 0.6 run, which changed nothing
+  there.
 
 ---
 

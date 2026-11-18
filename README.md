@@ -927,8 +927,9 @@ tests/                   lab tests (no root) and live tests (CI runners only)
 - **auto_sec is a personal research project.** Several parts are tested
   only in a lab (real package code, run without root). The live tests,
   including the full runs `full-adopt-live` and `full-new-live`, ran on
-  GitHub's Ubuntu 22.04 and 24.04 VMs; only 0.4's SSH step has also run
-  on a real server.
+  GitHub's Ubuntu 22.04 and 24.04 VMs. On one real server already in
+  use, 0.4's SSH step ran, and so did a full 0.6 run, which changed
+  nothing there.
 - **Detection is not managed in 0.6** ([#18](https://github.com/pythonistastic/auto_sec/issues/18)).
   Old 0.1–0.5 detectors in alert mode keep firing on every run until you
   remove them.

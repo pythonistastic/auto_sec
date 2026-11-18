@@ -13,10 +13,10 @@ changes. auto_sec is a personal research project, not a production service — s
 **A full run that changes nothing on an existing server unless asked.** Each
 server now says whether it is `existing` or `new`, every run prints a plan
 first, and on an existing server auto_sec changes only what you name. It is a
-personal research project, not a production service; read **Upgrading
-(0.6.0)** before you run it on a server set up by 0.1–0.5.
+personal research project, not a production service; read **Upgrading**
+before you run it on a server set up by 0.1–0.5.
 
-### Breaking (0.6.0)
+### Breaking
 
 - New required per-host `autosec_server: existing | new`. The run stops
   until it is set (R00-1).
@@ -39,10 +39,10 @@ personal research project, not a production service; read **Upgrading
 - `cve_watch_enabled` defaults to false.
 - The report is written only on the controller.
 - `site.yml` runs one host at a time, and refuses several hosts without
-  `-l` (an empty `-l ""` counts as none).
+  `-l` (#12; an empty `-l ""` counts as none).
 - High mode needs `fwknop_pcap_intf`.
 
-### Fixed (0.6.0)
+### Fixed
 
 - Overwriting `/etc/sudoers.d/<user>`, and changing an existing account's
   shell and groups.
@@ -69,7 +69,7 @@ personal research project, not a production service; read **Upgrading
 - Layer 07 overwriting `/opt/backup/*` and `/etc/logrotate.d/backup`
   files that are not auto_sec's (R07-2).
 
-### Added (0.6.0)
+### Added
 
 - The run plan with a plan id, `-e autosec_plan_only=true`, and
   `autosec_require_approval` / `-e autosec_approve=<id>` (R00-4, R00-5).
@@ -94,7 +94,7 @@ personal research project, not a production service; read **Upgrading
   `apt-guard-live` and `legacy-live`, and a static check that every role
   emits its plan and that refusal IDs are unique.
 
-### Upgrading (0.6.0)
+### Upgrading
 
 - Add `autosec_server` to every host: `new` for hosts auto_sec set up
   from scratch (they keep 0.5's management, minus kernel settings and
@@ -129,7 +129,7 @@ personal research project, not a production service; read **Upgrading
 - Old `/root/security-report-*.md` files on servers are not deleted.
 - Start with `-e autosec_plan_only=true` and read the plan.
 
-### Known limitations (0.6.0)
+### Known limitations
 
 - needrestart runs at your next apt run (nightly unattended-upgrades on
   Ubuntu 24.04).
@@ -142,8 +142,12 @@ personal research project, not a production service; read **Upgrading
 - Detection is not managed until 0.7.
 - Tested on GitHub's Ubuntu 22.04 and 24.04 runners: every live job,
   including a full run on an existing server set up like the canary
-  (`full-adopt-live`) and on a new server (`full-new-live`). Not yet run
-  on a real server, and not tested live on Debian.
+  (`full-adopt-live`) and on a new server (`full-new-live`). And on one
+  real Ubuntu 24.04 server already in use (`existing`): the plan only,
+  `--check` and a real run changed nothing there (its files under /etc,
+  packages, accounts, running services, ufw and fail2ban were the same
+  before and after). Not yet run on a real new server, and not tested
+  live on Debian.
 - Role 02's freshness check (P6) looks for sshd's last reload in the
   journal. If the journal no longer has it, the run refuses and asks you
   to reload sshd once. On a busy server that can happen quickly: in a
