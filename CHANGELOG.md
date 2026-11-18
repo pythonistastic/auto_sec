@@ -10,6 +10,10 @@ changes. auto_sec is a personal research project, not a production service — s
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.6.0] - 2026-11-18
+
 **A full run that changes nothing on an existing server unless asked.** Each
 server now says whether it is `existing` or `new`, every run prints a plan
 first, and on an existing server auto_sec changes only what you name. It is a
@@ -890,7 +894,8 @@ Backups/restore, fwknop, app/DB/TLS roles, Telegram delivery, `active`
 mode, and non-Ubuntu-22.04 targets are shipped but **not yet validated
 end-to-end**. See [docs/RETROSPECTIVE.md](docs/RETROSPECTIVE.md).
 
-[Unreleased]: https://github.com/pythonistastic/auto_sec/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/pythonistastic/auto_sec/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.6.0
 [0.5.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.5.0
 [0.4.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.4.0
 [0.3.2]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.3.2

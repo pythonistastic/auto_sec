@@ -10,7 +10,7 @@
 
 # auto_sec
 
-![version](https://img.shields.io/badge/version-0.5.0-blue)
+![version](https://img.shields.io/badge/version-0.6.0-blue)
 ![status](https://img.shields.io/badge/status-personal%20research%20project-orange)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
@@ -20,7 +20,7 @@
 > supported. Read what it does, try it on a throwaway server first, and
 > see the [Disclaimer](#disclaimer).
 
-**Version 0.5.0** · what's new and what's fixed: [CHANGELOG.md](CHANGELOG.md).
+**Version 0.6.0** · what's new and what's fixed: [CHANGELOG.md](CHANGELOG.md).
 
 An Ansible playbook for an Ubuntu/Debian VPS. You describe each server in
 one file, and every run shows a plan before it changes anything. What it
