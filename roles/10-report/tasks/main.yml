@@ -7,12 +7,13 @@
 # --check. It never fails because client_name, client_domain or ufw is
 # missing: lines without a value are left out.
 #
-# The report states only what this run measured (role 01's update reads,
-# role 02's `sshd -T`, role 03's fail2ban and ufw lines, and the two reads
-# below). Everything else says "not checked by auto_sec". Host output is
-# filtered (printable ASCII, backtick -> ', braces -> ?) before it reaches
-# the file. The local tasks set ansible_become: false as a task variable:
-# an inventory `ansible_become: true` would beat the keyword alone.
+# The report states only what this run measured (role 01's update reads
+# and its look at root's password, role 02's `sshd -T`, role 03's fail2ban
+# and ufw lines, and the two reads below). Everything else says "not
+# checked by auto_sec". Host output is filtered (printable ASCII, backtick
+# -> ', braces -> ?) before it reaches the file. The local tasks set
+# ansible_become: false as a task variable: an inventory
+# `ansible_become: true` would beat the keyword alone.
 
 - name: "Report: ufw status verbose (read-only)"
   ansible.builtin.command:

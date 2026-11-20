@@ -10,7 +10,30 @@ changes. auto_sec is a personal research project, not a production service — s
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **"The hosting provider may know root's password"** (role 01, note
+  `N01-R1`). On many cloud servers the provider's panel sets root's
+  password through cloud-init, when the server is made and at every
+  password reset in the panel, so the provider's systems hold it. Every
+  run now reads the day root's password was last changed, and the days on
+  which cloud-init set a password for root: the days its log names root,
+  and the days its mark shows the password step ran while the log does
+  not say for whom. A run whose log names no root does not count. If the
+  password was not changed on a later day, the plan shows a note and the
+  report a line, with the advice to change it inside the server with
+  `passwd`. Where root can also log in over SSH with a password, the note
+  says so.
+- **"root's password is empty"** (role 01, note `N01-R2`): a note in the
+  plan and a line in the report. With the default settings of Ubuntu and
+  Debian, anyone at the server's console, and any account on the server
+  with `su`, can then become root without a password.
+- Both checks only read, and never the hash. auto_sec never changes or
+  locks root's password: the provider's console is the way back in after
+  a lockout. Tested in the lab (`tests/base/semantics`). The read-only
+  scan also ran once, as root, on a real Ubuntu 24.04 server with
+  cloud-init 26.1, and printed what that server's own records show. The
+  check in `full-adopt-live` has not run yet.
 
 ## [0.6.0] - 2026-11-18
 

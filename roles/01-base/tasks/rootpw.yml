@@ -1,0 +1,231 @@
+---
+# roles/01-base/tasks/rootpw.yml - preflight B14: root's password. Two
+# notes, and nothing else:
+#   N01-R1  the hosting provider may know root's password
+#   N01-R2  root's password is empty
+# Read-only, on every run, whatever the tags, also in --check and with
+# autosec_plan_only. It never stops a run. auto_sec never changes or locks
+# root's password: the provider's console is the way back in after a
+# lockout, and it needs an account with a password.
+#
+# N01-R1. On many cloud servers the provider's panel sets root's password
+# through cloud-init: when the server is made, and again at every password
+# reset in the panel. The provider's systems then hold that password, and
+# whoever gets into those systems can log in as root on the server's
+# console.
+#
+# files/autosec-rootpw-scan reads, as root:
+#   - root's line in /etc/shadow, for two things only: is there a usable
+#     password, and the day of its last change. The hash stays on the host:
+#     it is not in the script's output, so it is in no registered variable,
+#     log or message;
+#   - cloud-init's records of its password step: the mark it keeps per
+#     instance under /var/lib/cloud, and the lines of that step in its own
+#     log (the script's header has the details).
+# Whether root can log in over SSH with a password comes from role 02's
+# preflight (`sshd -T -C user=root`), which ran before this file. With
+# ssh_hardening_enabled: false nothing is said about SSH.
+#
+# The days that count as "cloud-init set a password for root":
+#   - a day on which cloud-init's log says it set root's password;
+#   - a day on which a mark shows that the password step ran, when the log
+#     has no line of that step from that day (rotated away or gone). Whose
+#     password was set is then not known.
+# A day on which the step ran and its log names no root does not count:
+# a deployment with keys only, a server made from your own image, a step
+# that is set to run at every boot.
+#
+# Verdicts:
+#   provider     root has a usable password, and it was not changed on a
+#                later day than the last day that counts: note N01-R1 in
+#                the plan and a line in the report
+#   later        it was changed on a later day: nothing to say
+#   locked       no usable password (field 2 starts with ! or *)
+#   empty        the password field is empty: note N01-R2 in the plan and
+#                a line in the report
+#   no-evidence  a usable password, and no day that counts: not checked
+#   unread       root's entry could not be read
+# /etc/shadow keeps days (UTC), not times: a change later on the same day
+# looks the same as no change, and the note says so.
+#
+# N01-R2. pam_unix has "nullok" in the default login settings of Ubuntu
+# 22.04, 24.04 and 26.04 and of Debian 12 and 13
+# (/usr/share/pam-configs/unix), and both login and su read common-auth.
+# So an empty password lets anyone in at the console, and any account in
+# through su.
+#
+# Trust boundary (SECURITY.md): the script's lines are used only after a
+# strict pattern check (a few fixed words, counts of days and seconds,
+# dates). Nothing else of them is shown, and nothing reaches the server.
+#
+# Sets, on every host (also when the tags leave role 01 out):
+#   _base_rootpw    dict  for role 10:
+#                         verdict  one of the six words above
+#                         changed  day of root's last password change
+#                         cloud    the last day that counts ('' if none)
+#                         kind     what that day rests on: named (the log
+#                                  names root) or mark (a mark, and no log
+#                                  line of that step), '' if no such day
+#                         text     the note's sentences (provider, empty)
+#   _plan_01_notes  list  the note, shown under role 01's line of the plan
+
+- name: "Base B14: root's password and cloud-init's password runs (read-only)"
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - "{{ lookup('ansible.builtin.file', 'autosec-rootpw-scan') }}"
+      - sh
+      - "{{ _base_shadow }}"
+      - "{{ _base_cloud_dir }}"
+      - "{{ _base_cloud_log }}"
+  register: _base_pf_rootpw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Base B14: remember it"
+  ansible.builtin.set_fact:
+    _base_rootpw:
+      verdict: "{{ _base_rp_verdict }}"
+      changed: "{{ _base_rp_chg }}"
+      cloud: "{{ _base_rp_latest }}"
+      kind: "{{ _base_rp_kind }}"
+      text: >-
+        {{ _base_rp_text if _base_rp_verdict == 'provider'
+           else (_base_rp_s_empty if _base_rp_verdict == 'empty' else '') }}
+    _plan_01_notes: >-
+      {{ ['[N01-R1] ' ~ _base_rp_text ~ _base_rp_ssh]
+         if _base_rp_verdict == 'provider'
+         else (["[N01-R2] root's password is empty. " ~ _base_rp_s_empty]
+               if _base_rp_verdict == 'empty' else []) }}
+  vars:
+    # A scan that did not end normally counts as not read at all.
+    _base_rp_lines: >-
+      {{ (_base_pf_rootpw.stdout_lines | default([]))
+         if (_base_pf_rootpw.rc | default(1)) == 0 else [] }}
+    _base_rp_p: >-
+      {{ (_base_rp_lines
+          | select('match', '^P (usable|locked|empty) ([0-9]{1,6}|-)$')
+          | first | default('P unread -')).split(' ') }}
+    _base_rp_state: "{{ _base_rp_p[1] }}"
+    _base_rp_day: "{{ _base_rp_p[2] | string }}"
+    # Day 0 is not a date: it means "change the password at the next login".
+    _base_rp_chg: >-
+      {{ ('%Y-%m-%d' | strftime((_base_rp_day | int) * 86400, utc=true))
+         if (_base_rp_day is match('^[0-9]+$') and (_base_rp_day | int) > 0)
+         else '' }}
+    # cloud-init's password step. marks: the days of its marks ("S
+    # <seconds>"). The log ("L <date> ran|root"): logran, the days it shows
+    # the step running; named, the days it says root's password was set.
+    _base_rp_marks: >-
+      {%- set out = [] -%}
+      {%- for s in _base_rp_lines | select('match', '^S [0-9]{9,11}$') -%}
+      {%- set _ = out.append('%Y-%m-%d' | strftime(s[2:] | int, utc=true)) -%}
+      {%- endfor -%}
+      {{ out | unique | list }}
+    _base_rp_log_re: >-
+      ^L (19|20)[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01]) (ran|root)$
+    _base_rp_log: >-
+      {{ _base_rp_lines | select('match', _base_rp_log_re)
+         | map('split', ' ') | list }}
+    _base_rp_logran: "{{ _base_rp_log | map(attribute=1) | list | unique }}"
+    _base_rp_named: >-
+      {{ _base_rp_log | selectattr(2, 'equalto', 'root')
+         | map(attribute=1) | list | unique }}
+    # The days that count: named days, and mark days the log shows nothing
+    # of. A day on which the step ran and named no root does not count.
+    _base_rp_markonly: "{{ _base_rp_marks | difference(_base_rp_logran) }}"
+    _base_rp_counted: >-
+      {{ (_base_rp_named + _base_rp_markonly) | unique | sort }}
+    _base_rp_latest: "{{ _base_rp_counted | last | default('') }}"
+    _base_rp_kind: >-
+      {{ '' if _base_rp_latest == ''
+         else ('named' if _base_rp_latest in _base_rp_named else 'mark') }}
+    _base_rp_verdict: >-
+      {{ _base_rp_state if _base_rp_state in ['unread', 'locked', 'empty']
+         else ('no-evidence' if _base_rp_latest == ''
+         else ('later'
+               if (_base_rp_chg != '' and _base_rp_chg > _base_rp_latest)
+               else 'provider')) }}
+    # N01-R1. The first sentence says what was read, and is true whichever
+    # kind the last counted day is; the rest is fixed.
+    _base_rp_is_named: >-
+      {{ _base_rp_chg != '' and _base_rp_chg in _base_rp_named }}
+    _base_rp_is_mark: >-
+      {{ _base_rp_chg != '' and _base_rp_chg in _base_rp_markonly }}
+    _base_rp_s_named: >-
+      root's password was set by cloud-init on {{ _base_rp_chg }}
+      (cloud-init's log names root), and it was not changed on a later day.
+    _base_rp_s_mark: >-
+      root's password was last changed on {{ _base_rp_chg }}, the same day
+      cloud-init's password step ran on this server. cloud-init's log does
+      not say whose password that run set.
+    _base_rp_s_older_named: >-
+      The password file says root's password was last changed on
+      {{ _base_rp_chg }}, but cloud-init's log says it set root's password
+      after that, on {{ _base_rp_latest }}.
+    _base_rp_s_older_mark: >-
+      The password file says root's password was last changed on
+      {{ _base_rp_chg }}, but cloud-init's password step ran after that, on
+      {{ _base_rp_latest }}. cloud-init's log does not say whose password
+      that run set.
+    _base_rp_s_undated: >-
+      root has a password, and the password file does not say when it was
+      last changed.
+    _base_rp_s_undated_named: >-
+      cloud-init's log says it set root's password on {{ _base_rp_latest }}.
+    _base_rp_s_undated_mark: >-
+      cloud-init's password step ran on this server on
+      {{ _base_rp_latest }}, and its log does not say whose password that
+      run set.
+    _base_rp_s_day: >-
+      The password file records only the day, so a change later that day
+      does not show.
+    _base_rp_s_advice: >-
+      The hosting provider's panel can set root's password through
+      cloud-init, so the provider's systems may hold this password. Change
+      it inside the server with `passwd`. A reset in the panel hands the
+      new password to the provider again.
+    _base_rp_first: >-
+      {{ _base_rp_s_named if (_base_rp_is_named | bool)
+         else (_base_rp_s_mark if (_base_rp_is_mark | bool)
+         else ((_base_rp_s_older_named if _base_rp_kind == 'named'
+                else _base_rp_s_older_mark) if _base_rp_chg != ''
+         else (_base_rp_s_undated ~ ' '
+               ~ (_base_rp_s_undated_named if _base_rp_kind == 'named'
+                  else _base_rp_s_undated_mark)))) }}
+    _base_rp_text: >-
+      {{ [_base_rp_first,
+          _base_rp_s_day
+          if ((_base_rp_is_named | bool) or (_base_rp_is_mark | bool))
+          else '',
+          _base_rp_s_advice] | select | join(' ') }}
+    # What sshd uses for root now (role 02's preflight). Only a plain "yes"
+    # to both counts, with no AuthenticationMethods list in the way.
+    _base_rp_sshd: "{{ (_ssh_before | default({})).root | default({}) }}"
+    _base_rp_prl: >-
+      {{ _base_rp_sshd.permitrootlogin | default('') | string | lower }}
+    _base_rp_pwa: >-
+      {{ _base_rp_sshd.passwordauthentication | default('') | string | lower }}
+    _base_rp_am: >-
+      {{ _base_rp_sshd.authenticationmethods | default('any') | string
+         | lower }}
+    _base_rp_ssh: >-
+      {{ ' Root can also log in over SSH with this password.'
+         if ((_ssh_enabled | default(false) | bool) and _base_rp_prl == 'yes'
+             and _base_rp_pwa == 'yes' and _base_rp_am == 'any')
+         else '' }}
+    # N01-R2, after "root's password is empty."
+    _base_rp_s_empty: >-
+      With the default settings of Ubuntu and Debian, anyone at the server's
+      console, and any account on the server with `su`, can become root
+      without a password. Set one inside the server with `passwd`.
+
+# The plan lists role 01's notes only when the tags select role 01.
+- name: "Base B14: the note, when the plan does not show role 01"
+  when:
+    - _plan_01_notes | length > 0
+    - not (_base_role_runs | default(false) | bool)
+  ansible.builtin.debug:
+    msg: "{{ _plan_01_notes }}"

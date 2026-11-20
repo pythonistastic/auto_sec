@@ -23,9 +23,12 @@
 #      firewall rules (counters only grew), audit rules, kernel values,
 #      root's crontab and apt's history; the only new file is the report on
 #      this computer
+#   r  root's password (0.6.1): the report's line and the plan's notes
+#      (N01-R1, N01-R2) fit what `passwd -S root` says on this runner
 #
 # GITHUB-HOSTED RUNNERS ONLY (tests/full-live/lib.sh refuses elsewhere).
-# Ran green on GitHub's Ubuntu 22.04 and 24.04 runners (0.6).
+# Ran green on GitHub's Ubuntu 22.04 and 24.04 runners (0.6). Case r is new
+# in 0.6.1 and has not run yet.
 # Usage: bash tests/full-adopt-live/run.sh
 # Logs: $RUNNER_TEMP/full-adopt-live/logs. Exit 0 = every check passed.
 set -u -o pipefail
@@ -165,12 +168,42 @@ case_c() {
   log_lacks c c-run1 "needrestart" "needrestart not mentioned (no apt run)"
 }
 
+# Root's password (role 01's B14, notes N01-R1 and N01-R2; new in 0.6.1,
+# NOT RUN YET). The runner is a cloud-init machine. What the plan and the
+# report say must fit what `passwd -S root` says here: L (locked), NP
+# (empty) or P (a password). Case d proves /etc/shadow is unchanged.
+case_r() {
+  local st line marks
+  st=$(sudo -n passwd -S root 2>/dev/null | awk '{ print $2 }')
+  line=$(grep "oot's password" "$REPORT" 2>/dev/null | head -n 1)
+  marks=$(sudo -n sh -c 'ls /var/lib/cloud/instances/*/sem/config_set_passwords 2>/dev/null | wc -l')
+  info r "passwd -S root: ${st:-?}; marks of cloud-init's password step: $marks; report: $(printf '%s' "$line" | cut -c1-110)"
+  case $st in
+    L)
+      expect r "root's password is locked: the report says so" "${line%%,*}" "- Root's password (read during this run): locked"
+      log_lacks r a-plan "[N01-R" "root's password is locked: no N01-R1 or N01-R2 note in the plan" ;;
+    NP)
+      expect r "root's password is empty: the report says so" "${line%% (read*}" "- **Root's password is empty**"
+      log_has r a-plan "[N01-R2]" "root's password is empty: the plan has note N01-R2" ;;
+    P)
+      case $line in
+        "- **The hosting provider may know root's password**"*)
+          log_has r a-plan "[N01-R1]" "root has a password and the report warns: the plan has note N01-R1" ;;
+        "- Root's password (read during this run): "*)
+          log_lacks r a-plan "[N01-R1]" "root has a password and the report does not warn: the plan has no N01-R1 note" ;;
+        *) fail r "root has a password, but the report's line is '$line'" ;;
+      esac ;;
+    *) fail r "passwd -S root gave no status ('$st')" ;;
+  esac
+}
+
 setup
 snapshot before
 ssh_load_info a
 echo "== case a"; case_a
 echo "== case b"; case_b
 echo "== case c"; case_c
+echo "== case r"; case_r
 snapshot after
 echo "== case d"; same d before after
 finish

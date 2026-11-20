@@ -489,6 +489,59 @@ when `deploy_user` is also `ssh_admin_user`).
 With `keep` (the default with `existing`), auto_sec creates no account
 and writes no sudo rule.
 
+## Root's password and your hosting provider
+
+On many cloud servers, the provider's panel sets root's password
+through cloud-init: when the server is made, and again at every password
+reset in the panel. The provider's systems then hold that password.
+Whoever gets into those systems can log in as root on the server's
+console. No firewall, fail2ban or SSH setting covers the console.
+
+Every run checks for this, on `existing` and `new` servers alike. The
+check only reads:
+
+- From root's line in `/etc/shadow` it takes two things: is there a
+  password, and the day it was last changed. The hash never leaves the
+  server.
+- From cloud-init it takes the days on which cloud-init set a password
+  for root. Two kinds of days count:
+  - a day on which cloud-init's log says it set root's password;
+  - a day on which cloud-init's mark under `/var/lib/cloud` shows that
+    its password step ran, and its log does not say whose password was
+    set (the log of that run is rotated away or gone).
+
+  A day on which the step ran and the log names no root does not count:
+  a server made with keys only, a server made from your own image, a
+  step that is set to run at every boot.
+
+If root's password was not changed on a later day than the last day
+that counts, the plan shows note `N01-R1` and the report has the same
+text:
+
+```
+[N01-R1] root's password was set by cloud-init on 2026-05-11 (cloud-init's
+log names root), and it was not changed on a later day. [...] The hosting
+provider's panel can set root's password through cloud-init, so the
+provider's systems may hold this password. Change it inside the server
+with `passwd`. A reset in the panel hands the new password to the provider
+again.
+```
+
+- **What to do:** log in and run `passwd`. Do not use the panel's reset.
+- Where root can also log in over SSH with a password, the note says so.
+- The password file keeps days, not times. If you changed the password
+  later on the same day, the note still shows.
+- With no day that counts, there is no note, and the report says "not
+  checked". The check does not see a password that a provider set in
+  some other way.
+- **An empty password** gets its own note, `N01-R2`. With the default
+  settings of Ubuntu and Debian, anyone at the server's console, and any
+  account on the server with `su`, can then become root without a
+  password. Set one with `passwd`.
+- auto_sec **never changes or locks root's password.** The provider's
+  console is the way back in after a lockout, and it needs an account
+  with a password.
+
 ## Updates, reboots, hostname and timezone
 
 Role 01 handles automatic security updates (`unattended-upgrades`).

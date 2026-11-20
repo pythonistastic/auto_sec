@@ -26,6 +26,8 @@
 #       p13 a configured layer without a plan: NO PLAN, approval needed
 #       p14 an item that breaks the contract: refused as a bug
 #       p15-p16 not selected by --tags; ssh_hardening_enabled false
+#       p17-p18 a note of role 01 (N01-R1, N01-R2): shown, not part of the
+#           id, no approval needed; not shown when the tags leave role 01 out
 #       x1  the canary's plan id is the same on every ansible-core
 #   q*  role 02's plan lines (plan02.yml, a fake getent): keys present or
 #       missing, deploy's key after role 01 creates it, a linked ~/.ssh, the
@@ -228,6 +230,19 @@ EOF
   rc=$(plan p16 canary -e @cases/canary.json -e '{"_ssh_enabled": false}')
   js "$W/$tag-p16.json" 'd["lines"]' | grep -q "02 ssh:       off (ssh_hardening_enabled: false)"
   ok "$tag p16: ssh_hardening_enabled false" $?
+  # A note of role 01 (N01-R1: the hosting provider may know root's
+  # password; N01-R2: root's password is empty) is shown under the plan.
+  # It is not part of the id, and it needs no approval.
+  for nid in N01-R1 N01-R2; do
+    rc=$(plan "p17-$nid" canary -e @cases/canary.json -e "{\"_plan_01_notes\": [\"[$nid] a note of role 01, with {braces}\"]}"); F=$W/$tag-p17-$nid.json
+    [ "$rc" = 0 ] && [ "$(js "$F" 'd["id"]')" = "$ID1" ] && [ "$(js "$F" 'd["status"]')" = "no server change: approval not needed" ] \
+      && [ "$(js "$F" '[n for n in d["notes"] if "N01-R" in n]')" = "['  01 base: [$nid] a note of role 01, with ?braces?']" ] \
+      && has "$W/$tag-p17-$nid.log" "Notes (not part of the plan id):"
+    ok "$tag p17: note $nid of role 01 is shown under the plan: same id, no approval needed" $?
+    rc=$(plan "p18-$nid" canary -e @cases/canary.json -e "{\"_plan_01_notes\": [\"[$nid] a note of role 01\"], \"_base_role_runs\": false}")
+    [ "$(js "$W/$tag-p18-$nid.json" '[n for n in d["notes"] if "N01-R" in n]')" = "[]" ]
+    ok "$tag p18: the tags leave role 01 out: the plan does not show note $nid (role 01 prints it itself)" $?
+  done
 
   # --- q: role 02's plan lines (roles/02-ssh-hardening/tasks/plan.yml) --------------
   q() { # name overrides-json: prints rc; writes $W/<tag>-<name>.json

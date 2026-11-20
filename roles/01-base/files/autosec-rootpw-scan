@@ -1,0 +1,106 @@
+#!/bin/sh
+# autosec-rootpw-scan - role 01's read-only look at root's password entry
+# and at cloud-init's records of setting passwords (preflight B14, notes
+# N01-R1 and N01-R2). It changes nothing and writes nothing.
+# Role 01 runs it as `sh -c "<this file>" sh <args>`; the tests run it the
+# same way, on lab trees.
+#
+# Usage: autosec-rootpw-scan <shadow> <cloud_dir> <cloud_log>
+#   shadow     the password file (/etc/shadow)
+#   cloud_dir  cloud-init's state folder (/var/lib/cloud)
+#   cloud_log  cloud-init's log (/var/log/cloud-init.log); its rotated
+#              copies <cloud_log>.1 to .9, plain or .gz, are read too
+#
+# Why: on many cloud servers the provider's panel sets root's password
+# through cloud-init, when the server is made and again at every password
+# reset in the panel. The provider's systems then hold that password.
+#
+# What the script reports about cloud-init, and what it leaves out:
+# - S: sem/config_set_passwords in an instance folder. cloud-init writes it
+#   when its password module starts for that instance: "<pid>: <seconds>".
+#   A new instance (a new server, or a reset in the panel that makes
+#   cloud-init run as for a new server) gets a new one.
+# - L: in the log, the two kinds of lines that are written only when the
+#   module really runs (the same text in cloud-init 0.7.6 to 26.1, "Setting
+#   hashed" since 17.1; the times are UTC since 17.1):
+#     ... - helpers.py[DEBUG]: Running config-set_passwords using lock (...)
+#     ... - cc_set_passwords.py[DEBUG]: Changing password for ['root']:
+#     ... - cc_set_passwords.py[DEBUG]: Setting hashed password for ['root']:
+#   Older releases name the module set-passwords.
+# - Left out: "config-set_passwords already ran", which every later boot
+#   with cloud-init logs, and the dates of the instance folders, which
+#   change at every such boot.
+# Which days count as "cloud-init set a password for root" is decided in
+# tasks/rootpw.yml: a day with an "L ... root" line, and a day with an S
+# line and no L line at all.
+#
+# Output, one record per line, and nothing else. The password hash never
+# leaves awk: awk prints one of three words and a number.
+#   P usable|locked|empty <day>|-
+#                        root's entry: "usable" when field 2 is not empty
+#                        and does not start with ! or *; <day> is field 3,
+#                        the day of the last change (days since 1970, UTC),
+#                        or - when it is not a number
+#   S <seconds>          one per instance: when the password module ran
+#                        for it (seconds since 1970; the file's own time
+#                        when its content has another shape)
+#   L <yyyy-mm-dd> ran   a day on which the log says the module ran
+#   L <yyyy-mm-dd> root  a day on which the log says it set root's password
+#   E <text>             a bad call
+# Exit: 0 done, 2 usage.
+set -u
+LC_ALL=C
+export LC_ALL
+if [ $# -ne 3 ]; then
+  echo "E usage: autosec-rootpw-scan <shadow> <cloud_dir> <cloud_log>"
+  exit 2
+fi
+shadow=$1 cloud=$2 log=$3
+
+# Root's line only.
+awk -F: '
+  $1 == "root" {
+    state = "usable"
+    if ($2 == "") state = "empty"
+    else if ($2 ~ /^[!*]/) state = "locked"
+    day = "-"
+    if ($3 ~ /^[0-9]+$/ && length($3) <= 6) day = $3
+    print "P", state, day
+    exit
+  }' "$shadow" 2>/dev/null
+
+n=0
+for f in "$cloud"/instances/*/sem/config_set_passwords; do
+  if [ ! -f "$f" ] || [ -L "$f" ]; then continue; fi
+  n=$((n + 1))
+  if [ "$n" -gt 64 ]; then break; fi
+  t=$(awk 'NR == 1 && /^[0-9]+: [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]+(\.[0-9]*)?$/ {
+             split($2, a, "."); if (length(a[1]) <= 11) print a[1] }
+           { exit }' "$f" 2>/dev/null)
+  case $t in
+    '' | *[!0-9]*) t=$(stat -c %Y -- "$f" 2>/dev/null) ;;
+  esac
+  case $t in
+    '' | *[!0-9]*) ;;
+    *) printf 'S %s\n' "$t" ;;
+  esac
+done
+
+for f in "$log" "$log".[1-9] "$log".[1-9].gz; do
+  if [ ! -f "$f" ]; then continue; fi
+  case $f in
+    *.gz) gzip -dc -- "$f" 2>/dev/null ;;
+    *) cat -- "$f" 2>/dev/null ;;
+  esac
+done | grep -a -E 'config-set[-_]passwords using lock|password for \[' 2>/dev/null | awk '
+  /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9],[0-9]+ - / {
+    msg = $0
+    sub(/^[^ ]+ [^ ]+ - /, "", msg)
+    if (msg ~ /^helpers\.py\[DEBUG\]: Running config-set[-_]passwords using lock /) kind = "ran"
+    else if (msg ~ /^cc_set_passwords\.py\[DEBUG\]: (Changing|Setting hashed) password for \[/)
+      kind = (index(msg, "\047root\047") > 0) ? "root" : "ran"
+    else next
+    key = substr($0, 1, 10) " " kind
+    if (!(key in seen) && count < 200) { seen[key] = 1; count++; print "L", key }
+  }' 2>/dev/null
+exit 0

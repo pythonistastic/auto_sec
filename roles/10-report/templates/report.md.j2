@@ -28,6 +28,25 @@
 {%- set _hard = _prl != 'yes' and _pwd == 'no' and _pwd_root == 'no' -%}
 {%- set _why = (['root can log in with a password'] if _prl == 'yes' else [])
              + (['password login is enabled'] if (_pwd != 'no' or _pwd_root != 'no') else []) -%}
+{#- Root's password: role 01's preflight (rootpw.yml, B14) read root's
+    password entry and cloud-init's records during this run and set
+    _base_rootpw: verdict, two dates, kind (what the cloud date rests on:
+    "named", cloud-init's log names root, or "mark", a mark and no log line
+    of that step) and text (the sentences of role 01's note). A value of
+    another shape, or no fact at all (preflight skipped), reads "not
+    checked". The SSH sentence follows the values shown above: root with a
+    plain "yes" to permitrootlogin and passwordauthentication, no
+    AuthenticationMethods list, and only while role 02 manages SSH here. -#}
+{%- set _rp = _base_rootpw | default({}, true) -%}
+{%- set _rp = _rp if _rp is mapping else {} -%}
+{%- set _rpv = _rp.verdict | default('unread') -%}
+{%- set _rp_day = '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' -%}
+{%- set _rp_changed = (_rp.changed | default('') | string) if (_rp.changed | default('') | string) is match(_rp_day) else '' -%}
+{%- set _rp_cloud = (_rp.cloud | default('') | string) if (_rp.cloud | default('') | string) is match(_rp_day) else '' -%}
+{%- set _rp_kind = _rp.kind if (_rp.kind | default('')) in ['named', 'mark'] else '' -%}
+{%- set _rp_text = _rp.text if (_rp.text | default('')) is string else '' -%}
+{%- set _rp_ssh = _ssh_known and (ssh_hardening_enabled | default(true) | bool) and _prl == 'yes' and _pwd_root == 'yes'
+                  and (_sshd(_sv_root, 'authenticationmethods') | lower) in ['', 'any'] -%}
 {#- Update lines show what apt uses, read during this run (never intent):
     _base_uu_after   role 01's check after its change (role 01 ran);
     _base_uu_before  role 01's preflight, at the start of the run;
@@ -117,6 +136,19 @@ Anything else says "not checked by auto_sec".
 {% if not (ssh_hardening_enabled | default(true) | bool) %}
 - SSH login settings are not managed by auto_sec on this server
   (ssh_hardening_enabled is false)
+{% endif %}
+{% if _rpv == 'provider' and _rp_text | length > 0 %}
+- **The hosting provider may know root's password** (read during this run): {{ _rp_text }}{{ ' Root can also log in over SSH with this password.' if _rp_ssh else '' }}
+{% elif _rpv == 'later' and _rp_changed and _rp_cloud and _rp_kind %}
+- Root's password (read during this run): last changed on {{ _rp_changed }}, after {{ 'cloud-init set it' if _rp_kind == 'named' else "cloud-init's password step ran" }} on this server ({{ _rp_cloud }})
+{% elif _rpv == 'locked' %}
+- Root's password (read during this run): locked, so root cannot log in with a password
+{% elif _rpv == 'empty' and _rp_text | length > 0 %}
+- **Root's password is empty** (read during this run): {{ _rp_text }}
+{% elif _rpv == 'no-evidence' %}
+- Root's password (read during this run): root has one{{ (', last changed on ' ~ _rp_changed) if _rp_changed else '' }}. Whether the hosting provider's panel set it was not checked: this server has no record of cloud-init setting a password for root
+{% else %}
+- Root's password: not checked in this run
 {% endif %}
 {#- Firewall: role 03's measured line, else role 10's own read. -#}
 {% set _fw_line = _fw_report | default('', true) %}

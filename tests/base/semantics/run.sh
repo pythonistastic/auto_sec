@@ -28,6 +28,15 @@
 # (R01-A6, R01-A7), the notes about /etc/sysctl.conf (N01-K1, N01-K2), main
 # step 6b's check before the write (M01-A1) and the plan items. The package
 # guard has its own tests (tests/autosec-apt/semantics).
+# Last, rootpw.yml runs role 01's rootpw.yml and files/autosec-rootpw-scan
+# (B14; N01-R1: may the hosting provider know root's password? N01-R2: an
+# empty password) against lab trees with their own shadow file, cloud-init
+# state folder and cloud-init log: the password from the day the server
+# was made, a reset in the provider's panel, a change inside the server on
+# a later day, runs of cloud-init that name no root (keys only, your own
+# snapshot, a step that runs at every boot), a locked and an empty
+# password, no cloud-init, files that cannot be read or are garbled,
+# rotated logs, what sshd allows root, and that the hash is in no output.
 #
 # Usage: tests/base/semantics/run.sh [--cache DIR]... [--keep] [--verbose]
 #   --cache DIR  where the .debs are kept. Searched 3 levels deep by package
@@ -36,7 +45,7 @@
 #                Default: ~/.cache/auto-sec-base-semantics
 #   --keep       keep the work directory and print its path
 #   --verbose    print what unattended-upgrades uses in every lab
-# Needs: curl dpkg-deb sha256sum apt-config ansible-playbook python3 visudo. The
+# Needs: curl dpkg-deb sha256sum apt-config ansible-playbook python3 visudo gzip. The
 # unattended-upgrades checks also need python3-apt, python3-distro-info and
 # lsb_release for /usr/bin/python3 (SKIP lines without them). ShellCheck is
 # optional.
@@ -66,7 +75,7 @@ while [ $# -gt 0 ]; do
 done
 [ ${#CACHES[@]} -gt 0 ] || CACHES=("${XDG_CACHE_HOME:-$HOME/.cache}/auto-sec-base-semantics")
 CACHE=${CACHES[0]}
-for t in curl dpkg-deb sha256sum apt-config ansible-playbook python3 visudo; do
+for t in curl dpkg-deb sha256sum apt-config ansible-playbook python3 visudo gzip; do
   command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"
 done
 # The distro's python3: python3-apt is not on PyPI.
@@ -914,6 +923,461 @@ if acct_ok plan plan-c "${NEW[@]}" "${MORE[@]}" -e timezone=UTC -e "lab_dir=$(L 
     pass plan "a changed value changes an item"
   else fail plan "a changed value does not change any item"; fi
 fi
+
+# --- 14. root's password and cloud-init (rootpw.yml, autosec-rootpw-scan) -----------
+# rootpw.yml runs role 01's B14 (notes N01-R1 and N01-R2) against lab
+# trees: a shadow file, cloud-init's state folder and cloud-init's log.
+# fixtures/cloud-init-25.1.4.log is a log that cloud-init 25.1.4's own code
+# wrote in a lab (its module runner and cc_set_passwords, a stub chpasswd, a
+# set clock): the server is made, a reboot, a reset in the panel (a new
+# instance), a reboot. rp_ran, rp_skip and rp_always write the same lines
+# for other days; rp_sem writes the mark cloud-init leaves per instance.
+# The case "like a real server" has the shape seen on one real Ubuntu
+# 24.04 server with cloud-init 26.1, where the scan ran once as root.
+RPSCAN=$ROOT/roles/01-base/files/autosec-rootpw-scan
+RPFIX=$HERE/fixtures/cloud-init-25.1.4.log
+# A made-up hash. It must never show up in anything the role prints or keeps.
+# shellcheck disable=SC2016 # literal text, not an expansion
+RPHASH='$y$j9T$LABHASHMUSTNOTLEAK$Kq3mVh1yXw7pZt5uRb9cNd2eFg4hJk6lMn8oPq0rSt'
+RP1='2026-03-02 10:20:30' # the server is made
+RP2='2026-05-11 23:40:12' # a reset in the panel, late in the UTC day
+RPROOT="Changing password for ['root']:"
+mkdir -p "$W/rp"
+
+if command -v shellcheck >/dev/null 2>&1; then
+  if shellcheck -s sh "$RPSCAN"; then pass static "shellcheck -s sh autosec-rootpw-scan"; else fail static "shellcheck autosec-rootpw-scan"; fi
+fi
+bad=$(grep -rnE '(^|[^a-z_])(chpasswd|usermod|chage|password_lock|update_password)([^a-z_]|$)|(^|[^a-z_])passwd +(-|root)' \
+  "$ROOT/roles" "$ROOT/site.yml" | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#|getent passwd' | sed "s|$ROOT/||" | paste -sd' ' -)
+expect static "no role changes or locks a password (no chpasswd, usermod, chage, passwd -x, password_lock)" "${bad:-none}" none
+
+rp_new() { # name: an empty lab tree
+  rm -rf "$W/rp/$1"
+  mkdir -p "$W/rp/$1/cloud/instances" "$W/rp/$1/log" || die "mkdir rp/$1"
+}
+rp_day() { echo $(($(date -u -d "$1" +%s) / 86400)); } # yyyy-mm-dd: days since 1970
+rp_shadow() { # name field2 field3: root's line between two others
+  printf 'daemon:*:19000:0:99999:7:::\nroot:%s:%s:0:99999:7:::\nother:%s:20000:0:99999:7:::\n' "$2" "$3" "$RPHASH" \
+    >"$W/rp/$1/shadow"
+}
+rp_sem() { # name instance "yyyy-mm-dd hh:mm:ss": cloud-init's mark that its password module ran for the instance
+  local d=$W/rp/$1/cloud/instances/$2/sem
+  mkdir -p "$d" || die "mkdir $d"
+  printf '607: %s.2199984\n' "$(date -u -d "$3" +%s)" >"$d/config_set_passwords"
+  touch -d "$3 UTC" "$d/config_set_passwords"
+}
+rp_ran() { # name "yyyy-mm-dd hh:mm:ss" module [cc_set_passwords line...]: the log of a boot where the module runs
+  local f=$W/rp/$1/log/cloud-init.log s=$2 m=$3 l
+  shift 3
+  {
+    printf "%s,186 - modules.py[DEBUG]: Running module %s (<module 'cloudinit.config.cc_set_passwords' from '/usr/lib/python3/dist-packages/cloudinit/config/cc_set_passwords.py'>) with frequency once-per-instance\n" "$s" "$m"
+    printf '%s,208 - handlers.py[DEBUG]: start: modules-config/config-%s: running config-%s with frequency once-per-instance\n' "$s" "$m" "$m"
+    printf "%s,241 - helpers.py[DEBUG]: Running config-%s using lock (<FileLock using file '/var/lib/cloud/instances/lab/sem/config_set_passwords'>)\n" "$s" "$m"
+    for l in "$@"; do printf '%s,252 - cc_set_passwords.py[DEBUG]: %s\n' "$s" "$l"; done
+    printf "%s,274 - cc_set_passwords.py[DEBUG]: Leaving SSH config 'PasswordAuthentication' unchanged. ssh_pwauth=None\n" "$s"
+    printf '%s,296 - handlers.py[DEBUG]: finish: modules-config/config-%s: SUCCESS: config-%s ran successfully and took 0.004 seconds\n' "$s" "$m" "$m"
+  } >>"$f"
+}
+rp_skip() { # name "yyyy-mm-dd hh:mm:ss" module: the log of a later boot of the same instance
+  local f=$W/rp/$1/log/cloud-init.log s=$2 m=$3
+  {
+    printf "%s,197 - modules.py[DEBUG]: Running module %s (<module 'cloudinit.config.cc_set_passwords' from '/usr/lib/python3/dist-packages/cloudinit/config/cc_set_passwords.py'>) with frequency once-per-instance\n" "$s" "$m"
+    printf '%s,219 - handlers.py[DEBUG]: start: modules-config/config-%s: running config-%s with frequency once-per-instance\n' "$s" "$m" "$m"
+    printf '%s,230 - helpers.py[DEBUG]: config-%s already ran (freq=once-per-instance)\n' "$s" "$m"
+    printf '%s,252 - handlers.py[DEBUG]: finish: modules-config/config-%s: SUCCESS: config-%s previously ran\n' "$s" "$m" "$m"
+  } >>"$f"
+}
+rp_always() { # name "yyyy-mm-dd hh:mm:ss" [cc_set_passwords line...]: the log of a boot when the module is set to run at every boot (no mark)
+  local f=$W/rp/$1/log/cloud-init.log s=$2 l
+  shift 2
+  {
+    printf "%s,175 - modules.py[DEBUG]: Running module set_passwords (<module 'cloudinit.config.cc_set_passwords' from '/usr/lib/python3/dist-packages/cloudinit/config/cc_set_passwords.py'>) with frequency always\n" "$s"
+    printf '%s,180 - handlers.py[DEBUG]: start: modules-config/config-set_passwords: running config-set_passwords with frequency always\n' "$s"
+    printf '%s,186 - helpers.py[DEBUG]: Running config-set_passwords using lock (<cloudinit.helpers.DummyLock object at 0x7f30a3123410>)\n' "$s"
+    for l in "$@"; do printf '%s,197 - cc_set_passwords.py[DEBUG]: %s\n' "$s" "$l"; done
+    printf "%s,219 - cc_set_passwords.py[DEBUG]: Leaving SSH config 'PasswordAuthentication' unchanged. ssh_pwauth=None\n" "$s"
+    printf '%s,241 - handlers.py[DEBUG]: finish: modules-config/config-set_passwords: SUCCESS: config-set_passwords ran successfully and took 0.004 seconds\n' "$s"
+  } >>"$f"
+}
+rp_server() { # name: made on 2 March, rebooted, reset in the panel on 11 May (a new instance), rebooted
+  rp_new "$1"
+  rp_sem "$1" 0c9a55d1 "$RP1"
+  rp_sem "$1" 5e1f20c7 "$RP2"
+  rp_ran "$1" "$RP1" set_passwords "$RPROOT"
+  rp_skip "$1" '2026-03-20 06:15:00' set_passwords
+  rp_ran "$1" "$RP2" set_passwords "$RPROOT"
+  rp_skip "$1" '2026-06-01 08:00:00' set_passwords
+}
+rp() { # name [ansible args...]: role 01's B14 on lab tree $W/rp/<name>; returns ansible's rc
+  local n=$1 rc=0
+  shift
+  rm -f "$W/out/rp-$n".*
+  (cd "$HERE" && LC_ALL=C.UTF-8 ANSIBLE_ROLES_PATH="$ROOT/roles" ANSIBLE_LOCALHOST_WARNING=False \
+    ANSIBLE_INVENTORY_UNPARSED_WARNING=False ANSIBLE_NOCOLOR=1 ANSIBLE_RETRY_FILES_ENABLED=False \
+    ansible-playbook rootpw.yml -vvv -e "lab_dir=$W/rp/$n" -e "lab_out=$W/out/rp-$n.json" "$@") \
+    >"$W/out/rp-$n.log" 2>&1 || rc=$?
+  return "$rc"
+}
+rp_is() { # test name what "verdict changed cloud kind" [ansible args...]: run B14, compare the four facts ("-": none)
+  local t=$1 n=$2 what=$3 want=$4
+  shift 4
+  if ! rp "$n" "$@"; then
+    fail "$t" "$n: the run failed, and B14 must never stop a run (log $W/out/rp-$n.log)"
+    grep -E '"msg"|ERROR|fatal' "$W/out/rp-$n.log" | head -n 3 | cut -c1-400
+    return 1
+  fi
+  expect "$t" "$what" "$(j "rp-$n" '" ".join(d["rootpw"][k] or "-" for k in ("verdict", "changed", "cloud", "kind"))')" "$want"
+}
+rp_note() { j "rp-$1" '(d["notes"] + ["none"])[0]'; } # run-name: the plan note, or "none"
+rp_has() { j "rp-$1" "[s in (d['notes'] + [''])[0] for s in [$2]]"; } # run-name '"text", ...': which are in the note
+rp_starts() { case $(rp_note "$1") in "$2"*) echo yes ;; *) echo no ;; esac; } # run-name text: does the note start with it?
+rp_scan() { # name [directory to put first in PATH]: the scan script alone, on a lab tree
+  PATH="${2:+$2:}$PATH" sh -c "$(cat "$RPSCAN")" sh "$W/rp/$1/shadow" "$W/rp/$1/cloud" "$W/rp/$1/log/cloud-init.log" 2>&1
+}
+rp_task() { # run-name part-of-a-task-name: ok or skipping
+  awk -v t="$2" '/^TASK \[/ { on = index($0, t) > 0; next } on && /^(ok|skipping|fatal):/ { sub(/:.*/, ""); print; exit }' \
+    "$W/out/rp-$1.log"
+}
+rp_report() { # run-name: the line role 10 writes about root's password, from the facts of that run of role 01
+  local d=$W/rp/report-$1
+  rm -rf "$d"
+  mkdir -p "$d" && cp "$ROOT/tests/report/semantics/play.yml" "$d/play.yml" || return 1
+  (cd "$d" && LC_ALL=C.UTF-8 ANSIBLE_ROLES_PATH="$ROOT/roles" ANSIBLE_LOCALHOST_WARNING=False \
+    ANSIBLE_INVENTORY_UNPARSED_WARNING=False ANSIBLE_NOCOLOR=1 ANSIBLE_RETRY_FILES_ENABLED=False \
+    ansible-playbook -i localhost, play.yml -e "$(j "rp-$1" '{"_base_rootpw": d["rootpw"], "ssh_port": 22}')") >"$d/log" 2>&1 || return 1
+  grep "oot's password" "$d/reports/security-report-localhost.md"
+}
+D1=$(rp_day 2026-03-02)
+D2=$(rp_day 2026-05-11)
+
+# The scan script alone. Its lines, on cloud-init's own log: the two runs
+# count, with root named in both; the two reboots do not.
+rp_new fixture
+cp "$RPFIX" "$W/rp/fixture/log/cloud-init.log" || die "copy the fixture log"
+rp_shadow fixture "$RPHASH" "$D2"
+expect scan "cloud-init's own log: two runs that set root's password, on two days" \
+  "$(rp_scan fixture | paste -sd'|' -)" "P usable $D2|L 2026-03-02 ran|L 2026-03-02 root|L 2026-05-11 ran|L 2026-05-11 root"
+expect scan "(that log names the module on 4 days: the 2 reboots must not count)" \
+  "$(grep -E 'set[-_]passwords' "$RPFIX" | cut -c1-10 | sort -u | wc -l)" 4
+rp_server reset
+rp_shadow reset "$RPHASH" "$D2"
+want="P usable $D2|S $(date -u -d "$RP1" +%s)|S $(date -u -d "$RP2" +%s)|L 2026-03-02 ran|L 2026-03-02 root|L 2026-05-11 ran|L 2026-05-11 root"
+expect scan "a server reset once in the panel: root's entry, two marks, two runs in the log" "$(rp_scan reset | paste -sd'|' -)" "$want"
+for a in mawk gawk; do
+  command -v "$a" >/dev/null 2>&1 || continue
+  mkdir -p "$W/rp/bin-$a" && ln -sf "$(command -v "$a")" "$W/rp/bin-$a/awk"
+  expect scan "the same lines with $a as awk" "$(rp_scan reset "$W/rp/bin-$a" | paste -sd'|' -)" "$want"
+done
+expect scan "a bad call prints its usage and exits 2" "$(sh -c "$(cat "$RPSCAN")" sh a b 2>&1; echo "rc=$?")" \
+  "E usage: autosec-rootpw-scan <shadow> <cloud_dir> <cloud_log>
+rc=2"
+
+# Like a real server: one mark, one log file with the lines of the day the
+# server was made, then a later boot from the provider's side with the same
+# instance, where cloud-init says "already ran". That later day is no
+# password run.
+rp_new real
+rp_sem real 0c9a55d1 "$RP1"
+rp_ran real "$RP1" set_passwords "$RPROOT"
+rp_skip real "$RP2" set_passwords
+rp_shadow real "$RPHASH" "$D1"
+expect scan "like a real server: four lines (root's entry, the mark, the run and root's name on the day it was made)" \
+  "$(rp_scan real | paste -sd'|' -)" "P usable $D1|S $(date -u -d "$RP1" +%s)|L 2026-03-02 ran|L 2026-03-02 root"
+if rp_is rootpw real "like a real server, the first password still there: the note" "provider 2026-03-02 2026-03-02 named"; then
+  expect rootpw "real: the note names cloud-init and the day" \
+    "$(rp_starts real "[N01-R1] root's password was set by cloud-init on 2026-03-02 (cloud-init's log names root), and")" yes
+  expect rootpw "real: role 10 writes the same sentences into the report" "$(rp_report real)" \
+    "- **The hosting provider may know root's password** (read during this run): $(j rp-real 'd["rootpw"]["text"]')"
+fi
+rp_shadow real "$RPHASH" "$D2"
+rp_is rootpw real "like a real server, own password set on the day of that later boot: no note" "later 2026-05-11 2026-03-02 named"
+rp_shadow real "$RPHASH" "$(rp_day 2026-07-01)"
+if rp_is rootpw real "like a real server, after a change with passwd: no note" "later 2026-07-01 2026-03-02 named"; then
+  expect rootpw "real, changed: no note" "$(rp_note real)" none
+  expect rootpw "real, changed: the report says after which day" "$(rp_report real)" \
+    "- Root's password (read during this run): last changed on 2026-07-01, after cloud-init set it on this server (2026-03-02)"
+fi
+
+# The password from the day the server was made.
+rp_new deploy
+rp_sem deploy 0c9a55d1 "$RP1"
+rp_ran deploy "$RP1" set_passwords "$RPROOT"
+rp_skip deploy '2026-03-20 06:15:00' set_passwords
+rp_shadow deploy "$RPHASH" "$D1"
+before=$(cd "$W/rp/deploy" && find . -printf '%p %y %m %T@ %s\n' | sort | sha256sum)
+if rp_is rootpw deploy "set when the server was made, not changed since: the note" "provider 2026-03-02 2026-03-02 named"; then
+  expect rootpw "deploy: the note starts with the ID, cloud-init and the day" \
+    "$(rp_starts deploy "[N01-R1] root's password was set by cloud-init on 2026-03-02 (cloud-init's log names root), and")" yes
+  expect rootpw "deploy: it says what to do, that a panel reset does not help, and that the file knows only days; no SSH" \
+    "$(rp_has deploy '"Change it inside the server with", "A reset in the panel hands the new password to the provider again.", "records only the day", "systems may hold this password", "SSH"')" \
+    "[true, true, true, true, false]"
+  expect rootpw "deploy: one note, and the report gets the same sentences" \
+    "$(j rp-deploy '[len(d["notes"]), d["notes"][0] == "[N01-R1] " + d["rootpw"]["text"]]')" "[1, true]"
+  expect rootpw "deploy: the lab tree is as before (nothing written, no time changed)" \
+    "$(cd "$W/rp/deploy" && find . -printf '%p %y %m %T@ %s\n' | sort | sha256sum)" "$before"
+  expect rootpw "deploy: role 01 is in the run, so the plan shows the note and B14 does not print it again" \
+    "$(rp_task deploy 'the note, when the plan does not show role 01')" skipping
+fi
+if rp_is rootpw deploy "the same when the tags leave role 01 out" "provider 2026-03-02 2026-03-02 named" -e lab_role_runs=false; then
+  expect rootpw "deploy, role 01 not in the tags: B14 prints the note itself" \
+    "$(rp_task deploy 'the note, when the plan does not show role 01')" ok
+fi
+rm -f "$W/rp/deploy/log/cloud-init.log"
+if rp_is rootpw deploy "the mark alone (no log of that run is left): the note" "provider 2026-03-02 2026-03-02 mark"; then
+  expect rootpw "mark alone: the same day, and that the log does not say whose password was set" \
+    "$(rp_starts deploy "[N01-R1] root's password was last changed on 2026-03-02, the same day cloud-init's password step ran on this server. cloud-init's log does not say whose password that run set. The password file records only the day")" yes
+fi
+rp_new deploy-log
+rp_ran deploy-log "$RP1" set-passwords "Setting hashed password for ['root']:"
+rp_shadow deploy-log "$RPHASH" "$D1"
+rp_is rootpw deploy-log "the log alone (no mark), old module name, a hashed password" "provider 2026-03-02 2026-03-02 named"
+
+# A reset in the panel: cloud-init runs again, as for a new server.
+if rp_is rootpw reset "reset in the panel: the note names the day of the reset" "provider 2026-05-11 2026-05-11 named"; then
+  expect rootpw "reset: the note" "$(rp_starts reset "[N01-R1] root's password was set by cloud-init on 2026-05-11 ")" yes
+fi
+rp_is rootpw reset "reset, in --check: the same (the read runs in check mode too)" "provider 2026-05-11 2026-05-11 named" --check
+# 23:40 UTC is already the next day east of UTC. The days must be UTC
+# days, whatever the timezone of this computer (here: UTC+14 and UTC-11).
+for z in Pacific/Kiritimati Pacific/Pago_Pago; do
+  TZ=$z rp_is rootpw reset "reset, with TZ=$z here: the same days" "provider 2026-05-11 2026-05-11 named"
+done
+if rp_is rootpw fixture "cloud-init's own log, no marks: the same" "provider 2026-05-11 2026-05-11 named"; then
+  expect rootpw "fixture: cloud-init's log names root" "$(rp_has fixture '"was set by cloud-init on 2026-05-11"')" "[true]"
+fi
+
+# Changed inside the server on a later day: nothing to say.
+rp_shadow reset "$RPHASH" "$(rp_day 2026-07-01)"
+if rp_is rootpw reset "changed with passwd on a later day: no note" "later 2026-07-01 2026-05-11 named"; then
+  expect rootpw "later: no note" "$(rp_note reset)" none
+fi
+rp_skip reset '2026-08-15 12:00:00' set_passwords
+rp_is rootpw reset "a reboot after that change (the log says: already ran): still no note" "later 2026-07-01 2026-05-11 named"
+rp_shadow reset "$RPHASH" "$(rp_day 2026-05-12)"
+rp_is rootpw reset "changed the day after the reset: no note" "later 2026-05-12 2026-05-11 named"
+rp_shadow deploy "$RPHASH" "$(rp_day 2026-07-01)"
+if rp_is rootpw deploy "changed on a later day than a mark with no log: no note" "later 2026-07-01 2026-03-02 mark"; then
+  expect rootpw "later, mark: the report says the step ran, not whose password it set" "$(rp_report deploy)" \
+    "- Root's password (read during this run): last changed on 2026-07-01, after cloud-init's password step ran on this server (2026-03-02)"
+fi
+
+# Which runs count. A run whose log names no root does not: cloud-init set
+# no password for root then.
+rp_new keyonly
+rp_sem keyonly 0c9a55d1 "$RP1"
+rp_ran keyonly "$RP1" set_passwords
+rp_shadow keyonly "$RPHASH" "$D1"
+if rp_is rootpw keyonly "made with keys only (the step ran, its log names nobody), own password set that day: not checked" \
+     "no-evidence 2026-03-02 - -"; then
+  expect rootpw "keys only: no note" "$(rp_note keyonly)" none
+  expect rootpw "keys only: the report says not checked, and why" "$(rp_report keyonly)" \
+    "- Root's password (read during this run): root has one, last changed on 2026-03-02. Whether the hosting provider's panel set it was not checked: this server has no record of cloud-init setting a password for root"
+fi
+rp_new snapshot
+rp_sem snapshot 0c9a55d1 "$RP1"
+rp_ran snapshot "$RP1" set_passwords "$RPROOT"
+rp_sem snapshot 5e1f20c7 "$RP2"
+rp_ran snapshot "$RP2" set_passwords
+rp_shadow snapshot "$RPHASH" "$(rp_day 2026-04-01)"
+if rp_is rootpw snapshot "your own snapshot on a new server (own password, then a new-instance run that names nobody): no note" \
+     "later 2026-04-01 2026-03-02 named"; then
+  expect rootpw "snapshot: no note" "$(rp_note snapshot)" none
+fi
+rp_new everyboot
+rp_always everyboot "$RP1" "$RPROOT"
+for s in "$RP2" '2026-06-01 08:00:00' '2026-08-15 12:00:00'; do rp_always everyboot "$s"; done
+rp_shadow everyboot "$RPHASH" "$(rp_day 2026-04-01)"
+if rp_is rootpw everyboot "a step set to run at every boot that names nobody, after an own password and three reboots: no note" \
+     "later 2026-04-01 2026-03-02 named"; then
+  expect rootpw "every boot: no note" "$(rp_note everyboot)" none
+fi
+rp_new kept
+rp_sem kept 0c9a55d1 "$RP1"
+rp_sem kept 5e1f20c7 "$RP2"
+rp_ran kept "$RP1" set_passwords "$RPROOT"
+rp_ran kept "$RP2" set_passwords "Changing password for ['ubuntu']:"
+rp_shadow kept "$RPHASH" "$D1"
+if rp_is rootpw kept "the first password is still there after a later run that set another account's: the note, for the first day" \
+     "provider 2026-03-02 2026-03-02 named"; then
+  expect rootpw "kept: the note names the day cloud-init set root's own password" \
+    "$(rp_has kept '"was set by cloud-init on 2026-03-02"')" "[true]"
+fi
+
+# Older than the last day that counts, or no day at all: the note says both
+# facts. (The deploy lab has only its mark by now.)
+rp_shadow deploy "$RPHASH" "$(rp_day 2026-01-15)"
+if rp_is rootpw deploy "a mark with no log, later than the last change: the note" "provider 2026-01-15 2026-03-02 mark"; then
+  expect rootpw "older, mark: the note says both facts, and that the log does not say whose password was set" \
+    "$(rp_starts deploy "[N01-R1] The password file says root's password was last changed on 2026-01-15, but cloud-init's password step ran after that, on 2026-03-02. cloud-init's log does not say whose password that run set. The hosting provider's panel can set")" yes
+  expect rootpw "older: nothing about the same day" "$(rp_has deploy '"records only the day"')" "[false]"
+fi
+rp_new older
+rp_sem older 0c9a55d1 "$RP1"
+rp_ran older "$RP1" set_passwords "$RPROOT"
+rp_shadow older "$RPHASH" "$(rp_day 2026-01-15)"
+if rp_is rootpw older "cloud-init's log names root on a later day than the last change: the note" "provider 2026-01-15 2026-03-02 named"; then
+  expect rootpw "older, named: the note says both facts" \
+    "$(rp_starts older "[N01-R1] The password file says root's password was last changed on 2026-01-15, but cloud-init's log says it set root's password after that, on 2026-03-02. The hosting provider's panel can set")" yes
+fi
+for d in 0 abc '' 1234567; do
+  rp_shadow deploy "$RPHASH" "$d"
+  if rp_is rootpw deploy "day of the last change is '$d' (0: change it at the next login): the note, without a day" \
+       "provider - 2026-03-02 mark"; then
+    expect rootpw "day '$d': the note says the file has no day, and what is known of cloud-init's run" \
+      "$(rp_starts deploy "[N01-R1] root has a password, and the password file does not say when it was last changed. cloud-init's password step ran on this server on 2026-03-02, and its log does not say whose password that run set. The hosting provider's panel can set")" yes
+  fi
+done
+rp_shadow older "$RPHASH" 0
+if rp_is rootpw older "no day, and cloud-init's log names root: the note" "provider - 2026-03-02 named"; then
+  expect rootpw "no day, named: the note" \
+    "$(rp_starts older "[N01-R1] root has a password, and the password file does not say when it was last changed. cloud-init's log says it set root's password on 2026-03-02. The hosting provider's panel can set")" yes
+fi
+printf 'root:%s\n' "$RPHASH" >"$W/rp/deploy/shadow"
+rp_is rootpw deploy "a short line for root (two fields): the note, without a day" "provider - 2026-03-02 mark"
+
+# No usable password: nothing to say about the provider.
+# shellcheck disable=SC2016 # literal text
+for f in '!' '*' '!!' '!$y$j9T$LABHASHMUSTNOTLEAK$locked' '*LK*'; do
+  rp_shadow reset "$f" "$D2"
+  if rp_is rootpw reset "a locked password ($(printf '%s' "$f" | cut -c1-2)): no note" "locked 2026-05-11 2026-05-11 named"; then
+    expect rootpw "locked: no note" "$(rp_note reset)" none
+  fi
+done
+
+# An empty password field: its own note, N01-R2.
+rp_shadow reset '' "$D2"
+if rp_is rootpw reset "an empty password field: note N01-R2" "empty 2026-05-11 2026-05-11 named"; then
+  expect rootpw "empty: the note says who can become root without a password" \
+    "$(rp_starts reset "[N01-R2] root's password is empty. With the default settings of Ubuntu and Debian, anyone at the server's console, and any account on the server with")" yes
+  expect rootpw "empty: one note, with what to do; nothing about the provider" \
+    "$(j rp-reset '[len(d["notes"]), "Set one inside the server with" in d["notes"][0], "provider" in d["notes"][0], "N01-R1" in d["notes"][0]]')" \
+    "[1, true, false, false]"
+  expect rootpw "empty: the report gets the same sentences" \
+    "$(j rp-reset '[d["notes"][0].endswith("is empty. " + d["rootpw"]["text"]), d["rootpw"]["text"][:26]]')" '[true, "With the default settings "]'
+  expect rootpw "empty: role 10 writes the same sentences into the report" "$(rp_report reset)" \
+    "- **Root's password is empty** (read during this run): $(j rp-reset 'd["rootpw"]["text"]')"
+  expect rootpw "empty: role 01 is in the run, so the plan shows the note" \
+    "$(rp_task reset 'the note, when the plan does not show role 01')" skipping
+fi
+if rp_is rootpw reset "an empty password field, the tags leave role 01 out" "empty 2026-05-11 2026-05-11 named" -e lab_role_runs=false; then
+  expect rootpw "empty, role 01 not in the tags: B14 prints the note itself" \
+    "$(rp_task reset 'the note, when the plan does not show role 01')" ok
+fi
+rp_new bare
+rm -rf "$W/rp/bare/cloud" "$W/rp/bare/log"
+rp_shadow bare '' "$D1"
+if rp_is rootpw bare "an empty password field on a server without cloud-init: the same note" "empty 2026-03-02 - -"; then
+  expect rootpw "empty, no cloud-init: note N01-R2" "$(rp_starts bare "[N01-R2] root's password is empty. ")" yes
+fi
+
+# No record of cloud-init setting a password for root: not checked.
+rp_new plain
+rm -rf "$W/rp/plain/cloud" "$W/rp/plain/log"
+rp_shadow plain "$RPHASH" "$D1"
+if rp_is rootpw plain "no cloud-init on the server at all: no note" "no-evidence 2026-03-02 - -"; then
+  expect rootpw "no cloud-init: no note" "$(rp_note plain)" none
+fi
+rp_new never
+mkdir -p "$W/rp/never/cloud/instances/0c9a55d1/sem"
+: >"$W/rp/never/cloud/instances/0c9a55d1/sem/config_ssh"
+rp_skip never "$RP1" set_passwords
+rp_shadow never "$RPHASH" "$D1"
+rp_is rootpw never "cloud-init is there, but its password step never ran (no mark, only 'already ran' lines): not checked" \
+  "no-evidence 2026-03-02 - -"
+sed '/^root:/d' "$W/rp/never/shadow" >"$W/rp/never/shadow.new" && mv "$W/rp/never/shadow.new" "$W/rp/never/shadow"
+rp_is rootpw never "no line for root in the password file: not read" "unread - - -"
+
+# Files that cannot be read (not as root: root reads everything).
+if [ "$(id -u)" = 0 ]; then
+  info rootpw "running as root: the unreadable-file cases are left out"
+else
+  rp_server closed
+  rp_shadow closed "$RPHASH" "$D2"
+  chmod 000 "$W/rp/closed/shadow"
+  rp_is rootpw closed "the password file cannot be read: not read, no note, and the run goes on" "unread - 2026-05-11 named"
+  chmod 644 "$W/rp/closed/shadow"
+  chmod 000 "$W/rp/closed/log/cloud-init.log" "$W/rp/closed/cloud/instances"
+  if rp_is rootpw closed "cloud-init's files cannot be read: not checked, no note, and the run goes on" "no-evidence 2026-05-11 - -"; then
+    expect rootpw "unreadable: no note" "$(rp_note closed)" none
+  fi
+  chmod 755 "$W/rp/closed/cloud/instances"
+  chmod 644 "$W/rp/closed/log/cloud-init.log"
+fi
+
+# Garbled files. A mark with another content counts by the file's own time;
+# a link or a folder in its place does not count.
+rp_new odd
+rp_sem odd 0c9a55d1 "$RP1"
+printf 'not a number\n' >"$W/rp/odd/cloud/instances/0c9a55d1/sem/config_set_passwords"
+touch -d "$RP1 UTC" "$W/rp/odd/cloud/instances/0c9a55d1/sem/config_set_passwords"
+printf '607: %s.5\n' "$(date -u -d '2026-09-09 09:09:09' +%s)" >"$W/rp/odd/elsewhere"
+mkdir -p "$W/rp/odd/cloud/instances/1-link/sem" "$W/rp/odd/cloud/instances/2-dir/sem/config_set_passwords"
+ln -s ../../../../elsewhere "$W/rp/odd/cloud/instances/1-link/sem/config_set_passwords"
+printf '607: 12\n' >"$W/rp/odd/cloud/instances/2-dir/sem/config_set_passwords/x"
+rp_sem odd 3-long '2026-03-02 10:20:31'
+printf '607: 99999999999999999999.5\n' >"$W/rp/odd/cloud/instances/3-long/sem/config_set_passwords"
+touch -d '2026-03-02 10:20:31 UTC' "$W/rp/odd/cloud/instances/3-long/sem/config_set_passwords"
+rp_shadow odd "$RPHASH" "$D1"
+expect scan "marks with other content or too long a number: the file's own time; a link and a folder in its place: nothing" \
+  "$(rp_scan odd | paste -sd'|' -)" "P usable $D1|S $(date -u -d "$RP1" +%s)|S $(($(date -u -d "$RP1" +%s) + 1))"
+rp_is rootpw odd "a garbled mark: its file time still counts" "provider 2026-03-02 2026-03-02 mark"
+rp_new junk
+{
+  head -c 3000 /dev/urandom
+  printf '\n%s\n' "Changing password for ['root']:" "helpers.py[DEBUG]: Running config-set_passwords using lock (x)"
+  printf '%s\n' "2026-04-04 10:00:00,000 - util.py[DEBUG]: user-data: Changing password for ['root']:" \
+    "2026-04-04 10:00:00 - cc_set_passwords.py[DEBUG]: Changing password for ['root']:" \
+    "Apr  4 10:00:00 lab [CLOUDINIT] cc_set_passwords.py[DEBUG]: Changing password for ['root']:" \
+    "2026-04-04 10:00:00,000 - cc_set_passwords.py[INFO]: Changing password for ['root']:" \
+    "2026-04-04 10:00:00,000 - helpers.py[DEBUG]: config-set_passwords already ran (freq=once-per-instance)" \
+    "2026-13-45 10:00:00,000 - helpers.py[DEBUG]: Running config-set_passwords using lock (x)"
+  printf '2026-04-04 10:00:00,000 - cc_set_passwords.py[DEBUG]: Changing pass'
+} >"$W/rp/junk/log/cloud-init.log"
+printf 'not gzip at all\n' >"$W/rp/junk/log/cloud-init.log.2.gz"
+rp_shadow junk "$RPHASH" "$D1"
+expect scan "a garbled log: only a line of cloud-init's exact shape gets through (here one, with a day that is none)" \
+  "$(rp_scan junk | paste -sd'|' -)" "P usable $D1|L 2026-13-45 ran"
+rp_is rootpw junk "a garbled log, and a day that is no day: not checked, no note, the run goes on" "no-evidence 2026-03-02 - -"
+
+# Rotated logs: the runs are in .1 and in .2.gz, the current log has only reboots.
+rp_new rotated
+rp_ran rotated "$RP1" set-passwords "$RPROOT"
+gzip -c "$W/rp/rotated/log/cloud-init.log" >"$W/rp/rotated/log/cloud-init.log.2.gz"
+: >"$W/rp/rotated/log/cloud-init.log"
+rp_ran rotated "$RP2" set_passwords "$RPROOT"
+mv "$W/rp/rotated/log/cloud-init.log" "$W/rp/rotated/log/cloud-init.log.1"
+rp_skip rotated '2026-06-01 08:00:00' set_passwords
+printf 'not gzip at all\n' >"$W/rp/rotated/log/cloud-init.log.3.gz"
+rp_shadow rotated "$RPHASH" "$D2"
+rp_is rootpw rotated "the runs are only in rotated logs (.1, .2.gz; a broken .3.gz is skipped): the note" \
+  "provider 2026-05-11 2026-05-11 named"
+
+# Root over SSH with a password: one more sentence, from role 02's facts.
+rp_shadow reset "$RPHASH" "$D2"
+ssh_facts() { printf '{"_ssh_enabled": %s, "_ssh_before": {"admin": {}, "root": {%s}}}' "$1" "$2"; }
+YES='"permitrootlogin": "yes", "passwordauthentication": "yes", "authenticationmethods": "any"'
+if rp_is rootpw reset "sshd lets root in with a password" "provider 2026-05-11 2026-05-11 named" -e "$(ssh_facts true "$YES")"; then
+  expect rootpw "SSH: the note ends with the SSH sentence" "$(rp_note reset | grep -o 'Root can also log in over SSH with this password\.$')" \
+    "Root can also log in over SSH with this password."
+fi
+for c in "true|\"permitrootlogin\": \"prohibit-password\", \"passwordauthentication\": \"yes\"|root with keys only" \
+         "true|\"permitrootlogin\": \"yes\", \"passwordauthentication\": \"no\"|passwords off" \
+         "true|\"permitrootlogin\": \"yes\", \"passwordauthentication\": \"yes\", \"authenticationmethods\": \"publickey\"|an AuthenticationMethods list" \
+         "true||no values for root" \
+         "false|$YES|ssh_hardening_enabled false"; do
+  IFS='|' read -r en kv what <<<"$c"
+  if rp_is rootpw reset "sshd: $what" "provider 2026-05-11 2026-05-11 named" -e "$(ssh_facts "$en" "$kv")"; then
+    expect rootpw "sshd, $what: nothing said about SSH" "$(rp_has reset '"SSH"')" "[false]"
+  fi
+done
+
+# The hash: in the lab's shadow files, and nowhere in what the runs printed
+# (-vvv) or kept.
+n=$(grep -l LABHASHMUSTNOTLEAK "$W"/rp/*/shadow 2>/dev/null | wc -l)
+if [ "$n" -ge 8 ]; then pass rootpw "the made-up hash is in $n lab shadow files"; else fail rootpw "the made-up hash is in only $n lab shadow files"; fi
+n=$(find "$W/out" -name 'rp-*' -type f | wc -l)
+bad=$(grep -l LABHASHMUSTNOTLEAK "$W"/out/rp-* 2>/dev/null | paste -sd' ' -)
+expect rootpw "and in none of the $n logs (-vvv) and facts files of these runs" "${bad:-none}" none
 
 echo
 echo "$PASSES passed, $FAILS failed"

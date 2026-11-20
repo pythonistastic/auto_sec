@@ -1,0 +1,91 @@
+2026-03-02 10:20:30,010 - util.py[DEBUG]: Attempting to remove /var/lib/cloud/instance/boot-finished
+2026-03-02 10:20:30,021 - stages.py[DEBUG]: Using distro class <class 'cloudinit.distros.ubuntu.Distro'>
+2026-03-02 10:20:30,032 - util.py[DEBUG]: Attempting to remove /var/lib/cloud/instance
+2026-03-02 10:20:30,043 - util.py[DEBUG]: Creating symbolic link from '/var/lib/cloud/instance' => '/var/lib/cloud/instances/0c9a55d1f3b84e6f9d1e7a2b3c4d5e6f7a8b9c0d'
+2026-03-02 10:20:30,054 - util.py[DEBUG]: Reading from /var/lib/cloud/instances/0c9a55d1f3b84e6f9d1e7a2b3c4d5e6f7a8b9c0d/datasource (quiet=False)
+2026-03-02 10:20:30,065 - util.py[DEBUG]: Writing to /var/lib/cloud/instances/0c9a55d1f3b84e6f9d1e7a2b3c4d5e6f7a8b9c0d/datasource - wb: [644] 21 bytes
+2026-03-02 10:20:30,076 - util.py[DEBUG]: Writing to /var/lib/cloud/data/previous-datasource - wb: [644] 21 bytes
+2026-03-02 10:20:30,087 - util.py[DEBUG]: Reading from /var/lib/cloud/data/instance-id (quiet=False)
+2026-03-02 10:20:30,098 - stages.py[DEBUG]: previous iid found to be NO_PREVIOUS_INSTANCE_ID
+2026-03-02 10:20:30,109 - util.py[DEBUG]: Writing to /var/lib/cloud/data/instance-id - wb: [644] 41 bytes
+2026-03-02 10:20:30,120 - util.py[DEBUG]: Writing to /run/cloud-init/.instance-id - wb: [644] 41 bytes
+2026-03-02 10:20:30,131 - util.py[DEBUG]: Writing to /var/lib/cloud/data/previous-instance-id - wb: [644] 24 bytes
+2026-03-02 10:20:30,142 - util.py[DEBUG]: Writing to /var/lib/cloud/instance/obj.pkl - wb: [400] 3392 bytes
+2026-03-02 10:20:30,164 - handlers.py[DEBUG]: start: modules-config: running modules for config
+2026-03-02 10:20:30,175 - stages.py[DEBUG]: Using distro class <class 'cloudinit.distros.ubuntu.Distro'>
+2026-03-02 10:20:30,186 - modules.py[DEBUG]: Running module set-passwords (<module 'cloudinit.config.cc_set_passwords' from '/usr/lib/python3/dist-packages/cloudinit/config/cc_set_passwords.py'>) with frequency once-per-instance
+2026-03-02 10:20:30,208 - handlers.py[DEBUG]: start: modules-config/config-set-passwords: running config-set-passwords with frequency once-per-instance
+2026-03-02 10:20:30,230 - util.py[DEBUG]: Writing to /var/lib/cloud/instances/0c9a55d1f3b84e6f9d1e7a2b3c4d5e6f7a8b9c0d/sem/config_set_passwords - wb: [644] 24 bytes
+2026-03-02 10:20:30,241 - helpers.py[DEBUG]: Running config-set-passwords using lock (<FileLock using file '/var/lib/cloud/instances/0c9a55d1f3b84e6f9d1e7a2b3c4d5e6f7a8b9c0d/sem/config_set_passwords'>)
+2026-03-02 10:20:30,252 - cc_set_passwords.py[DEBUG]: Setting hashed password for ['root']:
+2026-03-02 10:20:30,263 - subp.py[DEBUG]: Running command ['chpasswd', '-e'] with allowed return codes [0] (shell=False, capture=True)
+2026-03-02 10:20:30,274 - cc_set_passwords.py[DEBUG]: Leaving SSH config 'PasswordAuthentication' unchanged. ssh_pwauth=None
+2026-03-02 10:20:30,296 - handlers.py[DEBUG]: finish: modules-config/config-set-passwords: SUCCESS: config-set-passwords ran successfully and took 0.006 seconds
+2026-03-02 10:20:30,318 - handlers.py[DEBUG]: finish: modules-config: SUCCESS: running modules for config
+2026-03-20 06:15:00,010 - util.py[DEBUG]: Attempting to remove /var/lib/cloud/instance/boot-finished
+2026-03-20 06:15:00,021 - stages.py[DEBUG]: Using distro class <class 'cloudinit.distros.ubuntu.Distro'>
+2026-03-20 06:15:00,032 - stages.py[INFO]: Instance link already exists, not recreating it.
+2026-03-20 06:15:00,043 - util.py[DEBUG]: Reading from /var/lib/cloud/instances/0c9a55d1f3b84e6f9d1e7a2b3c4d5e6f7a8b9c0d/datasource (quiet=False)
+2026-03-20 06:15:00,054 - util.py[DEBUG]: Reading 21 bytes from /var/lib/cloud/instances/0c9a55d1f3b84e6f9d1e7a2b3c4d5e6f7a8b9c0d/datasource
+2026-03-20 06:15:00,065 - util.py[DEBUG]: Writing to /var/lib/cloud/instances/0c9a55d1f3b84e6f9d1e7a2b3c4d5e6f7a8b9c0d/datasource - wb: [644] 21 bytes
+2026-03-20 06:15:00,076 - util.py[DEBUG]: Writing to /var/lib/cloud/data/previous-datasource - wb: [644] 21 bytes
+2026-03-20 06:15:00,087 - util.py[DEBUG]: Reading from /var/lib/cloud/data/instance-id (quiet=False)
+2026-03-20 06:15:00,098 - util.py[DEBUG]: Reading 41 bytes from /var/lib/cloud/data/instance-id
+2026-03-20 06:15:00,109 - stages.py[DEBUG]: previous iid found to be 0c9a55d1f3b84e6f9d1e7a2b3c4d5e6f7a8b9c0d
+2026-03-20 06:15:00,120 - util.py[DEBUG]: Writing to /var/lib/cloud/data/instance-id - wb: [644] 41 bytes
+2026-03-20 06:15:00,131 - util.py[DEBUG]: Writing to /run/cloud-init/.instance-id - wb: [644] 41 bytes
+2026-03-20 06:15:00,142 - util.py[DEBUG]: Writing to /var/lib/cloud/data/previous-instance-id - wb: [644] 41 bytes
+2026-03-20 06:15:00,153 - util.py[DEBUG]: Writing to /var/lib/cloud/instance/obj.pkl - wb: [400] 3392 bytes
+2026-03-20 06:15:00,164 - stages.py[INFO]: Not re-loading configuration, instance id and datasource have not changed.
+2026-03-20 06:15:00,186 - handlers.py[DEBUG]: start: modules-config: running modules for config
+2026-03-20 06:15:00,197 - modules.py[DEBUG]: Running module set-passwords (<module 'cloudinit.config.cc_set_passwords' from '/usr/lib/python3/dist-packages/cloudinit/config/cc_set_passwords.py'>) with frequency once-per-instance
+2026-03-20 06:15:00,219 - handlers.py[DEBUG]: start: modules-config/config-set-passwords: running config-set-passwords with frequency once-per-instance
+2026-03-20 06:15:00,230 - helpers.py[DEBUG]: config-set-passwords already ran (freq=once-per-instance)
+2026-03-20 06:15:00,252 - handlers.py[DEBUG]: finish: modules-config/config-set-passwords: SUCCESS: config-set-passwords previously ran
+2026-03-20 06:15:00,274 - handlers.py[DEBUG]: finish: modules-config: SUCCESS: running modules for config
+2026-05-11 23:40:12,010 - util.py[DEBUG]: Attempting to remove /var/lib/cloud/instance/boot-finished
+2026-05-11 23:40:12,021 - stages.py[DEBUG]: Using distro class <class 'cloudinit.distros.ubuntu.Distro'>
+2026-05-11 23:40:12,032 - util.py[DEBUG]: Attempting to remove /var/lib/cloud/instance
+2026-05-11 23:40:12,043 - util.py[DEBUG]: Creating symbolic link from '/var/lib/cloud/instance' => '/var/lib/cloud/instances/5e1f20c7a9d34b0e8c6f1a2b3c4d5e6f7a8b9c0d'
+2026-05-11 23:40:12,054 - util.py[DEBUG]: Reading from /var/lib/cloud/instances/5e1f20c7a9d34b0e8c6f1a2b3c4d5e6f7a8b9c0d/datasource (quiet=False)
+2026-05-11 23:40:12,065 - util.py[DEBUG]: Writing to /var/lib/cloud/instances/5e1f20c7a9d34b0e8c6f1a2b3c4d5e6f7a8b9c0d/datasource - wb: [644] 21 bytes
+2026-05-11 23:40:12,076 - util.py[DEBUG]: Writing to /var/lib/cloud/data/previous-datasource - wb: [644] 21 bytes
+2026-05-11 23:40:12,087 - util.py[DEBUG]: Reading from /var/lib/cloud/data/instance-id (quiet=False)
+2026-05-11 23:40:12,098 - util.py[DEBUG]: Reading 41 bytes from /var/lib/cloud/data/instance-id
+2026-05-11 23:40:12,109 - stages.py[DEBUG]: previous iid found to be 0c9a55d1f3b84e6f9d1e7a2b3c4d5e6f7a8b9c0d
+2026-05-11 23:40:12,120 - util.py[DEBUG]: Writing to /var/lib/cloud/data/instance-id - wb: [644] 41 bytes
+2026-05-11 23:40:12,131 - util.py[DEBUG]: Writing to /run/cloud-init/.instance-id - wb: [644] 41 bytes
+2026-05-11 23:40:12,142 - util.py[DEBUG]: Writing to /var/lib/cloud/data/previous-instance-id - wb: [644] 41 bytes
+2026-05-11 23:40:12,153 - util.py[DEBUG]: Writing to /var/lib/cloud/instance/obj.pkl - wb: [400] 3382 bytes
+2026-05-11 23:40:12,175 - handlers.py[DEBUG]: start: modules-config: running modules for config
+2026-05-11 23:40:12,186 - stages.py[DEBUG]: Using distro class <class 'cloudinit.distros.ubuntu.Distro'>
+2026-05-11 23:40:12,197 - modules.py[DEBUG]: Running module set_passwords (<module 'cloudinit.config.cc_set_passwords' from '/usr/lib/python3/dist-packages/cloudinit/config/cc_set_passwords.py'>) with frequency once-per-instance
+2026-05-11 23:40:12,219 - handlers.py[DEBUG]: start: modules-config/config-set_passwords: running config-set_passwords with frequency once-per-instance
+2026-05-11 23:40:12,241 - util.py[DEBUG]: Writing to /var/lib/cloud/instances/5e1f20c7a9d34b0e8c6f1a2b3c4d5e6f7a8b9c0d/sem/config_set_passwords - wb: [644] 24 bytes
+2026-05-11 23:40:12,252 - helpers.py[DEBUG]: Running config-set_passwords using lock (<FileLock using file '/var/lib/cloud/instances/5e1f20c7a9d34b0e8c6f1a2b3c4d5e6f7a8b9c0d/sem/config_set_passwords'>)
+2026-05-11 23:40:12,263 - cc_set_passwords.py[DEBUG]: Changing password for ['root']:
+2026-05-11 23:40:12,274 - subp.py[DEBUG]: Running command ['chpasswd'] with allowed return codes [0] (shell=False, capture=True)
+2026-05-11 23:40:12,285 - cc_set_passwords.py[DEBUG]: Leaving SSH config 'PasswordAuthentication' unchanged. ssh_pwauth=None
+2026-05-11 23:40:12,307 - handlers.py[DEBUG]: finish: modules-config/config-set_passwords: SUCCESS: config-set_passwords ran successfully and took 0.005 seconds
+2026-05-11 23:40:12,329 - handlers.py[DEBUG]: finish: modules-config: SUCCESS: running modules for config
+2026-06-01 08:00:00,010 - util.py[DEBUG]: Attempting to remove /var/lib/cloud/instance/boot-finished
+2026-06-01 08:00:00,021 - stages.py[DEBUG]: Using distro class <class 'cloudinit.distros.ubuntu.Distro'>
+2026-06-01 08:00:00,032 - stages.py[INFO]: Instance link already exists, not recreating it.
+2026-06-01 08:00:00,043 - util.py[DEBUG]: Reading from /var/lib/cloud/instances/5e1f20c7a9d34b0e8c6f1a2b3c4d5e6f7a8b9c0d/datasource (quiet=False)
+2026-06-01 08:00:00,054 - util.py[DEBUG]: Reading 21 bytes from /var/lib/cloud/instances/5e1f20c7a9d34b0e8c6f1a2b3c4d5e6f7a8b9c0d/datasource
+2026-06-01 08:00:00,065 - util.py[DEBUG]: Writing to /var/lib/cloud/instances/5e1f20c7a9d34b0e8c6f1a2b3c4d5e6f7a8b9c0d/datasource - wb: [644] 21 bytes
+2026-06-01 08:00:00,076 - util.py[DEBUG]: Writing to /var/lib/cloud/data/previous-datasource - wb: [644] 21 bytes
+2026-06-01 08:00:00,087 - util.py[DEBUG]: Reading from /var/lib/cloud/data/instance-id (quiet=False)
+2026-06-01 08:00:00,098 - util.py[DEBUG]: Reading 41 bytes from /var/lib/cloud/data/instance-id
+2026-06-01 08:00:00,109 - stages.py[DEBUG]: previous iid found to be 5e1f20c7a9d34b0e8c6f1a2b3c4d5e6f7a8b9c0d
+2026-06-01 08:00:00,120 - util.py[DEBUG]: Writing to /var/lib/cloud/data/instance-id - wb: [644] 41 bytes
+2026-06-01 08:00:00,131 - util.py[DEBUG]: Writing to /run/cloud-init/.instance-id - wb: [644] 41 bytes
+2026-06-01 08:00:00,142 - util.py[DEBUG]: Writing to /var/lib/cloud/data/previous-instance-id - wb: [644] 41 bytes
+2026-06-01 08:00:00,153 - util.py[DEBUG]: Writing to /var/lib/cloud/instance/obj.pkl - wb: [400] 3382 bytes
+2026-06-01 08:00:00,164 - stages.py[INFO]: Not re-loading configuration, instance id and datasource have not changed.
+2026-06-01 08:00:00,186 - handlers.py[DEBUG]: start: modules-config: running modules for config
+2026-06-01 08:00:00,197 - modules.py[DEBUG]: Running module set_passwords (<module 'cloudinit.config.cc_set_passwords' from '/usr/lib/python3/dist-packages/cloudinit/config/cc_set_passwords.py'>) with frequency once-per-instance
+2026-06-01 08:00:00,219 - handlers.py[DEBUG]: start: modules-config/config-set_passwords: running config-set_passwords with frequency once-per-instance
+2026-06-01 08:00:00,230 - helpers.py[DEBUG]: config-set_passwords already ran (freq=once-per-instance)
+2026-06-01 08:00:00,252 - handlers.py[DEBUG]: finish: modules-config/config-set_passwords: SUCCESS: config-set_passwords previously ran
+2026-06-01 08:00:00,274 - handlers.py[DEBUG]: finish: modules-config: SUCCESS: running modules for config

@@ -1,7 +1,7 @@
 ---
 # roles/01-base/tasks/preflight.yml
 #
-# Read-only role 01 checks B1-B13. site.yml imports this file in pre_tasks
+# Read-only role 01 checks B1-B14. site.yml imports this file in pre_tasks
 # with tags [always], after the SSH preflight, so a refusal happens BEFORE
 # role 01 changes anything. It also runs in --check. It writes only below
 # /run/auto-sec (the trial runs' copies, removed again).
@@ -43,14 +43,17 @@
 #                                file, and sudo's configuration when checked)
 #   _base_sudo_write       bool  main step 6b writes /etc/sudoers.d/<user>
 #   _base_sudo_installed   bool  sudo is installed now
+#   _base_rootpw           dict  root's password and cloud-init (rootpw.yml)
 #   _plan_01               list  the plan items {role, part, do, what, note}
+#   _plan_01_notes         list  notes shown under role 01's line of the plan
 #   plus the plan facts of plan.yml and decide.yml.
 #
 # The variable checks (B1) run, and refuse, with every tag. Host checks and
 # refusals (B3, B5-B8, B13) run only when the tags select role 01 (tag
 # "base"), so that for example `--tags ssh` is not refused because of a
 # role 01 change that would not happen in that run. B12 (the account role
-# 02 logs in as) runs whenever role 02 runs.
+# 02 logs in as) runs whenever role 02 runs. B14 (root's password and
+# cloud-init) only reads and never refuses: it runs with every tag.
 
 - name: "Base preflight: start every base fact from a safe value"
   ansible.builtin.set_fact:
@@ -91,6 +94,8 @@
     _base_sysctl_legacy: false
     _base_sysctl_unread: false
     _plan_01: []
+    _plan_01_notes: []
+    _base_rootpw: {verdict: unread, changed: "", cloud: "", kind: "", text: ""}
     _base_hostname_static: ""
     _base_hostname_transient: ""
     _base_hostname_now: ""
@@ -334,6 +339,11 @@
 - name: "Base B13: kernel settings"
   when: _base_role_runs | bool
   ansible.builtin.import_tasks: kernel.yml
+
+# --- B14. Root's password and cloud-init, read only (always) ------------------
+
+- name: "Base B14: may the hosting provider know root's password?"
+  ansible.builtin.import_tasks: rootpw.yml
 
 # --- B7. Hostname and timezone (only when a change is planned) ---------------
 

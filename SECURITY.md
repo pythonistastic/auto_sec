@@ -219,6 +219,17 @@ a strict pattern check or a filter (printable ASCII, braces replaced by `?`).
   The groups and numbers decide only whether auto_sec refuses; they never reach a file.
 - **Kernel settings (role 01).** `/etc/sysctl.conf` is read for a count of setting lines
   and whether 0.1–0.5's seven lines are there (N01-K1, N01-K2).
+- **Root's password and cloud-init (role 01, since 0.6.1; notes N01-R1 and N01-R2).** A
+  script on the host (`roles/01-base/files/autosec-rootpw-scan`) looks at root's line in
+  `/etc/shadow` and prints two things: one of three fixed words (usable, locked, empty)
+  and the day of the last change, as a number. The password hash never leaves the host:
+  it is in no registered variable, log or message. The script also prints when
+  cloud-init's password step ran: the seconds in each
+  `/var/lib/cloud/instances/*/sem/config_set_passwords` (or that file's time), and, from
+  `/var/log/cloud-init.log` and its rotated copies, the days of that step's lines with one
+  of two fixed words (it ran; it named root). Every line is used only after a strict
+  pattern check (the fixed words, numbers, dates). The dates are shown in the plan's
+  notes and in the report; nothing else is, and nothing reaches the server.
 - **Packages (`roles/autosec-apt`).** `dpkg-query` states, `apt-get -s` output (only
   `Inst` and `Remv` lines count; names are shown after a pattern check) and the names of
   units with `NeedDaemonReload=yes` (shown after a pattern check). Package names come

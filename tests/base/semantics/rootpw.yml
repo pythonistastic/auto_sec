@@ -1,0 +1,40 @@
+---
+# Runs role 01's rootpw.yml (preflight B14: root's password and cloud-init,
+# notes N01-R1 and N01-R2) on localhost, unprivileged, against a lab tree
+# that run.sh builds: <lab_dir>/shadow, <lab_dir>/cloud (cloud-init's state
+# folder) and <lab_dir>/log/cloud-init.log with its rotated copies. The
+# script files/autosec-rootpw-scan runs unchanged, on those files.
+#   ansible-playbook rootpw.yml -e lab_dir=<dir> -e lab_out=<facts.json>
+#     [-e lab_role_runs=false] [--check]
+#     [-e '{"_ssh_enabled": true, "_ssh_before": {"root": {...}}}']
+#   lab_role_runs  false: the tags leave role 01 out, so the plan would not
+#                  show its notes and B14 prints the note itself
+#   _ssh_*         role 02's preflight facts (what sshd uses for root)
+- name: Role 01 root password check against a lab tree
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # Play vars beat the role defaults: point the role at the lab.
+    _base_shadow: "{{ lab_dir }}/shadow"
+    _base_cloud_dir: "{{ lab_dir }}/cloud"
+    _base_cloud_log: "{{ lab_dir }}/log/cloud-init.log"
+  tasks:
+    - name: "What the rest of the preflight would have set"
+      ansible.builtin.set_fact:
+        _base_role_runs: "{{ lab_role_runs | default(true) | bool }}"
+
+    - name: "B14 (role 01 rootpw.yml)"
+      ansible.builtin.include_role:
+        name: 01-base
+        tasks_from: rootpw
+
+    - name: Write the facts
+      check_mode: false
+      ansible.builtin.copy:
+        dest: "{{ lab_out }}"
+        mode: "0644"
+        content: >-
+          {{ {'rootpw': _base_rootpw, 'notes': _plan_01_notes,
+              'scan': _base_pf_rootpw.stdout_lines | default([]),
+              'scan_rc': _base_pf_rootpw.rc | default(-1)} | to_nice_json }}

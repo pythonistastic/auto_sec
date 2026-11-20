@@ -88,7 +88,8 @@ ansible-lint
 shopt -s globstar
 shellcheck -x scripts/*.sh tests/**/*.sh tests/guard/stubs/* tests/legacy/stubs/* \
   roles/02-ssh-hardening/files/auto-sec-ssh-guard \
-  roles/01-base/files/autosec-apt-sim roles/01-base/files/autosec-sudo-scan
+  roles/01-base/files/autosec-apt-sim roles/01-base/files/autosec-sudo-scan \
+  roles/01-base/files/autosec-rootpw-scan
 # the run-wide checks and the plan, without root (current ansible-core):
 bash tests/site/semantics/run.sh
 ```
@@ -173,7 +174,8 @@ machine or on a server you care about.
   unattended-upgrades code reports what it would install from and
   whether it would reboot, before and after. Role 01's package step
   runs against real `apt-get -s` output (fake `dpkg-query` and `apt-get`
-  in `PATH`).
+  in `PATH`). Its look at root's password (N01-R1, N01-R2) runs against
+  lab shadow files and cloud-init logs.
 - **Live tests** (`tests/fail2ban/live/`, `tests/base/live/`). The real
   roles against GitHub's Ubuntu 22.04 and 24.04 VMs. GitHub runners
   only: they reconfigure fail2ban, apt, the hostname and the timezone of
