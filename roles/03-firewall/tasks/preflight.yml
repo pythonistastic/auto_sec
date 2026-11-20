@@ -9,6 +9,8 @@
 #   ufw-preflight.yml  U2-U3 ufw: no command on an active ufw; the turn-on
 #                            checks when ufw is off and firewall_state is enabled
 #   below              PF1-PF4 fail2ban, only with fail2ban_hardening_enabled: true
+#                      and, with fail2ban_slow_scanners: true, the slow-scanner
+#                      files (slow-trial.yml, slow-decide.yml)
 #   end                _plan_03 (the run plan's role 03 lines)
 #
 # It writes only scratch copies under /run/auto-sec (tmpfs, root only,
@@ -19,7 +21,10 @@
 # restarts its sshd jail, and (only with -e fail2ban_migrate_jail_local=true)
 # moves a jail.local that auto_sec 0.1-0.4 wrote. It never becomes part of a
 # config file or a ufw rule: 00-autosec.conf and the ufw rules are built
-# from your variables only.
+# from your variables only. With fail2ban_slow_scanners: true, two things
+# read from the host decide what is written, each one checked first: a yes
+# or no (is the recidive section in 00-autosec-slow.conf?) and one number
+# (the seconds of dbpurgeage in fail2ban.d/00-autosec.conf).
 #
 # fail2ban facts set on every host:
 #   _f2b_enabled             bool  fail2ban_hardening_enabled is true ("keep" and "false": no)
@@ -33,6 +38,11 @@
 #   _f2b_pkg_want            list  packages the fail2ban part wants (autosec-apt)
 #   _f2b_plan                str   what role 03 does with fail2ban
 #   _f2b_report              str   one line for the report (role 10)
+#   _f2b_slow                bool  fail2ban_slow_scanners is true
+#   _f2b_slow_trial          dict  output of the last slow-scanner trial
+#   _f2b_slow_rec_in         bool  the recidive section is written (the trial says)
+#   _f2b_slow_db_s           int   dbpurgeage as written, in seconds (the trial says)
+#   _f2b_slow_plan           str   what role 03 does for slow scanners
 # and _plan_03: list of {role, part, do, what, note}; [] = no change.
 #
 # Checks that protect only role 03's own write (PF3) run only when the tags
@@ -65,6 +75,22 @@
     _f2b_will_restart_sshd: false
     _f2b_pkg_want: []
     _plan_03_f2b: []
+    _f2b_slow: "{{ (fail2ban_slow_scanners | default(false) | string | lower) in ['true', 'yes', '1', 'on'] }}"
+    _f2b_slow_trial: {}
+    _f2b_slow_rec_in: false
+    _f2b_slow_db_s: 0
+    _f2b_slow_jail_differs: false
+    _f2b_slow_db_differs: false
+    _f2b_slow_will_reload: false
+    _f2b_slow_will_set: false
+    _f2b_slow_plan: ""
+    _f2b_slow_jail_note: ""
+    _f2b_slow_db_note: ""
+    _f2b_slow_change_lines: []
+    _f2b_slow_rec_gone: false
+    _f2b_slow_note_ids: []
+    _f2b_slow_noted: []
+    _plan_03_slow: []
     _f2b_plan: >-
       {{ 'keep (no install, no file, no reload)'
          if (fail2ban_hardening_enabled | default('keep') | string | lower) not in ['true', 'yes', '1', 'on']
@@ -88,6 +114,55 @@
       or true (false means keep), and fail2ban_migrate_jail_local
       ({{ fail2ban_migrate_jail_local | default(false) }}) and fail2ban_nginx_jails
       ({{ fail2ban_nginx_jails | default(true) }}) true or false. Nothing has been changed.
+
+- name: "fail2ban preflight PF1: the slow-scanner switches are true or false"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (fail2ban_slow_scanners | default(false) | string | lower) in _f2b_bool_words
+      - (fail2ban_slow_recidive_enabled | default(true) | string | lower) in _f2b_bool_words
+    fail_msg: >-
+      fail2ban_slow_scanners ({{ fail2ban_slow_scanners | default(false) | string | truncate(30) }}) and
+      fail2ban_slow_recidive_enabled ({{ fail2ban_slow_recidive_enabled | default(true) | string | truncate(30) }})
+      must be true or false. Nothing has been changed.
+
+# The values reach jail.d/00-autosec-slow.conf (an INI file), so each one
+# has a strict shape, and all three keys are required: a jail without its
+# own findtime would take the short one from [DEFAULT].
+- name: "fail2ban preflight PF1: fail2ban_slow_sshd, fail2ban_slow_recidive and fail2ban_slow_dbpurgeage"
+  when: _f2b_slow | bool
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _f2b_sl_bad | length == 0
+      - _f2b_sl_db is match('^' ~ _f2b_time_pat ~ '$')
+      - _f2b_sl_db is not search('[\r\n]')
+    fail_msg: >-
+      {% if _f2b_sl_bad | length > 0 %}{{ _f2b_sl_bad | join('; ') }}. fail2ban_slow_sshd and
+      fail2ban_slow_recidive must each be a mapping with exactly findtime, maxretry and bantime,
+      for example {findtime: "1d", maxretry: 6, bantime: "1w"}. Times look like 10m, 1h, 1d, 4w;
+      maxretry is 1 to 99; bantime may also be -1 (banned until you unban).
+      {% else %}fail2ban_slow_dbpurgeage ({{ _f2b_sl_db | truncate(30) }}) must be a time like 30d or 8w.
+      {% endif %}Nothing has been changed.
+  vars:
+    _f2b_sl_db: "{{ fail2ban_slow_dbpurgeage | default('30d') | string }}"
+    _f2b_sl_bad: >-
+      {%- set bad = [] -%}
+      {%- for name, m in [['fail2ban_slow_sshd', fail2ban_slow_sshd | default({})],
+                          ['fail2ban_slow_recidive', fail2ban_slow_recidive | default({})]] -%}
+      {%- if m is not mapping -%}
+      {%- set _ = bad.append(name ~ ' is not a mapping') -%}
+      {%- elif (m | dict2items | map(attribute='key') | map('string') | sort | list) != (_f2b_slow_key_pat | dict2items | map(attribute='key') | sort | list) -%}
+      {%- set _ = bad.append(name ~ ' has the keys ' ~ (m | dict2items | map(attribute='key') | map('string') | sort | join(', ') | regex_replace('[{}]', '?') | truncate(80))) -%}
+      {%- else -%}
+      {%- for k, pat in _f2b_slow_key_pat | dictsort -%}
+      {%- if (m[k] | string) is not match('^' ~ pat ~ '$') or (m[k] | string) is search('[\r\n]') -%}
+      {%- set _ = bad.append(name ~ '.' ~ k ~ ' is ' ~ (m[k] | string | regex_replace('[{}]', '?') | truncate(30))) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ bad }}
 
 - name: "fail2ban preflight PF1: fail2ban_defaults uses allowed keys and values"
   when: _f2b_enabled | bool
@@ -121,7 +196,7 @@
            | zip(_f2b_key_pat | dict2items | map(attribute='value')) | map('join', '=') | join('|') }})$
 
 - name: "fail2ban preflight PF1: addresses fail2ban must ignore are IP addresses or networks"
-  when: _f2b_enabled | bool
+  when: (_f2b_enabled | bool) or (_f2b_slow | bool)
   ansible.builtin.assert:
     quiet: true
     that:
@@ -142,7 +217,7 @@
 # --- PF2. Is fail2ban installed and running? (read-only) -------------------
 
 - name: "fail2ban preflight PF2: installed fail2ban package"
-  when: _f2b_enabled | bool
+  when: (_f2b_enabled | bool) or (_f2b_slow | bool)
   ansible.builtin.command:
     argv: [dpkg-query, -W, "-f=${db:Status-Abbrev} ${Version}", fail2ban]
   register: _f2b_pf_pkg
@@ -151,7 +226,7 @@
   check_mode: false
 
 - name: "fail2ban preflight PF2: state of fail2ban.service"
-  when: _f2b_enabled | bool
+  when: (_f2b_enabled | bool) or (_f2b_slow | bool)
   ansible.builtin.command:
     argv: [systemctl, is-active, fail2ban.service]
   register: _f2b_pf_active
@@ -160,7 +235,7 @@
   check_mode: false
 
 - name: "fail2ban preflight PF2: is fail2ban.service enabled at boot?"
-  when: _f2b_enabled | bool
+  when: (_f2b_enabled | bool) or (_f2b_slow | bool)
   ansible.builtin.command:
     argv: [systemctl, is-enabled, fail2ban.service]
   register: _f2b_pf_unit
@@ -169,7 +244,7 @@
   check_mode: false
 
 - name: "fail2ban preflight PF2: remember the state before this run"
-  when: _f2b_enabled | bool
+  when: (_f2b_enabled | bool) or (_f2b_slow | bool)
   ansible.builtin.set_fact:
     _f2b_installed_before: "{{ (_f2b_pf_pkg.rc | default(1)) == 0 and (_f2b_pf_pkg.stdout | default('')) is match('^.i') }}"
     _f2b_version_before: "{{ (_f2b_pf_pkg.stdout | default('')).split()[1:2] | join('') | regex_replace('[^A-Za-z0-9.:+~-]', '?') }}"
@@ -232,6 +307,87 @@
       {{ inventory_hostname }} (fail2ban_hardening_enabled: keep). Set true to keep managing
       it, or delete it by hand (then `sudo fail2ban-client reload`).
 
+# --- PF3 for fail2ban_slow_scanners -------------------------------------------
+# The switch works with fail2ban_hardening_enabled: keep, but it installs
+# nothing: fail2ban must be there, or the fail2ban part installs it in this
+# same run (true). Then the trial runs later, in fail2ban-slow.yml.
+
+- name: "fail2ban preflight R03-F8: the slow-scanner jails need an installed fail2ban"
+  when:
+    - _f2b_slow | bool
+    - _f2b_role_runs | bool
+  ansible.builtin.assert:
+    quiet: true
+    that: (_f2b_installed_before | bool) or (_f2b_enabled | bool)
+    fail_msg: >-
+      fail2ban_slow_scanners is true, but fail2ban is not installed on {{ inventory_hostname }},
+      and this run does not install it (fail2ban_hardening_enabled:
+      {{ fail2ban_hardening_enabled | default('keep') | string | truncate(20) }}). Install fail2ban yourself,
+      or set fail2ban_hardening_enabled: true (auto_sec then installs it and writes its
+      00-autosec.conf), or set fail2ban_slow_scanners: false. Nothing has been changed.
+
+- name: "fail2ban preflight PF3: trial run and decision for the slow-scanner files"
+  when:
+    - _f2b_slow | bool
+    - _f2b_role_runs | bool
+    - _f2b_installed_before | bool
+  block:
+    - name: "fail2ban preflight PF3: trial run of the slow-scanner files on a copy of /etc/fail2ban"
+      ansible.builtin.include_tasks:
+        file: slow-trial.yml
+      vars:
+        _f2b_stage: preflight
+
+    - name: "fail2ban preflight PF3: refuse or go on (slow-scanner files)"
+      ansible.builtin.include_tasks:
+        file: slow-decide.yml
+      vars:
+        _f2b_stage: preflight
+
+# false: no file, no reload, no trial. One read: auto_sec never deletes its
+# own files, so say when an earlier run's files still apply.
+- name: "fail2ban preflight PF3: are slow-scanner files of an earlier run still in place?"
+  when:
+    - not (_f2b_slow | bool)
+    - _f2b_role_runs | bool
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - |
+        for f in "$@"; do
+          if [ -f "$f" ] && [ ! -L "$f" ]; then printf 'file %s ' "$f"; head -n 1 -- "$f"; echo; fi
+        done
+      - sh
+      - "{{ _f2b_slow_dropin }}"
+      - "{{ _f2b_slow_db_dropin }}"
+  register: _f2b_pf_slow_left
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "fail2ban preflight N03-F8: the slow-scanner files of an earlier run still apply"
+  when:
+    - _f2b_pf_slow_left is not skipped
+    - _f2b_sl_left | length > 0
+  ansible.builtin.debug:
+    msg: >-
+      INFO: auto_sec's {{ _f2b_sl_left | join(' and ') }} from an earlier run
+      {{ 'stays and still applies' if (_f2b_sl_left | length == 1) else 'stay and still apply' }} on
+      {{ inventory_hostname }} (fail2ban_slow_scanners: false removes nothing). Set true to keep
+      managing {{ 'it' if (_f2b_sl_left | length == 1) else 'them' }}. To remove by hand:
+      `sudo rm {{ _f2b_sl_left | join(' ') }}`, then
+      `sudo fail2ban-client -t && sudo fail2ban-client reload`. That reload stops the jails
+      sshd-slow and recidive if auto_sec's file added them, lifts their bans, and puts
+      fail2ban's memory (dbpurgeage) back to the value of your files.
+  vars:
+    _f2b_sl_left: >-
+      {{ [_f2b_slow_dropin, _f2b_slow_db_dropin]
+         | select('in', (_f2b_pf_slow_left.stdout_lines | default([])
+                         | select('search', ' ' ~ (_f2b_marker | regex_escape) ~ '$')
+                         | map('regex_replace', '^file (\S+) .*$', '\1') | list))
+         | list }}
+
 # --- PF4. Packages, plan and summary -----------------------------------------
 
 - name: "fail2ban preflight PF4: packages the fail2ban part wants (package guard)"
@@ -289,9 +445,77 @@
       NOTE: nobody is exempt from bans on {{ inventory_hostname }} (office_static_ip and
       fail2ban_ignore_ips are empty).
 
+# The slow-scanner files. "what" holds your values and constant names only;
+# what the trial read on the host (each jail as fail2ban will run it, the
+# seconds of dbpurgeage and why) is in "note". On a host where this run
+# installs fail2ban first there was no trial yet: both files, the runtime
+# dbpurgeage and the reload are listed.
+- name: "fail2ban preflight PF4: plan lines for the slow-scanner files"
+  when:
+    - _f2b_slow | bool
+    - _f2b_role_runs | bool
+  vars:
+    _f2b_sl_new: "{{ not (_f2b_installed_before | bool) }}"
+    _f2b_sl_rec: >-
+      {{ ((fail2ban_slow_recidive_enabled | default(true) | string | lower) in ['true', 'yes', '1', 'on'])
+         if (_f2b_sl_new | bool) else (_f2b_slow_rec_in | bool) }}
+    _f2b_sl_ban: "{{ fail2ban_slow_sshd.bantime | string }}"
+    _f2b_sl_find: "{{ fail2ban_slow_recidive.findtime | string }}"
+    # Can sshd-slow alone ban an address often enough for recidive? Not
+    # when its ban time, times the bans recidive still needs after the
+    # first, fills recidive's window.
+    _f2b_sl_reach: >-
+      {{ _f2b_sl_ban != '-1'
+         and ((_f2b_sl_ban | regex_replace('[a-z]+$', '') | int) * (_f2b_unit_s[_f2b_sl_ban | regex_replace('^[0-9]+', '')] | int)
+              * ((fail2ban_slow_recidive.maxretry | int) - 1))
+             < ((_f2b_sl_find | regex_replace('[a-z]+$', '') | int) * (_f2b_unit_s[_f2b_sl_find | regex_replace('^[0-9]+', '')] | int)) }}
+    _f2b_sl_what: >-
+      {{ _f2b_slow_dropin ~ ': sshd-slow bans after ' ~ fail2ban_slow_sshd.maxretry ~ ' failed logins in '
+         ~ fail2ban_slow_sshd.findtime ~ ' ' ~ ('until you unban' if _f2b_sl_ban == '-1' else ('for ' ~ _f2b_sl_ban))
+         ~ ' (port ' ~ (ssh_port | int) ~ ')'
+         ~ (('; recidive bans after ' ~ fail2ban_slow_recidive.maxretry ~ ' bans by the other jails in ' ~ _f2b_sl_find ~ ' '
+             ~ ('until you unban' if (fail2ban_slow_recidive.bantime | string) == '-1' else ('for ' ~ fail2ban_slow_recidive.bantime))
+             ~ ' (all ports; '
+             ~ ('sshd-slow bans count too' if (_f2b_sl_reach | bool)
+                else 'sshd-slow alone cannot reach it, it bans an address at most once in that time')
+             ~ ')') if (_f2b_sl_rec | bool) else '')
+         ~ (('; ignoreip: sshd-slow takes the list of the sshd jail' ~ (', recidive the list in [DEFAULT]' if (_f2b_sl_rec | bool) else '')
+             ~ ', plus ' ~ (_f2b_ignore | join(' ')))
+            if (_f2b_ignore | length > 0) else
+            ('; ignoreip: ' ~ ('both jails take' if (_f2b_sl_rec | bool) else 'sshd-slow takes')
+             ~ ' the list in [DEFAULT], and no address of yours is named')) }}
+    _f2b_sl_w1: >-
+      {{ [{'role': '03', 'part': 'fail2ban', 'do': 'write', 'what': _f2b_sl_what, 'note': _f2b_slow_jail_note}]
+         if ((_f2b_sl_new | bool) or (_f2b_slow_jail_differs | bool)) else [] }}
+    _f2b_sl_w2: >-
+      {{ [{'role': '03', 'part': 'fail2ban', 'do': 'write',
+           'what': _f2b_slow_db_dropin ~ ': dbpurgeage at least ' ~ fail2ban_slow_dbpurgeage
+                   ~ ' (longer when a jail bans or looks back for longer; never shorter than the server has it)',
+           'note': _f2b_slow_db_note}]
+         if ((_f2b_sl_new | bool) or (_f2b_slow_db_differs | bool)) else [] }}
+    _f2b_sl_set: >-
+      {{ [{'role': '03', 'part': 'fail2ban', 'do': 'reload',
+           'what': 'fail2ban dbpurgeage at run time (fail2ban-client set dbpurgeage; no restart)', 'note': ''}]
+         if ((_f2b_sl_new | bool) or (_f2b_slow_will_set | bool)) else [] }}
+    _f2b_sl_rl: >-
+      {{ [{'role': '03', 'part': 'fail2ban', 'do': 'reload',
+           'what': 'fail2ban, for 00-autosec-slow.conf ('
+                   ~ ("auto_sec's recidive jail of an earlier run goes, its bans are lifted; the other jails and their bans stay"
+                      if (_f2b_slow_rec_gone | default(false) | bool) else 'the other jails and every ban stay') ~ ')',
+           'note': ''}]
+         if ((_f2b_sl_new | bool) or (_f2b_slow_will_reload | bool)) else [] }}
+  ansible.builtin.set_fact:
+    _plan_03_slow: "{{ _f2b_sl_w1 + _f2b_sl_w2 + _f2b_sl_set + _f2b_sl_rl }}"
+    _f2b_slow_plan: >-
+      {{ 'write 00-autosec-slow.conf and fail2ban.d/00-autosec.conf once fail2ban is installed; set dbpurgeage, reload fail2ban'
+         if (_f2b_sl_new | bool) else _f2b_slow_plan }}
+
 - name: "Role 03: plan lines (ufw and fail2ban)"
   ansible.builtin.set_fact:
-    _plan_03: "{{ (_plan_03_ufw | default([])) + (_plan_03_f2b | default([])) }}"
+    _plan_03: "{{ (_plan_03_ufw | default([])) + (_plan_03_f2b | default([])) + (_plan_03_slow | default([])) }}"
+    _f2b_plan: >-
+      {{ _f2b_plan ~ (('; slow scanners: ' ~ (_f2b_slow_plan or 'not checked (fail2ban is not selected by --tags)'))
+                      if (_f2b_slow | bool) else '') }}
 
 - name: "fail2ban preflight: summary"
   when:
@@ -305,3 +529,15 @@
       sshd_jail_after_this_run: "{{ _f2b_trial.sshd.effective | default({}) }}"
       set_in: "{{ _f2b_trial.sshd.set_in | default({}) }}"
       changes: "{{ _f2b_change_lines | default([]) }}"
+
+- name: "fail2ban preflight: summary for slow scanners"
+  when:
+    - _f2b_slow | bool
+    - _f2b_role_runs | bool
+  ansible.builtin.debug:
+    msg:
+      plan: "{{ _f2b_slow_plan }}"
+      jails: "{{ _f2b_slow_jail_note or 'checked after fail2ban is installed' }}"
+      memory: "{{ _f2b_slow_db_note or 'checked after fail2ban is installed' }}"
+      set_in: "{{ (_f2b_slow_trial.slow | default({}, true)).set_in | default({}) }}"
+      changes: "{{ _f2b_slow_change_lines | default([]) }}"

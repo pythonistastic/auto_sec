@@ -12,6 +12,11 @@
 # /etc/fail2ban/jail.d/00-autosec.conf and never jail.local (issue #2).
 # There is no handler: fail2ban is reloaded in fail2ban.yml, and only when
 # its effective config changes.
+#
+# fail2ban for slow scanners: only with fail2ban_slow_scanners: true, with
+# or without the part above. Two more files of auto_sec's own
+# (fail2ban-slow.yml): jail.d/00-autosec-slow.conf and
+# fail2ban.d/00-autosec.conf.
 
 - name: ufw (no command on an active ufw; turn-on only when planned)
   ansible.builtin.include_tasks:
@@ -24,6 +29,14 @@
   when: _f2b_enabled | default(false) | bool
   ansible.builtin.include_tasks:
     file: fail2ban.yml
+    apply:
+      tags: [fail2ban]
+  tags: [fail2ban]
+
+- name: fail2ban for slow scanners (jail.d/00-autosec-slow.conf, fail2ban.d/00-autosec.conf)
+  when: _f2b_slow | default(false) | bool
+  ansible.builtin.include_tasks:
+    file: fail2ban-slow.yml
     apply:
       tags: [fail2ban]
   tags: [fail2ban]

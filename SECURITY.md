@@ -191,6 +191,45 @@ Every string in the helper's output has `{` and `}` replaced by `?`, so host tex
 never be read as a Jinja template. During a run, `/run/auto-sec/f2b-prev` (root only)
 keeps the previous `00-autosec.conf` for the rollback, and is removed at the end.
 
+### What the slow-scanner jails read from fail2ban (0.6.1)
+
+With `fail2ban_slow_scanners: true`, role 03 runs the same helper for its two more
+files (`jail.d/00-autosec-slow.conf`, `fail2ban.d/00-autosec.conf`). The helper also
+reads the server's own settings from `fail2ban-client -d` (log target, `dbpurgeage`),
+`fail2ban-client get dbpurgeage`, each jail's ban list (`get <jail> banip --with-time`)
+and the PID file that `fail2ban-client -v ping` names. As before, what it finds is
+shown, compared, or used to refuse. **Two documented exceptions** decide what is
+written:
+
+- **A yes or no: is the `recidive` section written?** The file is rendered from the
+  operator's variables with and without that section. The helper says which one fits
+  the host: without it when the operator has an enabled `recidive` jail, when fail2ban
+  does not log to a file the jail reads, or when its ban action is another firewall
+  tool than the `sshd` jail's. No text from the host enters the file. The value must
+  be a plain true or false before it is used.
+- **One number: the seconds of `dbpurgeage`.** It is the largest of the operator's
+  `fail2ban_slow_dbpurgeage`, the longest ban time and findtime of any jail in
+  fail2ban's own reading of its config, and the `dbpurgeage` the server has without
+  auto_sec's file. So a jail of the operator's can raise it. It is written as the one
+  value of `fail2ban.d/00-autosec.conf` and passed as one argv item to
+  `fail2ban-client set dbpurgeage <seconds>`. Before that it must match
+  `^[1-9][0-9]{0,9}$` and be at most 100 years. The helper does not count a time
+  above ten years. The plan id covers the operator's minimum and the rule; the
+  number itself is in the plan's notes. Worst case: a host that is already
+  compromised makes its own fail2ban remember bans for another time.
+- **The plan still holds at the write (M03-F1).** The trial runs again right before
+  the write. If it would then add or drop the `recidive` section, write a file, set
+  `dbpurgeage` or reload, and the plan did not list that, the run stops.
+- The files' other values are the operator's variables. The `%(sshd/...)s` references
+  in the jail file are fixed text that fail2ban resolves itself.
+- The controller's address (`_ssh_controller_ip`, the existing exception above) is
+  passed as `--controller-ip` for comparison only: is it in the new jails' ignore
+  lists? It never becomes part of a file.
+- The ban lists and the PID from before the reload stay on the host, in
+  `/run/auto-sec/f2b-prev/snapshot.json` (root only, removed at the end). Only counts
+  come back to the controller. If a ban is missing after the reload, the run fails
+  and shows the jail and up to 50 of the missing addresses.
+
 ### What 0.6 reads from the host
 
 0.6 adds more read-only checks. Unless a point below says otherwise, what they read is

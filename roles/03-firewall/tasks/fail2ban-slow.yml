@@ -1,0 +1,133 @@
+---
+# roles/03-firewall/tasks/fail2ban-slow.yml - fail2ban for slow scanners.
+#
+# Included by main.yml (tags: fail2ban) when fail2ban_slow_scanners is true,
+# after the fail2ban part: with fail2ban_hardening_enabled: true that part
+# has installed fail2ban by now. This part installs nothing and works with
+# fail2ban_hardening_enabled: keep too.
+#
+# auto_sec writes two files of its own and nothing else:
+#   /etc/fail2ban/jail.d/00-autosec-slow.conf   the jails sshd-slow and recidive
+#   /etc/fail2ban/fail2ban.d/00-autosec.conf    dbpurgeage (fail2ban's memory)
+# Your jail.local, fail2ban.local and jails are never changed, and a value
+# your files set wins. fail2ban is reloaded, never restarted.
+#
+#   S0  trial run and decision again, after the roles before this one
+#       (preflight PF3 did the same before anything changed); M03-F1 if
+#       this step would now do more than the plan showed
+#   S1-S7 slow-apply.yml: write, check, set dbpurgeage, reload only on a
+#       change to the jails, verify
+#   S8  one more sentence for the report (_f2b_report)
+
+- name: "fail2ban slow: the preflight must have run in this play"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _f2b_slow is defined
+      - _f2b_installed_before is defined
+      - _f2b_role_runs | default(false) | bool
+    fail_msg: >-
+      Role 03's slow-scanner part needs its preflight, and the role must be tagged
+      "firewall". site.yml runs the preflight in pre_tasks (import_role
+      name=03-firewall tasks_from=preflight, tags always). Do the same in any other
+      playbook that uses role 03. Nothing has been changed in fail2ban.
+
+- name: "fail2ban slow: is fail2ban installed now?"
+  ansible.builtin.command:
+    argv: [dpkg-query, -W, "-f=${db:Status-Abbrev}", fail2ban]
+  register: _f2b_slow_pkg
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# The preflight refused already when nothing installs fail2ban (R03-F8).
+# This is the same check right before the write.
+- name: "fail2ban slow R03-F8: fail2ban must be installed (outside --check)"
+  ansible.builtin.assert:
+    quiet: true
+    that: ansible_check_mode or ((_f2b_slow_pkg.stdout | default('')) is match('^.i'))
+    fail_msg: >-
+      fail2ban_slow_scanners is true, but fail2ban is not installed on
+      {{ inventory_hostname }}. The slow-scanner files have not been written.
+
+- name: "fail2ban slow: check mode on a host without fail2ban"
+  when: (_f2b_slow_pkg.stdout | default('')) is not match('^.i')
+  ansible.builtin.debug:
+    msg: >-
+      fail2ban is not installed on {{ inventory_hostname }} yet. The real run installs it
+      (fail2ban_hardening_enabled: true), runs the trial on its config, writes
+      {{ _f2b_slow_dropin }} and {{ _f2b_slow_db_dropin }}, sets dbpurgeage and
+      reloads fail2ban.
+
+- name: "fail2ban slow: trial, write and load"
+  when: (_f2b_slow_pkg.stdout | default('')) is match('^.i')
+  block:
+    - name: "fail2ban slow S0: what the plan showed"
+      ansible.builtin.set_fact:
+        _f2b_slow_planned:
+          rec: "{{ _f2b_slow_rec_in | bool }}"
+          jail: "{{ _f2b_slow_jail_differs | bool }}"
+          db: "{{ _f2b_slow_db_differs | bool }}"
+          set: "{{ _f2b_slow_will_set | bool }}"
+          reload: "{{ _f2b_slow_will_reload | bool }}"
+
+    - name: "fail2ban slow S0: trial run on a copy of /etc/fail2ban (after the roles before)"
+      ansible.builtin.include_tasks:
+        file: slow-trial.yml
+      vars:
+        _f2b_stage: apply
+
+    - name: "fail2ban slow S0: refuse or go on"
+      ansible.builtin.include_tasks:
+        file: slow-decide.yml
+      vars:
+        _f2b_stage: apply
+
+    # The plan id covers what the plan listed: the recidive jail or none,
+    # each file, the runtime dbpurgeage, the reload. Doing less is fine
+    # (the notes say why); doing more is not. The cause can be this run's
+    # own fail2ban part (a longer ban time in fail2ban_defaults needs a
+    # longer memory) or somebody else. On a host where this run installed
+    # fail2ban there was no trial before, and the plan listed everything.
+    - name: "fail2ban slow S0 M03-F1: this step does no more than the plan showed"
+      when: _f2b_installed_before | bool
+      ansible.builtin.assert:
+        quiet: true
+        that: _f2b_slow_more | length == 0
+        fail_msg: >-
+          fail2ban on {{ inventory_hostname }} changed during this run: {{ _f2b_slow_more | join('; ') }}.
+          The plan at the start did not show that, so the slow-scanner files have not been
+          written. Run again and read the new plan.
+      vars:
+        _f2b_slow_more: >-
+          {{ ((['the plan ' ~ ('had a' if (_f2b_slow_planned.rec | bool) else 'had no')
+                ~ ' recidive jail from auto_sec, and now the trial says to '
+                ~ ('add one' if (_f2b_slow_rec_in | bool) else 'leave it out')])
+              if ((_f2b_slow_rec_in | bool) != (_f2b_slow_planned.rec | bool)) else [])
+             + (['00-autosec-slow.conf would now be written']
+                if ((_f2b_slow_jail_differs | bool) and not (_f2b_slow_planned.jail | bool)) else [])
+             + ([('fail2ban.d/00-autosec.conf would now be written (dbpurgeage ' ~ (_f2b_slow_db_s | int) ~ ' seconds)')]
+                if ((_f2b_slow_db_differs | bool) and not (_f2b_slow_planned.db | bool)) else [])
+             + (['dbpurgeage would now be set in the running fail2ban']
+                if ((_f2b_slow_will_set | bool) and not (_f2b_slow_planned.set | bool)) else [])
+             + (['fail2ban would now be reloaded for the slow-scanner jails']
+                if ((_f2b_slow_will_reload | bool) and not (_f2b_slow_planned.reload | bool)) else []) }}
+
+    - name: "fail2ban slow S1-S7: write, check, load and verify"
+      ansible.builtin.include_tasks:
+        file: slow-apply.yml
+
+    - name: "fail2ban slow S8: one more sentence for the report"
+      ansible.builtin.set_fact:
+        _f2b_report: >-
+          {{ _f2b_report | default('') }}{{ '; ' if (_f2b_report | default('') | length > 0) else '' }}slow scanners:
+          sshd-slow bans after {{ fail2ban_slow_sshd.maxretry }} failed logins in {{ fail2ban_slow_sshd.findtime }}
+          ({{ 'until unbanned' if (fail2ban_slow_sshd.bantime | string) == '-1' else fail2ban_slow_sshd.bantime }}){{
+          (', recidive after ' ~ fail2ban_slow_recidive.maxretry ~ ' bans in ' ~ fail2ban_slow_recidive.findtime
+           ~ ' (' ~ ('until unbanned' if (fail2ban_slow_recidive.bantime | string) == '-1' else fail2ban_slow_recidive.bantime) ~ ')')
+          if (_f2b_slow_rec_in | bool) else '' }}, fail2ban's memory {{ _f2b_slow_s.dbpurgeage.new_s | default(_f2b_slow_db_s) }} seconds
+          (auto_sec's 00-autosec-slow.conf and fail2ban.d/00-autosec.conf)
+
+    - name: "fail2ban slow S8: result"
+      ansible.builtin.debug:
+        msg: "{{ _f2b_slow_plan }}. {{ _f2b_slow_jail_note }}. {{ _f2b_slow_db_note }}"

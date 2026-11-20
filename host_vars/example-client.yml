@@ -65,6 +65,12 @@ egress_lockdown: false
 # jail.local is never touched, and every value it sets wins.
 # fail2ban_hardening_enabled: true    # the default with new; keep = leave it alone
 # fail2ban_defaults: {}               # auto_sec sets no fail2ban values
+# Slow scanners (one password every few minutes): two more jails and a
+# longer memory, in two more files of auto_sec's own. Off by default.
+# Name your own addresses above first: a ban lasts a week.
+# fail2ban_slow_scanners: true
+# fail2ban_slow_sshd: { findtime: "1d", maxretry: 6, bantime: "1w" }
+# fail2ban_slow_recidive_enabled: false   # no recidive jail from auto_sec
 
 # --- Account, updates, reboots, hostname, timezone (role 01) ------------
 # deploy_user_account: create        # the default with new (deploy_user

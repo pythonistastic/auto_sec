@@ -1,0 +1,36 @@
+# A day of SSH logins for the slow-scanner checks (lab.py S22 and S23).
+# lab.py turns each line into one sshd log line, dated that many minutes
+# before the moment the check runs: fail2ban counts by the real clock.
+# All addresses are documentation addresses (RFC 5737).
+#
+# minutes-ago  address        user   failed | accepted
+
+# A slow scanner: one failed login every 20 minutes, 6 in 100 minutes.
+# Never 4 within 10 minutes, so the sshd jail does not see it.
+101  198.51.100.77  root   failed
+81   198.51.100.77  root   failed
+61   198.51.100.77  root   failed
+41   198.51.100.77  root   failed
+21   198.51.100.77  root   failed
+1    198.51.100.77  root   failed
+
+# Ten times slower: one failed login every 200 minutes, 6 in 16 hours 40
+# minutes. Still inside one day.
+1001 198.51.100.78  root   failed
+801  198.51.100.78  root   failed
+601  198.51.100.78  root   failed
+401  198.51.100.78  root   failed
+201  198.51.100.78  root   failed
+1    198.51.100.78  root   failed
+
+# Slower still: 5 failed logins in 20 hours. Under the limit of 6 a day.
+1201 198.51.100.79  root   failed
+901  198.51.100.79  root   failed
+601  198.51.100.79  root   failed
+301  198.51.100.79  root   failed
+2    198.51.100.79  root   failed
+
+# A person: two typos, then the right password.
+30   198.51.100.88  alice  failed
+29   198.51.100.88  alice  failed
+28   198.51.100.88  alice  accepted

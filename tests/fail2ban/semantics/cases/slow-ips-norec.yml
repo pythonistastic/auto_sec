@@ -1,0 +1,7 @@
+---
+# cases/slow-ips.yml without the recidive section.
+render_template: 00-autosec-slow.conf.j2
+ssh_port: 22
+office_static_ip: "203.0.113.7"
+fail2ban_ignore_ips: ["198.51.100.9", "2001:db8::/32"]
+_f2b_slow_rec_render: false

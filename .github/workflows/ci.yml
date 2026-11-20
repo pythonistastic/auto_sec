@@ -357,10 +357,15 @@ jobs:
   # (fail2ban-client -d/-t/-vvv on config copies). A real fail2ban 1.0.2
   # server (noble build, pyasyncore) also runs as the runner user: reload
   # and restart semantics, and role 03's own task files against it, on the
-  # current ansible-core and on 2.16.
+  # current ansible-core and on 2.16. 0.6.1 adds the slow-scanner files
+  # (fail2ban_slow_scanners): the same config checks on all five builds,
+  # the jails on real 1.0.2 and 1.1.0 servers (a slow scanner, typos,
+  # recidive, growing and permanent bans), and the role's task files. The
+  # job is longer than before, and its time on a runner is not measured
+  # yet: the limit went from 30 to 60 minutes.
   fail2ban-semantics:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -432,7 +437,8 @@ jobs:
   # come through unchanged (same dump, PID, bans, firewall set; no reload),
   # refusals, and the migration of a 0.3 jail.local. 22.04 has fail2ban
   # 0.11.2 with iptables, 24.04 fail2ban 1.0.2 with nftables.
-  # Ran on GitHub's runners for v0.5.0, and with 0.6's changes.
+  # Ran on GitHub's runners for v0.5.0, and with 0.6's changes. Case c10
+  # (fail2ban_slow_scanners, 0.6.1) is written and has not run yet.
   fail2ban-live:
     name: fail2ban-live (${{ matrix.os }})
     strategy:

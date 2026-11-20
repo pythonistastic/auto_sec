@@ -80,6 +80,40 @@ fail2ban_migrate_jail_local: false
 # nginx-botsearch jails in jail.d/00-autosec-nginx.conf after nginx is in.
 fail2ban_nginx_jails: true
 
+# --- fail2ban for slow scanners: public settings ----------------------------
+# Off on every server, existing or new. true adds two jails in auto_sec's
+# own /etc/fail2ban/jail.d/00-autosec-slow.conf and a longer memory in
+# /etc/fail2ban/fail2ban.d/00-autosec.conf. Your jail.local, fail2ban.local
+# and jails are not changed, and fail2ban is reloaded, never restarted. It
+# needs an installed fail2ban (fail2ban_hardening_enabled: true in the same
+# run installs one). Name your own addresses first (office_static_ip,
+# fail2ban_ignore_ips): a ban lasts a week.
+fail2ban_slow_scanners: false
+
+# The jail sshd-slow: the failed logins the sshd jail reads, counted over a
+# longer time. maxretry failures within findtime ban for bantime. All three
+# keys are required. Times like 10m, 1h, 1d, 1w; bantime may also be -1
+# (banned until you unban the address).
+fail2ban_slow_sshd:
+  findtime: "1d"
+  maxretry: 6
+  bantime: "1w"
+
+# The jail recidive: an address the other jails ban maxretry times within
+# findtime is banned for bantime, on all ports. It is left out when you
+# have a recidive jail of your own. false: auto_sec never adds it.
+fail2ban_slow_recidive_enabled: true
+fail2ban_slow_recidive:
+  findtime: "1w"
+  maxretry: 3
+  bantime: "4w"
+
+# How long fail2ban remembers an address after a ban (dbpurgeage), at
+# least. fail2ban's own default is 1d. auto_sec writes a longer time when a
+# jail bans or looks back for longer, and never a shorter time than the
+# server has now.
+fail2ban_slow_dbpurgeage: "30d"
+
 # --- Role-internal constants. These are not settings: do not override. ---
 
 # The files auto_sec owns. "00-autosec" sorts right after jail.conf and
@@ -91,6 +125,20 @@ _f2b_nginx_dropin: "{{ _f2b_conf_dir }}/jail.d/00-autosec-nginx.conf"
 _f2b_jail_local: "{{ _f2b_conf_dir }}/jail.local"
 _f2b_marker: "# Written by auto_sec (role 03). Do not edit: the next run replaces this file."
 _f2b_nginx_marker: "# Written by auto_sec (role 05). Do not edit: the next run replaces this file."
+
+# The slow-scanner files (fail2ban_slow_scanners): the jails sshd-slow and
+# recidive, and auto_sec's file among fail2ban's own settings. Both carry
+# _f2b_marker. "00-autosec-slow" is read before 00-autosec.conf and before
+# every file of yours; fail2ban.d/00-autosec.conf right after fail2ban.conf
+# and before fail2ban.local.
+_f2b_slow_dropin: "{{ _f2b_conf_dir }}/jail.d/00-autosec-slow.conf"
+_f2b_slow_db_dropin: "{{ _f2b_conf_dir }}/fail2ban.d/00-autosec.conf"
+# In the trial's candidate this stands where the seconds go (DB_TOKEN in
+# files/auto-sec-f2b-check).
+_f2b_slow_db_token: "@AUTOSEC_DBPURGEAGE@"
+# The seconds come from the trial (SECURITY.md): digits only, and at most
+# this many (100 years).
+_f2b_slow_db_max: 3155760000
 
 # Scratch space for the trial run (tmpfs, root only, removed every run).
 _f2b_run_dir: /run/auto-sec
@@ -115,6 +163,16 @@ _f2b_key_pat:
   bantime.factor: '[0-9]{1,3}(\.[0-9]{1,3})?'
   bantime.increment: '(True|False)'
   backend: '(auto|systemd|polling|pyinotify)'
+
+# fail2ban_slow_sshd and fail2ban_slow_recidive: exactly these keys, each
+# with this whole-value pattern. A bantime of -1 bans until you unban.
+_f2b_slow_key_pat:
+  bantime: "(-1|{{ _f2b_time_pat }})"
+  findtime: "{{ _f2b_time_pat }}"
+  maxretry: '[1-9][0-9]?'
+# fail2ban's time units in seconds (its MyTime.str2seconds: mo and y are
+# averages). Only for the plan's wording; the trial asks fail2ban itself.
+_f2b_unit_s: {"": 1, s: 1, m: 60, h: 3600, d: 86400, w: 604800, mo: 2629800, y: 31557600}
 
 # IPv4/IPv6 address or network. Same pattern as role 02's preflight and
 # site.yml (fail2ban_ignore_ips); keep them equal.

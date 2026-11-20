@@ -33,7 +33,8 @@
 #       missing, deploy's key after role 01 creates it, a linked ~/.ssh, the
 #       drop-in's lines from your values, comments only, the stock-file
 #       migration, role 02 not selected
-#   d*  the defaults that follow autosec_server (group_vars/all.yml)
+#   d*  the defaults that follow autosec_server (group_vars/all.yml), and
+#       fail2ban_slow_scanners, which is off with both
 #   t*  tests/site/semantics/static.py on the repository, and on a copy
 #       with one planted violation per check (each must FAIL)
 # Usage: tests/site/semantics/run.sh [--ansible PLAYBOOK]... [--keep]
@@ -325,6 +326,8 @@ PYQ
   [ "$(js "$W/$tag-d4.json" 'd["deploy_user_account"]')" = keep ]; ok "$tag d4: new with deploy_user root: no account" $?
   dflt d5 -e autosec_server=new -e ssh_admin_user=alice >/dev/null
   [ "$(js "$W/$tag-d5.json" 'd["deploy_user_account"]')" = keep ]; ok "$tag d5: new with another admin account: no account" $?
+  [ "$(js "$W/$tag-d1.json" 'd["fail2ban_slow_scanners"]')" = False ] && [ "$(js "$W/$tag-d2.json" 'd["fail2ban_slow_scanners"]')" = False ]
+  ok "$tag d6: fail2ban_slow_scanners is off with existing and with new" $?
 done
 
 # --- x: the plan id does not depend on the ansible-core version -----------------------

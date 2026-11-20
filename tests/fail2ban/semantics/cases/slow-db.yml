@@ -1,0 +1,5 @@
+---
+# fail2ban.d/00-autosec.conf as the trial gets it: the helper puts the
+# seconds in place of the token.
+render_template: 00-autosec-fail2ban.conf.j2
+_f2b_slow_db_render: "@AUTOSEC_DBPURGEAGE@"

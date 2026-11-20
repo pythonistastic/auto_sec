@@ -1,0 +1,341 @@
+---
+# roles/03-firewall/tasks/slow-decide.yml - refuse, note, or plan the
+# slow-scanner files (R03-F9 to R03-F11, N03-F9 to N03-F13).
+#
+# Included right after slow-trial.yml with the same _f2b_stage. Reads
+# _f2b_slow_trial (host data; the helper has replaced every "{" and "}"
+# with "?"). R03-F1, R03-F2, R03-F5 and R03-F7 are decide.yml's checks,
+# here for these two files. Sets:
+#   _f2b_slow_rec_in       bool  the recidive section is written
+#   _f2b_slow_db_s         int   dbpurgeage as written, in seconds
+#   _f2b_slow_jail_differs bool  00-autosec-slow.conf gets new content
+#   _f2b_slow_db_differs   bool  fail2ban.d/00-autosec.conf gets new content
+#   _f2b_slow_will_reload  bool  the jails change and fail2ban runs
+#   _f2b_slow_will_set     bool  dbpurgeage changes and fail2ban runs
+#   _f2b_slow_plan         str   for the plan's role 03 line
+#   _f2b_slow_jail_note, _f2b_slow_db_note   str  host details for the plan's notes
+#   _f2b_slow_noted        list  the notes the preflight has shown (not shown again)
+#
+# Two things come from the host and decide what is written (SECURITY.md):
+# a yes or no (is the recidive section written?) and one number (the
+# seconds of dbpurgeage). Both are checked below before they are used.
+
+- name: "fail2ban slow decide: what the trial found"
+  ansible.builtin.set_fact:
+    _f2b_slow_s: "{{ _f2b_slow_trial.slow | default({}, true) }}"
+    _f2b_slow_run: "{{ _f2b_slow_trial.running | default({}, true) }}"
+    # auto_sec's own recidive jail of an earlier run goes with this run.
+    _f2b_slow_rec_gone: >-
+      {{ _f2b_slow_trial.changes | default([]) | selectattr('jail', 'equalto', 'recidive')
+         | selectattr('key', 'equalto', '(jail)') | selectattr('after', 'equalto', 'absent') | list | length > 0 }}
+    _f2b_slow_nothing: >-
+      {{ 'Nothing has been changed.' if _f2b_stage == 'preflight'
+         else 'The slow-scanner files have not been written. Roles that ran before this step may have changed other things.' }}
+
+- name: "fail2ban slow decide R03-F1: fail2ban's own config must load now"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _f2b_slow_trial.installed | default(false)
+      - _f2b_slow_trial.live.ok | default(false)
+      - _f2b_slow_trial.live_test.ok | default(false)
+    fail_msg: >-
+      fail2ban's own configuration on {{ inventory_hostname }} does not load
+      (`fail2ban-client -d` / `-t`): {{ (_f2b_slow_trial.live.error | default('') or _f2b_slow_trial.live_test.error | default(''))
+      if (_f2b_slow_trial.installed | default(false)) else 'fail2ban is installed, but ' ~ _f2b_conf_dir ~ '/jail.conf is missing' }}.
+      auto_sec changes nothing in fail2ban until it does. Fix it, check with
+      `sudo fail2ban-client -t`, and run again. {{ _f2b_slow_nothing }}
+
+- name: "fail2ban slow decide R03-F9: the name sshd-slow must be free"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not (_f2b_slow_s.theirs_enabled | default(false))
+      - _f2b_slow_s.foreign | default([]) | length == 0
+    fail_msg: >-
+      {{ inventory_hostname }} already has a jail or a section named sshd-slow that auto_sec did not
+      write{{ (' (in ' ~ (_f2b_slow_s.foreign | default([]) | join(', ')) ~ ')') if (_f2b_slow_s.foreign | default([]) | length > 0) else '' }}.
+      auto_sec's jail of that name lives only in its own 00-autosec-slow.conf and is never
+      mixed with yours. Give your jail another name, or set fail2ban_slow_scanners: false.
+      To change auto_sec's jail, use fail2ban_slow_sshd. {{ _f2b_slow_nothing }}
+
+- name: "fail2ban slow decide R03-F2: auto_sec's files must not break fail2ban"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _f2b_slow_trial.without.ok | default(false)
+      - _f2b_slow_trial.new.ok | default(false)
+      - _f2b_slow_trial.new_test.ok | default(false)
+      - _f2b_slow_s.folders | default(true)
+    fail_msg: >-
+      {% if not (_f2b_slow_s.folders | default(true)) %}{{ _f2b_conf_dir }}/jail.d or {{ _f2b_conf_dir }}/fail2ban.d
+      is missing or a link on {{ inventory_hostname }}. Both folders belong to the fail2ban package, and
+      auto_sec writes its files there. Create the missing one (sudo install -d -m 0755 <folder>) and run again.
+      {% else %}With auto_sec's 00-autosec-slow.conf and fail2ban.d/00-autosec.conf, fail2ban's config
+      would not load on {{ inventory_hostname }}:
+      {{ _f2b_slow_trial.new.error | default('') or _f2b_slow_trial.without.error | default('') or _f2b_slow_trial.new_test.error | default('') }}.
+      {% endif %}{{ _f2b_slow_nothing }}
+
+# The two host values that decide what is written, and the checksums of
+# the files as the trial tried them.
+- name: "fail2ban slow decide: the trial's yes/no and number have the expected shape"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _f2b_slow_s.recidive.write | default('') | string in ['True', 'False']
+      - _f2b_slow_s.dbpurgeage.write_s | default('') | string is match('^[1-9][0-9]{0,9}$')
+      - (_f2b_slow_s.dbpurgeage.write_s | default(0) | int) <= (_f2b_slow_db_max | int)
+      - _f2b_slow_s.sha256.jail | default('') | string is match('^[0-9a-f]{64}$')
+      - _f2b_slow_s.sha256.db | default('') | string is match('^[0-9a-f]{64}$')
+    fail_msg: >-
+      The fail2ban trial on {{ inventory_hostname }} returned a dbpurgeage auto_sec will not write
+      ({{ _f2b_slow_s.dbpurgeage.write_s | default('?') | string | regex_replace('[^0-9A-Za-z.-]', '?') | truncate(24) }}
+      seconds; it writes whole seconds, at most 100 years). A jail or a dbpurgeage of yours asks
+      for more: set fail2ban_slow_scanners: false on this server. {{ _f2b_slow_nothing }}
+
+- name: "fail2ban slow decide R03-F5: no file read before auto_sec's may set the same value"
+  ansible.builtin.assert:
+    quiet: true
+    that: _f2b_slow_trial.read_before_overrides | default([]) | length == 0
+    fail_msg: >-
+      {% for o in _f2b_slow_trial.read_before_overrides | default([]) %}{{ o.file }} sets
+      {{ o.key }} = {{ o.value }} in [{{ o.section }}] (auto_sec's value: {{ o.ours or 'empty' }}). {% endfor %}fail2ban
+      reads {{ 'that file' if (_f2b_slow_trial.read_before_overrides | default([]) | length == 1) else 'these files' }}
+      BEFORE auto_sec's 00-autosec-slow.conf on {{ inventory_hostname }}, so auto_sec's value
+      would silently win{{ ' (its empty ignoreip in [DEFAULT] would cancel yours for every jail)'
+      if (_f2b_slow_trial.read_before_overrides | default([]) | selectattr('key', 'equalto', 'ignoreip') | list | length > 0) else '' }}.
+      Move your settings to jail.local or a *.local file in jail.d
+      (jail.conf says "YOU SHOULD NOT MODIFY THIS FILE"; dpkg replaces it on updates),
+      or give the jail.d file a name that sorts after 00-autosec. {{ _f2b_slow_nothing }}
+
+- name: "fail2ban slow decide R03-F10: only auto_sec's own jails may change"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _f2b_slow_trial.leaks | default([]) | length == 0
+      - _f2b_slow_trial.ignore_dropped | default([]) | length == 0
+    fail_msg: >-
+      auto_sec's slow-scanner files would change jails of yours on {{ inventory_hostname }}:
+      {{ _f2b_slow_trial.leak_lines | default([]) | join('; ') }}.
+      {% for d in _f2b_slow_trial.ignore_dropped | default([]) %}The jail {{ d.jail }} would stop ignoring
+      {{ d.addresses | join(', ') }}. {% endfor %}{% if (_f2b_slow_s.recidive.reason | default('')) == 'yours'
+      and (_f2b_slow_trial.leaks | default([]) | selectattr('jail', 'equalto', 'recidive') | list | length > 0) %}You
+      now have a recidive jail of your own, so auto_sec takes its recidive section away, and
+      your jail loses the values it took from there. Set them in your own [recidive] section
+      first. {% endif %}auto_sec's files may only add or change its own jails. {{ _f2b_slow_nothing }}
+
+- name: "fail2ban slow decide R03-F11: sshd-slow must follow the sshd jail"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _f2b_slow_s.follow | default([]) | length == 0
+      - _f2b_slow_s.ignore_missing | default({}) | dict2items | map(attribute='value') | flatten | length == 0
+      - _f2b_slow_mine | length == 0
+    fail_msg: >-
+      On {{ inventory_hostname }} the jail sshd-slow would not do what the sshd jail does:
+      {{ ((_f2b_slow_s.follow | default([]))
+          + (_f2b_slow_s.ignore_missing | default({}) | dict2items | rejectattr('value', 'equalto', [])
+             | map(attribute='key') | map('regex_replace', '^(.*)$', '\1 would not ignore your addresses') | list)
+          + (_f2b_slow_mine | map('regex_replace', '^(.*)$', 'sshd-slow \1 is not the value of fail2ban_slow_sshd') | list))
+         | join('; ') }}.
+      auto_sec's jail takes over the sshd jail's log source and ban action through
+      fail2ban's own references, and its ignore list once you name an address of your own.
+      A setting in your [sshd] section that it cannot take over stops it. For an ignoreip
+      set only in [sshd]: put those addresses in fail2ban_ignore_ips. For anything else:
+      move the setting to [DEFAULT], or set fail2ban_slow_scanners: false on this server.
+      {{ _f2b_slow_nothing }}
+  vars:
+    _f2b_slow_mine: "{{ ((_f2b_slow_s.jails | default({})).get('sshd-slow', {})).get('yours', []) }}"
+
+- name: "fail2ban slow decide R03-F7: a reload must not also load edits you have not loaded"
+  when:
+    - _f2b_slow_run.ok | default(false)
+    - (_f2b_slow_trial.changes | default([]) | length > 0) or (_f2b_slow_s.dbpurgeage.changes | default(false))
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _f2b_slow_run.same_jails_as_disk | default(true)
+      - _f2b_slow_run.drift | default([]) | length == 0
+      - _f2b_slow_run.db_drift | default(none) is none
+    fail_msg: >-
+      fail2ban on {{ inventory_hostname }} is running a different config than its files:
+      {% if not (_f2b_slow_run.same_jails_as_disk | default(true)) %}running jails
+      {{ _f2b_slow_run.jails }}, jails in the files {{ _f2b_slow_trial.live.jails }}. {% endif %}{% for d in _f2b_slow_run.drift | default([]) %}{{ d.jail }}
+      {{ d.key }} running {{ d.running }}, files {{ d.files }}. {% endfor %}{% if _f2b_slow_run.db_drift | default(none) is not none %}dbpurgeage
+      running {{ _f2b_slow_run.db_drift.running }} s, files {{ _f2b_slow_run.db_drift.files }} s. {% endif %}auto_sec's
+      change needs a reload (or sets dbpurgeage), and that would also load or undo those edits
+      of yours. Load or undo them first (`sudo fail2ban-client reload` after checking
+      `sudo fail2ban-client -t`), then run again. {{ _f2b_slow_nothing }}
+
+# --- Notes (do not stop the run) ---------------------------------------------
+# A note is shown once: by the preflight, or by the apply stage when the
+# preflight did not show it (fail2ban was installed in this run, or a step
+# before this one changed what the note is about).
+
+- name: "fail2ban slow decide: which notes apply"
+  ansible.builtin.set_fact:
+    _f2b_slow_note_ids: >-
+      {{ (['N03-F9'] if (((_f2b_slow_s.recidive.reason | default('')) not in ['', 'off']) or (_f2b_slow_rec_gone | bool)) else [])
+         + (['N03-F10'] if ((not (_f2b_slow_s.dbpurgeage.effective | default(true)))
+                            or (_f2b_slow_run.db_disabled | default(false, true))) else [])
+         + (['N03-F11'] if (_f2b_slow_s.dbpurgeage.uncapped | default([]) | length > 0) else [])
+         + (['N03-F12'] if (_f2b_slow_s.controller_open | default([]) | length > 0) else [])
+         + (['N03-F13'] if ((not (_f2b_slow_s.sshd_enabled | default(true))) or not (_f2b_slow_run.ok | default(false))) else [])
+         + (['reload'] if ((_f2b_slow_trial.changes | default([]) | length > 0) and (_f2b_slow_run.ok | default(false))) else []) }}
+
+- name: "fail2ban slow decide N03-F9: the recidive jail is left out"
+  when:
+    - "'N03-F9' in _f2b_slow_note_ids"
+    - (_f2b_stage == 'preflight') or ('N03-F9' not in (_f2b_slow_noted | default([])))
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: auto_sec adds no recidive jail on {{ inventory_hostname }}:
+      {% if _f2b_slow_s.recidive.reason == 'off' %}fail2ban_slow_recidive_enabled is false.
+      {% elif _f2b_slow_s.recidive.reason == 'yours' %}you have one of your own
+      ({{ _f2b_slow_s.recidive.detail | default('') | regex_replace(' \[.*$', '') or 'enabled in your files' }}), and it stays as it is.
+      {% elif _f2b_slow_s.recidive.reason == 'disabled' %}a file of yours turns it off
+      ({{ _f2b_slow_s.recidive.detail | default('') | regex_replace(' \[.*$', '') or 'enabled = false' }}), and that wins.
+      {% elif _f2b_slow_s.recidive.reason == 'logtarget' %}it must read fail2ban's own log file, and here
+      fail2ban logs to {{ _f2b_slow_s.recidive.logtarget or 'no file' }} while the jail would read
+      {{ _f2b_slow_s.recidive.logpath | default([]) | join(' ') or 'no existing file' }}. Set logtarget in
+      fail2ban.local to a file, and logpath in a [recidive] section of your jail.local to the
+      same file.
+      {% elif _f2b_slow_s.recidive.reason == 'action' %}its ban on all ports would use another firewall
+      tool than the sshd jail ({{ _f2b_slow_s.recidive.detail }}). Set banaction_allports in [DEFAULT]
+      of your jail.local to the tool your banaction uses (for ufw: banaction_allports = ufw).
+      {% else %}fail2ban cannot load it: {{ _f2b_slow_s.recidive.detail | default('') | truncate(300) }}.
+      {% endif %}{% if _f2b_slow_rec_gone | bool %}auto_sec added that jail in an earlier run: this
+      run's reload stops it, and the addresses it bans now are released.
+      {% endif %}sshd-slow and the longer memory are not affected.
+
+- name: "fail2ban slow decide N03-F10: a dbpurgeage of yours wins, or the database is off"
+  when:
+    - "'N03-F10' in _f2b_slow_note_ids"
+    - (_f2b_stage == 'preflight') or ('N03-F10' not in (_f2b_slow_noted | default([])))
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: {% if _f2b_slow_run.db_disabled | default(false, true) %}fail2ban's database is off on
+      {{ inventory_hostname }} (dbfile = None): it remembers nothing between restarts, so the
+      longer memory has no effect, and ban times do not grow.
+      {% else %}{{ _f2b_slow_s.dbpurgeage.set_in | default('a file of yours') | regex_replace(' \[.*$', '') }} on
+      {{ inventory_hostname }} sets dbpurgeage, and it wins over auto_sec's file: fail2ban's memory
+      stays at {{ _f2b_slow_s.dbpurgeage.new_s | default('?') }} seconds, not the
+      {{ _f2b_slow_s.dbpurgeage.write_s | default('?') }} auto_sec would set. Change or remove your
+      value if you want the longer memory.{% endif %}
+
+- name: "fail2ban slow decide N03-F11: ban times grow without a limit"
+  when:
+    - "'N03-F11' in _f2b_slow_note_ids"
+    - (_f2b_stage == 'preflight') or ('N03-F11' not in (_f2b_slow_noted | default([])))
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: on {{ inventory_hostname }} bantime.increment is on and no bantime.maxtime is set for
+      {{ _f2b_slow_s.dbpurgeage.uncapped | join(', ') }}: every repeat ban of an address is longer
+      than the one before, without a limit (fail2ban stops doubling only after 20 bans).
+      dbpurgeage counts only the first ban time of these jails. To cap the growth, set
+      bantime.maxtime {{ 'in fail2ban_defaults' if (_f2b_enabled | bool) else 'in [DEFAULT] of your jail.local' }}
+      (auto_sec sets none by itself).
+
+- name: "fail2ban slow decide N03-F12: this computer's address is not exempt"
+  when:
+    - "'N03-F12' in _f2b_slow_note_ids"
+    - (_f2b_stage == 'preflight') or ('N03-F12' not in (_f2b_slow_noted | default([])))
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: this computer's address ({{ _ssh_controller_ip | default('?') }}) is not in the ignore
+      list of {{ _f2b_slow_s.controller_open | join(' and ') }} on {{ inventory_hostname }}. After
+      {{ fail2ban_slow_sshd.maxretry }} failed logins in {{ fail2ban_slow_sshd.findtime }} it would be banned
+      {{ 'until you unban it' if (fail2ban_slow_sshd.bantime | string) == '-1' else ('for ' ~ fail2ban_slow_sshd.bantime) }}.
+      If it is a fixed address of yours, put it in office_static_ip or fail2ban_ignore_ips.
+
+- name: "fail2ban slow decide N03-F13: the sshd jail is off, or fail2ban does not run"
+  when:
+    - "'N03-F13' in _f2b_slow_note_ids"
+    - (_f2b_stage == 'preflight') or ('N03-F13' not in (_f2b_slow_noted | default([])))
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: {% if not (_f2b_slow_run.ok | default(false)) %}fail2ban on {{ inventory_hostname }} does not
+      answer (it is not running). auto_sec writes its files; they load when fail2ban starts.
+      auto_sec never starts a fail2ban that was installed before the run.
+      {% endif %}{% if not (_f2b_slow_s.sshd_enabled | default(true)) %}The sshd jail is off on
+      {{ inventory_hostname }}. sshd-slow still runs: it uses the [sshd] section's log source and
+      bans on its own.{% endif %}
+
+# --- Plan ---------------------------------------------------------------------
+
+- name: "fail2ban slow decide: plan"
+  ansible.builtin.set_fact:
+    _f2b_slow_rec_in: "{{ _f2b_slow_s.recidive.write | bool }}"
+    _f2b_slow_db_s: "{{ _f2b_slow_s.dbpurgeage.write_s | int }}"
+    _f2b_slow_jail_differs: "{{ _f2b_slow_s.differs.jail | default(true) | bool }}"
+    _f2b_slow_db_differs: "{{ _f2b_slow_s.differs.db | default(true) | bool }}"
+    _f2b_slow_will_reload: "{{ (_f2b_slow_trial.changes | default([]) | length > 0) and (_f2b_slow_run.ok | default(false)) }}"
+    _f2b_slow_will_set: >-
+      {{ (_f2b_slow_s.dbpurgeage.changes | default(false)) and (_f2b_slow_s.dbpurgeage.effective | default(false))
+         and (_f2b_slow_run.ok | default(false)) and (_f2b_slow_run.dbpurgeage_s | default(none) is not none)
+         and (_f2b_slow_run.dbpurgeage_s | default(0) | int) != (_f2b_slow_s.dbpurgeage.write_s | int) }}
+    _f2b_slow_change_lines: "{{ _f2b_slow_trial.change_lines | default([]) }}"
+    _f2b_slow_jail_note: >-
+      {%- set out = [] -%}
+      {%- for name in ['sshd-slow', 'recidive'] if name in (_f2b_slow_s.jails | default({})) -%}
+      {%- set j = _f2b_slow_s.jails[name] -%}
+      {%- set grow = '' if not j.increment else ((', a repeat ban is longer, up to ' ~ j.maxtime) if j.maxtime else ', a repeat ban is longer, without a limit') -%}
+      {%- set src = ('the journal (' ~ (j.journalmatch | join(' + ')) ~ ')') if j.backend == 'systemd' else ((j.logpath | join(' ')) or 'no log file') -%}
+      {%- set _ = out.append(name ~ ' as fail2ban will run it: ' ~ j.maxretry ~ ' in ' ~ j.findtime ~ ', banned '
+                             ~ ('until you unban it' if (j.bantime | string) == '-1' else ('for ' ~ j.bantime)) ~ grow
+                             ~ '; reads ' ~ src ~ '; ban action ' ~ ((j.actions | join(', ')) or 'none')
+                             ~ '; ignoreip ' ~ ((j.ignoreip | join(' ')) or 'nobody')
+                             ~ ((' (values of yours win: ' ~ (j.yours | join(', ')) ~ ')') if (j.yours | length > 0) else '')) -%}
+      {%- endfor -%}
+      {%- if (_f2b_slow_s.recidive.reason | default('')) not in ['', 'off'] -%}
+      {%- set _ = out.append('recidive is left out (' ~ {'yours': 'you have your own', 'disabled': 'a file of yours turns it off',
+                             'logtarget': 'fail2ban does not log to a file it can read', 'action': 'its ban action is another tool than the sshd jail uses',
+                             'broken': 'fail2ban cannot load it'}[_f2b_slow_s.recidive.reason] ~ ')') -%}
+      {%- endif -%}
+      {{ out | join('. ') }}
+    _f2b_slow_db_note: >-
+      {%- set d = _f2b_slow_s.dbpurgeage -%}
+      {%- set who = ('the jail ' if (d.why_jails | default([]) | length < 2) else 'the jails ')
+                    ~ (d.why_jails | default([]) | join(', ') | truncate(120)) -%}
+      {%- set why = {'variable': 'fail2ban_slow_dbpurgeage ' ~ d.min,
+                     'bantime': 'the bantime ' ~ d.why_value ~ ' of ' ~ who,
+                     'maxtime': 'the bantime.maxtime ' ~ d.why_value ~ ' of ' ~ who,
+                     'findtime': 'the findtime ' ~ d.why_value ~ ' of ' ~ who,
+                     'yours': 'the ' ~ d.why_value ~ ' this server already has'}[d.why | default('variable')] -%}
+      dbpurgeage {{ d.write_s }} seconds: the largest value is {{ why }}; the server has {{ d.without | default('?', true) }} now
+      {%- if not (d.effective | default(true)) %}; {{ d.set_in | regex_replace(' \[.*$', '') }} wins, so it stays {{ d.new }}{% endif -%}
+      {%- if d.permanent | default([]) | length > 0 %}; a ban until you unban ({{ d.permanent | join(', ') }}) needs no dbpurgeage{% endif -%}
+      {%- if d.uncapped | default([]) | length > 0 %}; ban times grow without a limit in {{ d.uncapped | join(', ') }} (no bantime.maxtime){% endif -%}
+      {%- if d.uncounted | default([]) | length > 0 %}; not counted: {{ d.uncounted | join(', ') | truncate(200) }}{% endif -%}
+
+- name: "fail2ban slow decide: one line for the plan"
+  ansible.builtin.set_fact:
+    _f2b_slow_plan: >-
+      {%- set w = (['00-autosec-slow.conf'] if (_f2b_slow_jail_differs | bool) else [])
+                  + (['fail2ban.d/00-autosec.conf'] if (_f2b_slow_db_differs | bool) else []) -%}
+      {%- set act = (['set dbpurgeage'] if (_f2b_slow_will_set | bool) else [])
+                    + (['reload fail2ban'] if (_f2b_slow_will_reload | bool) else []) -%}
+      {{ (('write ' ~ (w | join(' and '))) if (w | length > 0) else 'no file changes')
+         ~ '; ' ~ ((act | join(', ')) if (act | length > 0) else
+                   ('no effective change, no reload' if (_f2b_slow_run.ok | default(false)) else 'fail2ban is not running: the files load when it starts')) }}
+
+- name: "fail2ban slow decide: changes to the effective fail2ban config"
+  when: _f2b_slow_change_lines | length > 0
+  ansible.builtin.debug:
+    msg: "{{ _f2b_slow_change_lines }}"
+
+- name: "fail2ban slow decide: a reload loads every unloaded edit"
+  when:
+    - "'reload' in _f2b_slow_note_ids"
+    - (_f2b_stage == 'preflight') or ('reload' not in (_f2b_slow_noted | default([])))
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: this run reloads fail2ban on {{ inventory_hostname }}. A reload also loads any other
+      edit under /etc/fail2ban that has not been loaded yet (a filter, an action, another value).
+      auto_sec compares only the jail list, each jail's maxretry, findtime, bantime and
+      ignoreip, and dbpurgeage with the running server. A reload keeps the bans.
+
+- name: "fail2ban slow decide: the notes the preflight has shown"
+  when: _f2b_stage == 'preflight'
+  ansible.builtin.set_fact:
+    _f2b_slow_noted: "{{ _f2b_slow_note_ids }}"

@@ -20,6 +20,7 @@
           {{ {'deploy_user_account': deploy_user_account | string,
               'unattended_upgrades_enabled': unattended_upgrades_enabled | string,
               'fail2ban_hardening_enabled': fail2ban_hardening_enabled | string,
+              'fail2ban_slow_scanners': fail2ban_slow_scanners | string,
               'firewall_state': firewall_state | string,
               'cve_watch_enabled': cve_watch_enabled | string,
               'autosec_require_approval': autosec_require_approval | string,

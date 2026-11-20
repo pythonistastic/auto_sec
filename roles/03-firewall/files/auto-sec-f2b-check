@@ -2,10 +2,11 @@
 """auto-sec-f2b-check: read-only trial of an auto_sec fail2ban drop-in.
 
 Role 03 runs this on the managed host as root, with python3 -I, as one
-argv list (no shell). It never writes outside --work and never changes
-fail2ban: it only asks fail2ban's own config reader what a config means
-(`fail2ban-client -c COPY -d`, `-t`, `-vvv -d`) and, with --running, reads
-the running server (`status`, `get`). Python 3.10 standard library only.
+argv list (no shell). It never writes outside --work (and the --snapshot
+file) and never changes fail2ban: it only asks fail2ban's own config reader
+what a config means (`fail2ban-client -c COPY -d`, `-t`, `-vvv -d`) and,
+with --running, reads the running server (`status`, `get`, `ping`). Python
+3.10 standard library only.
 
 Trial mode (default) builds three copies of the fail2ban directory in --work:
   live     /etc/fail2ban as it is now
@@ -15,6 +16,16 @@ Trial mode (default) builds three copies of the fail2ban directory in --work:
 and prints one JSON object (keys documented in report_defaults()).
 
 Verify mode (--verify) compares the running server with --conf itself.
+
+With --candidate-name 00-autosec-slow.conf (fail2ban_slow_scanners) the
+candidate is two files: the jail file (sshd-slow and recidive), and
+--db-candidate for fail2ban.d/00-autosec.conf, in which this script puts
+the number of seconds for dbpurgeage. --candidate-alt is the jail file
+without its [recidive] section; the script says which one fits this host.
+See trial_slow() and slow_defaults().
+
+--snapshot FILE writes what runs now (each jail's bans, the server's PID)
+to FILE, mode 0600. --verify --before FILE compares with it after a reload.
 
 Exit 0 = JSON printed (the caller decides), 2 = usage or setup error.
 
@@ -35,8 +46,22 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 
 OWN_FILES = ("00-autosec.conf", "00-autosec-nginx.conf")
+# The slow-scanner part: one more jail file, and auto_sec's file in
+# fail2ban.d. Its candidate holds DB_TOKEN where the seconds go.
+SLOW_FILE = "00-autosec-slow.conf"
+DB_FILE = "00-autosec.conf"
+DB_TOKEN = "@AUTOSEC_DBPURGEAGE@"
+SLOW_JAIL, REC_JAIL = "sshd-slow", "recidive"
+# A ban time or findtime above ten years is not counted for dbpurgeage.
+YEARS10 = 315576000
+# jail.conf's own [recidive] values, the same in every fail2ban build this
+# was tried with (0.11.2, 1.0.2, 1.1.0). In a jail.conf that is not the
+# package's file byte for byte (an older one kept at an upgrade, or edited
+# elsewhere), they are still not a choice of the operator's.
+STOCK_RECIDIVE = {("jail.conf", REC_JAIL, "bantime"): "1w", ("jail.conf", REC_JAIL, "findtime"): "1d"}
 
 # jail.local as auto_sec 0.1.0-0.3.2 (A) and the 0.4.0 test branch (B) wrote
 # it, after normalising the two variable lines (port, ignoreip).
@@ -170,8 +195,9 @@ def short_hash(obj):
 
 
 def parse_dump(text):
-    """`fail2ban-client -d` stream -> jails {name: {key: str}}, actions."""
-    jails, order, actions, parsed = {}, [], {}, 0
+    """`fail2ban-client -d` stream -> jails {name: {key: str}}, actions, and
+    the server's own settings (logtarget, dbpurgeage ...)."""
+    jails, order, actions, server, parsed = {}, [], {}, {}, 0
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith("["):
@@ -210,7 +236,9 @@ def parse_dump(text):
                 jails[j][k] = v
         elif c[0] == "start" and c[1] in jails:
             jails[c[1]]["(started)"] = "yes"
-    return {"order": order, "jails": jails, "actions": actions, "parsed": parsed}
+        elif c[0] == "set" and len(c) == 3 and c[1] not in jails:
+            server[c[1]] = str(c[2])
+    return {"order": order, "jails": jails, "actions": actions, "server": server, "parsed": parsed}
 
 
 def errors_of(err):
@@ -221,7 +249,7 @@ def errors_of(err):
 def dump(client, conf):
     rc, out, err = run(client + ["-c", conf, "-d"])
     res = {"ok": rc == 0, "rc": rc, "error": errors_of(err) or (err.strip()[-400:] if rc else "")}
-    parsed = parse_dump(out) if rc == 0 else {"order": [], "jails": {}, "actions": {}, "parsed": 0}
+    parsed = parse_dump(out) if rc == 0 else {"order": [], "jails": {}, "actions": {}, "server": {}, "parsed": 0}
     # rc 0 but no command we can read: unreadable, never "no jails"
     parsed["unparsed"] = rc == 0 and parsed["parsed"] == 0
     res.update(parsed)
@@ -302,17 +330,19 @@ def md5_of(path):
     return h.hexdigest()
 
 
-def read_before_overrides(tree, read_order, cand_name, cand_ini, conffiles):
+def read_before_overrides(tree, read_order, cand_name, cand_ini, conffiles, own=OWN_FILES, stock=None):
     """Keys of auto_sec's sections set (to another value) in a file that is
     read BEFORE auto_sec's file and is not an unmodified package conffile:
-    auto_sec's value would silently win over them."""
+    auto_sec's value would silently win over them. `own`: the jail.d files
+    that are auto_sec's own. `stock`: (file, section, key) -> a value that
+    is the package's own and so not reported."""
     target = os.path.normpath(os.path.join(tree, "jail.d", cand_name))
     if target not in read_order:
         return [], False
     found = []
     for f in read_order[:read_order.index(target)]:
         rel = os.path.relpath(f, tree)
-        if os.path.basename(f) in OWN_FILES and os.path.dirname(rel) == "jail.d":
+        if os.path.basename(f) in own and os.path.dirname(rel) == "jail.d":
             continue
         if rel in conffiles and md5_of(f) == conffiles[rel]:
             continue
@@ -325,6 +355,8 @@ def read_before_overrides(tree, read_order, cand_name, cand_ini, conffiles):
                 continue
             for k in cand_ini.options(sec):
                 if p.has_option(sec, k) and norm_value(k, p.get(sec, k)) != norm_value(k, cand_ini.get(sec, k)):
+                    if (stock or {}).get((rel, sec, k)) == norm_value(k, p.get(sec, k)):
+                        continue
                     found.append({"file": rel, "section": sec, "key": k,
                                   "value": p.get(sec, k), "ours": cand_ini.get(sec, k)})
     return found, True
@@ -386,9 +418,34 @@ def restart_needed(live_actions, new_actions):
     return a != b
 
 
+# One number with one unit, as fail2ban's MyTime.str2seconds counts it (mo
+# and y are averages). Only used together with Str2Sec.prove().
+UNIT_S = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "mo": 2629800, "y": 31557600}
+
+
 class Str2Sec:
     def __init__(self, client):
         self.client, self.cache = client, {}
+
+    @staticmethod
+    def simple(value):
+        m = re.match(r"^([0-9]+)(s|m|h|d|w|mo|y)$", str(value).strip())
+        return int(m.group(1)) * UNIT_S[m.group(2)] if m else None
+
+    def prove(self, values):
+        """One call of fail2ban's own --str2sec for all these values instead
+        of one call each: it is given their sum. When fail2ban's answer is
+        the sum this script expects, each value is cached; if not, every
+        value is asked on its own later, as before."""
+        vals = sorted({str(v).strip() for v in values
+                       if v is not None and self.simple(v) is not None and str(v).strip() not in self.cache})
+        if len(vals) < 2:
+            return
+        rc, out, err = run(self.client + ["--str2sec", " + ".join(vals)], timeout=30)
+        out = out.strip()
+        if rc == 0 and re.match(r"^[0-9]+(\.[0-9]+)?$", out) and int(float(out)) == sum(self.simple(v) for v in vals):
+            for v in vals:
+                self.cache[v] = str(self.simple(v))
 
     def __call__(self, value):
         v = str(value).strip()
@@ -400,6 +457,11 @@ class Str2Sec:
             self.cache[v] = str(int(float(out))) if rc == 0 and re.match(r"^-?[0-9]+(\.[0-9]+)?$", out) else v
         return self.cache[v]
 
+    def num(self, value):
+        """Seconds as an int, None when fail2ban does not read it as a time."""
+        v = self(value) if value is not None else ""
+        return int(v) if re.match(r"^-?[0-9]+$", v) else None
+
 
 def runtime_ignores(path):
     try:
@@ -410,8 +472,9 @@ def runtime_ignores(path):
     return {norm_net(ip)} if ip else set()
 
 
-def running_state(client, conf, files_jails, compare_all, runtime_ignore_file):
-    """Running server (its socket is set in conf/fail2ban.conf) vs the given dump."""
+def running_state(client, conf, files_jails, compare_all, runtime_ignore_file, db=False):
+    """Running server (its socket is set in conf/fail2ban.conf) vs the given dump.
+    db: also read the dbpurgeage the server runs with (seconds)."""
     s2s = Str2Sec(client)
     client = client + ["-c", conf]
     rc, out, err = run(client + ["status"], timeout=60)
@@ -426,9 +489,14 @@ def running_state(client, conf, files_jails, compare_all, runtime_ignore_file):
     # database (jail.py restoreCurrentBans runs only with a database).
     rc, out, err = run(client + ["get", "dbfile"], timeout=60)
     res["db_disabled"] = rc == 0 and "Database currently disabled" in out
+    if db:
+        rc, out, err = run(client + ["get", "dbpurgeage"], timeout=60)
+        m = re.search(r"(-?[0-9]+)\s*seconds", out)
+        res["dbpurgeage_s"] = int(m.group(1)) if (rc == 0 and m) else None
     if not compare_all:
         return res
     skip_ips = runtime_ignores(runtime_ignore_file)
+    s2s.prove([files_jails[j].get(k) for j in running if j in files_jails for k in DRIFT_KEYS])
     for j in running:
         want = files_jails.get(j)
         if want is None:
@@ -476,6 +544,7 @@ def report_defaults():
         "read_order_from_trace": False,
         "sshd_action_restart_needed": False,
         "running": None,
+        "slow": None,                  # only with SLOW_FILE: see slow_defaults()
     }
 
 
@@ -532,7 +601,8 @@ def trial(a, client):
     if cand is None:
         raise Fail("cannot parse the candidate file %s" % a.candidate)
     res["read_before_overrides"], seen = read_before_overrides(
-        trees["new"], order, a.candidate_name, cand, conffile_md5s(a.conffiles))
+        trees["new"], order, a.candidate_name, cand, conffile_md5s(a.conffiles),
+        own=OWN_FILES + tuple(a.own_file))
     if not seen:
         res["read_before_overrides"] = [{"file": "jail.d/" + a.candidate_name, "section": "?", "key": "?",
                                          "value": "fail2ban did not read this file", "ours": ""}]
@@ -572,12 +642,497 @@ def trial(a, client):
     return res
 
 
+def slow_defaults():
+    return {
+        "foreign": [],             # files that are not auto_sec's and have a [sshd-slow] section
+        "theirs_enabled": False,   # a jail sshd-slow runs without auto_sec's file
+        # recidive: wanted = the candidate has it; theirs = the operator's own
+        # recidive jail is enabled; write = it stays in the file auto_sec
+        # writes; reason = "" | off | yours | disabled | broken | logtarget | action
+        "recidive": {"wanted": False, "theirs": False, "write": False, "reason": "", "detail": "",
+                     "logtarget": "", "logpath": []},
+        "jails": {},               # sshd-slow and recidive as fail2ban would run them
+        "set_in": {},              # per jail: the file and section each value comes from
+        "sshd_enabled": False,
+        "follow": [],              # what sshd-slow would not take over from the sshd jail
+        "ignore_missing": {},      # per jail: --autosec-ip addresses its ignore list lacks
+        "controller_open": [],     # jails whose ignore list does not cover --controller-ip
+        "dbpurgeage": {},          # see db_need(); plus live_s, new, new_s, effective, changes, set_in
+        "sha256": {"jail": "", "db": ""},       # the two files as tried
+        "differs": {"jail": True, "db": True},  # from the files the host has now
+        "folders": True,           # jail.d and fail2ban.d exist (the package ships both)
+    }
+
+
+def addr_list(jail):
+    return (jail.get("addignoreip") or "").replace("|", " ").split()
+
+
+def held(ip, tokens):
+    return ip in tokens or covered(ip, tokens)
+
+
+def log_source(jail):
+    """Where a jail reads: backend, log files, journal matches (alternatives)."""
+    paths = sorted({re.sub(r"\s+(head|tail)$", "", p.strip())
+                    for p in (jail.get("addlogpath") or "").split(" | ") if p.strip()})
+    alts = sorted({" ".join(sorted(alt.split())) for ln in (jail.get("addjournalmatch") or "").split(" | ")
+                   for alt in ln.split(" + ") if alt.strip()})
+    return {"backend": jail.get("backend") or "", "logpath": paths, "journalmatch": alts}
+
+
+def source_gaps(sshd, slow):
+    """What the jail sshd-slow would not read that the sshd jail reads."""
+    sa, sb, out = log_source(sshd), log_source(slow), []
+    if sa["backend"] != sb["backend"]:
+        out.append("backend: sshd %s, sshd-slow %s" % (sa["backend"], sb["backend"]))
+    elif sa["backend"] == "systemd":
+        wide = [set(y.split()) for y in sb["journalmatch"]]
+        miss = [x for x in sa["journalmatch"] if not any(y <= set(x.split()) for y in wide)]
+        if wide and (miss or not sa["journalmatch"]):
+            out.append("journalmatch: sshd reads %s, sshd-slow only %s"
+                       % (" + ".join(sa["journalmatch"]) or "the whole journal", " + ".join(sb["journalmatch"])))
+    else:
+        miss = [p for p in sa["logpath"] if p not in sb["logpath"]]
+        if miss:
+            out.append("logpath: sshd-slow would not read %s" % " ".join(miss))
+    for k in ("logencoding", "logtimezone", "datepattern", "usedns"):
+        if sshd.get(k) != slow.get(k):
+            out.append("%s: sshd %s, sshd-slow %s" % (k, sshd.get(k), slow.get(k)))
+    return out
+
+
+def families(actions):
+    """Action names 'nftables', 'iptables-allports' -> ['iptables', 'nftables']."""
+    return sorted({re.split(r"[-\[]", n, maxsplit=1)[0] for n in (actions or {})})
+
+
+def action_text(actions):
+    out = []
+    for n, p in sorted((actions or {}).items()):
+        extra = [k + " " + str(p[k]) for k in ("type", "port") if p.get(k)]
+        out.append(n + ((" (" + ", ".join(extra) + ")") if extra else ""))
+    return out
+
+
+def grows(jail):
+    return str(jail.get("bantime.increment", "")).lower() in ("true", "1", "yes", "on")
+
+
+def describe(s2s, jail, acts):
+    """One of auto_sec's jails as fail2ban would run it (shown in the plan)."""
+    src = log_source(jail)
+    return {
+        "maxretry": jail.get("maxretry"), "findtime": jail.get("findtime"), "bantime": jail.get("bantime"),
+        "findtime_s": s2s.num(jail.get("findtime")), "bantime_s": s2s.num(jail.get("bantime")),
+        "increment": grows(jail), "factor": jail.get("bantime.factor"),
+        "maxtime": jail.get("bantime.maxtime") or None,
+        "backend": src["backend"], "logpath": src["logpath"], "journalmatch": src["journalmatch"],
+        "ignoreip": addr_list(jail), "actions": action_text(acts), "families": families(acts),
+        "yours": [],
+    }
+
+
+def db_need(s2s, db_min, jails, without):
+    """The dbpurgeage auto_sec writes, in seconds: the largest of the
+    operator's minimum (--db-min), every jail's bantime (and bantime.maxtime
+    where its ban times grow), every findtime, and the value the server has
+    without auto_sec's file. A permanent ban (-1) is not counted: fail2ban
+    never purges it. why: which of them is the largest (variable | bantime |
+    maxtime | findtime | yours), with the jails that have it. uncapped: jails
+    whose ban times grow without a bantime.maxtime."""
+    cands = [("variable", "", str(db_min), s2s.num(db_min))]
+    uncapped, permanent, uncounted = [], [], []
+    for name in sorted(jails):
+        j = jails[name]
+        ban = s2s.num(j.get("bantime"))
+        keys = ["bantime", "findtime"]
+        if grows(j) and ban is not None and ban > 0:
+            if j.get("bantime.maxtime") in (None, ""):
+                uncapped.append(name)
+            else:
+                keys.append("bantime.maxtime")
+        for key in keys:
+            sec = s2s.num(j.get(key))
+            if sec is None or sec > YEARS10:
+                uncounted.append("%s %s %s" % (name, key, j.get(key)))
+            elif sec < 0 and key == "bantime":
+                permanent.append(name)
+            elif sec > 0:
+                cands.append((key.replace("bantime.", ""), name, str(j.get(key)), sec))
+    wo = s2s.num(without)
+    if wo is not None:
+        cands.append(("yours", "", str(without), wo))
+    best = cands[0]
+    for c in cands[1:]:
+        if c[3] is not None and best[3] is not None and c[3] > best[3]:
+            best = c
+    tied = sorted(c[1] for c in cands if c[1] and c[0] == best[0] and c[3] == best[3])
+    return {"min": str(db_min), "min_s": cands[0][3], "without": without, "without_s": wo,
+            "write_s": best[3], "why": best[0], "why_jail": best[1], "why_jails": tied, "why_value": best[2],
+            "uncapped": uncapped, "permanent": permanent, "uncounted": uncounted}
+
+
+def db_order(conf):
+    """Files fail2ban reads for its own settings, in order."""
+    files = [os.path.join(conf, "fail2ban.conf")]
+    files += sorted(glob.glob(os.path.join(conf, "fail2ban.d", "*.conf")))
+    files.append(os.path.join(conf, "fail2ban.local"))
+    files += sorted(glob.glob(os.path.join(conf, "fail2ban.d", "*.local")))
+    return [f for f in files if os.path.isfile(f)]
+
+
+def server_pid(client, conf):
+    """PID of the running server; fail2ban's own client names the pid file."""
+    rc, out, err = run(client + ["-c", conf, "-v", "ping"], timeout=60)
+    m = re.search(r"Using pid file (.+?), \[", err + "\n" + out)
+    if rc != 0 or not m:
+        return None
+    try:
+        with open(m.group(1).strip(), encoding="ascii") as f:
+            pid = f.readline().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return int(pid) if re.match(r"^[0-9]{1,10}$", pid) and os.path.isdir("/proc/" + pid) else None
+
+
+def bans_of(client, conf, jail):
+    """Address -> end of its ban in epoch seconds (None = permanent). None =
+    no such jail, or a line that is not `ADDRESS  START + SECONDS = END`."""
+    rc, out, err = run(client + ["-c", conf, "get", jail, "banip", "--with-time"], timeout=60)
+    if rc != 0:
+        return None
+    bans = {}
+    for ln in out.splitlines():
+        if not ln.strip():
+            continue
+        m = re.match(r"^\s*(\S+)\s.*\+\s*(-?[0-9]+)\s*=\s*([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})\s*$", ln)
+        if not m:
+            return None
+        end = None
+        if int(m.group(2)) >= 0:
+            try:
+                end = int(time.mktime(time.strptime(m.group(3), "%Y-%m-%d %H:%M:%S")))
+            except (ValueError, OverflowError):
+                end = None
+        bans[m.group(1)] = end
+    return bans
+
+
+def running_jails(client, conf):
+    rc, out, err = run(client + ["-c", conf, "status"], timeout=60)
+    m = re.search(r"Jail list:\s*(.*)$", out, re.M)
+    if rc != 0 or not m:
+        return None, errors_of(err) or err.strip()[-300:]
+    return sorted(x.strip() for x in m.group(1).split(",") if x.strip()), ""
+
+
+def snapshot(a, client):
+    """What runs now: each jail's bans and the server's PID. The file stays
+    on the host (0600); only counts are printed. No picture of the bans, no
+    snapshot: the caller then changes nothing in the running fail2ban."""
+    conf = os.path.realpath(a.conf)
+    jails, error = running_jails(client, conf)
+    if jails is None:
+        raise Fail("fail2ban does not answer, so its bans cannot be read (%s)" % (error or "no jail list"))
+    snap = {"time": int(time.time()), "pid": server_pid(client, conf),
+            "jails": {j: bans_of(client, conf, j) for j in jails}}
+    unread = sorted(j for j, b in snap["jails"].items() if b is None)
+    if unread:
+        raise Fail("cannot read the bans of %s (fail2ban-client get <jail> banip --with-time)" % ", ".join(unread))
+    fd = os.open(a.snapshot, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(snap, f)
+    return {"ok": True, "error": "", "jails": jails, "pid": snap["pid"],
+            "banned": {j: len(b or {}) for j, b in snap["jails"].items()}}
+
+
+def since_snapshot(path, client, conf, released=()):
+    """Bans a jail had in the snapshot and no longer has (a ban that has run
+    out since is not lost), and the server's PID then and now. released:
+    jails this run takes away on purpose (their bans go with them)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            before = json.load(f)
+    except (OSError, ValueError) as e:
+        raise Fail("cannot read --before %s: %s" % (path, e))
+    now, lost = time.time(), []
+    for j, bans in sorted((before.get("jails") or {}).items()):
+        if bans is None or j in released:
+            continue
+        cur = bans_of(client, conf, j)
+        if cur is None:
+            lost.append({"jail": j, "addresses": ["(the jail is gone)"]})
+            continue
+        gone = sorted(ip for ip, end in bans.items() if ip not in cur and (end is None or end > now + 3))
+        if gone:
+            lost.append({"jail": j, "addresses": gone[:50]})
+    pid = server_pid(client, conf)
+    same = None if (before.get("pid") is None or pid is None) else before.get("pid") == pid
+    return lost, {"before": before.get("pid"), "after": pid, "same": same}
+
+
+def trial_slow(a, client):
+    """The slow-scanner files: jail.d/SLOW_FILE (the jails sshd-slow and
+    recidive) and fail2ban.d/DB_FILE (dbpurgeage). Three copies as in
+    trial(); "without" and "new" lack both files, "new" then gets the
+    candidates. Adds res["slow"] (slow_defaults()). res["leaks"] holds every
+    change to a jail that is not auto_sec's own."""
+    conf = os.path.realpath(a.conf)
+    res = report_defaults()
+    res["candidate_name"] = SLOW_FILE
+    slow = res["slow"] = slow_defaults()
+    if not os.path.isfile(os.path.join(conf, "jail.conf")):
+        res["installed"] = False
+        return res
+    slow["folders"] = all(os.path.isdir(os.path.join(conf, x)) and not os.path.islink(os.path.join(conf, x))
+                          for x in ("jail.d", "fail2ban.d"))
+    if not (a.db_candidate and a.db_min):
+        raise Fail("--db-candidate and --db-min are required with " + SLOW_FILE)
+    with open(a.db_candidate, encoding="utf-8") as f:
+        db_text = f.read()
+    if db_text.count(DB_TOKEN) != 1:
+        raise Fail("--db-candidate must hold %s exactly once" % DB_TOKEN)
+    a.work = os.path.abspath(a.work)
+    if os.path.lexists(a.work):
+        raise Fail("--work %s already exists; the caller removes it first" % a.work)
+    os.makedirs(a.work, mode=0o700)
+    trees = {n: os.path.join(a.work, n) for n in ("live", "without", "new")}
+    for t in trees.values():
+        shutil.copytree(conf, t, symlinks=True)
+    jail_rel, db_rel = os.path.join("jail.d", SLOW_FILE), os.path.join("fail2ban.d", DB_FILE)
+    for n in ("without", "new"):
+        for rel in (jail_rel, db_rel):
+            if os.path.lexists(os.path.join(trees[n], rel)):
+                os.unlink(os.path.join(trees[n], rel))
+    res["legacy_jail_local"] = legacy_kind(os.path.join(conf, "jail.local"))
+
+    def place(rel, data):
+        dst = os.path.join(trees["new"], rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.lexists(dst):
+            os.unlink(dst)
+        with open(dst, "wb") as fh:
+            fh.write(data)
+
+    def loaded(x):
+        return {"ok": x["ok"] and not x.get("unparsed"), "error": x["error"] or
+                ("fail2ban-client -d printed nothing readable" if x.get("unparsed") else ""),
+                "jails": x["order"]}
+
+    def read_candidate(path):
+        with open(path, "rb") as fh:
+            data = fh.read()
+        parsed = ini(path)
+        if parsed is None:
+            raise Fail("cannot parse the candidate file %s" % path)
+        return data, parsed
+
+    jail_data, cand = read_candidate(a.candidate)
+    place(jail_rel, jail_data)
+    d = {n: dump(client, t) for n, t in trees.items()}
+    for n in d:
+        res[n] = loaded(d[n])
+    res["live_test"] = config_test(client, trees["live"])
+    if not (res["live"]["ok"] and res["without"]["ok"]):
+        res["new_test"] = config_test(client, trees["new"])
+        return res
+    L, W = d["live"]["jails"], d["without"]["jails"]
+
+    # recidive stays in auto_sec's file only when the candidate has it, the
+    # operator has no recidive jail of their own, and it would read
+    # fail2ban's own log file and ban with the same tool as the sshd jail.
+    # Otherwise --candidate-alt (without it) is what is tried and reported.
+    rec = slow["recidive"]
+    rec["wanted"], rec["theirs"] = cand.has_section(REC_JAIL), REC_JAIL in W
+    if not rec["wanted"]:
+        rec["reason"] = "off"
+    elif rec["theirs"]:
+        rec["reason"] = "yours"
+        rec["detail"] = set_in(trees["without"], fallback_order(trees["without"]), REC_JAIL,
+                               {"enabled"}).get("enabled", "")
+    elif not res["new"]["ok"]:
+        rec["reason"], rec["detail"] = "broken", res["new"]["error"]
+    elif REC_JAIL not in d["new"]["jails"]:
+        rec["reason"] = "disabled"
+        rec["detail"] = set_in(trees["new"], fallback_order(trees["new"]), REC_JAIL,
+                               {"enabled"}).get("enabled", "")
+    else:
+        n0 = d["new"]
+        src = log_source(n0["jails"][REC_JAIL])
+        target = re.sub(r"\[[^\]]*\]\s*$", "", n0["server"].get("logtarget", "")).strip()
+        rec["logtarget"], rec["logpath"] = target, src["logpath"]
+        ref = n0["actions"].get("sshd" if "sshd" in n0["jails"] else SLOW_JAIL)
+        fam, ref_fam = families(n0["actions"].get(REC_JAIL)), families(ref)
+        if (src["backend"] == "systemd" or not target.startswith("/") or not os.path.isfile(target)
+                or not os.access(target, os.R_OK)
+                or os.path.realpath(target) not in [os.path.realpath(p) for p in src["logpath"]]):
+            rec["reason"] = "logtarget"
+        elif not set(fam) <= set(ref_fam):
+            rec["reason"] = "action"
+            rec["detail"] = "recidive: %s; sshd: %s" % (" ".join(fam) or "none", " ".join(ref_fam) or "none")
+    rec["write"] = rec["wanted"] and not rec["reason"]
+    # The jails as they will be, for the dbpurgeage below: with the candidate
+    # that stays. Without recidive that is the first dump minus auto_sec's
+    # recidive (the operator's own one counts as it is without auto_sec's file).
+    first = d["new"]["jails"] if res["new"]["ok"] else None
+    if rec["wanted"] and not rec["write"]:
+        if not a.candidate_alt:
+            raise Fail("--candidate-alt is required when --candidate has a [recidive] section")
+        jail_data, cand = read_candidate(a.candidate_alt)
+        if cand.has_section(REC_JAIL):
+            raise Fail("--candidate-alt must not have a [recidive] section")
+        place(jail_rel, jail_data)
+        if first is None:
+            d["new"] = dump(client, trees["new"])
+            res["new"] = loaded(d["new"])
+            first = d["new"]["jails"] if res["new"]["ok"] else None
+        else:
+            first = dict((k, v) for k, v in first.items() if k != REC_JAIL)
+            if REC_JAIL in W:
+                first[REC_JAIL] = W[REC_JAIL]
+    if first is None:
+        res["new_test"] = config_test(client, trees["new"])
+        return res
+
+    # dbpurgeage: the number is worked out here, from what fail2ban's own
+    # reader says about every jail, and put into the candidate. The dump of
+    # the finished copy must give the same number (one more round if not).
+    s2s = Str2Sec(client)
+    s2s.prove([a.db_min, d["without"]["server"].get("dbpurgeage"), d["live"]["server"].get("dbpurgeage")]
+              + [j.get(k) for j in first.values() for k in ("bantime", "findtime", "bantime.maxtime")])
+    had = d["without"]["server"].get("dbpurgeage")
+    want = db_need(s2s, a.db_min, first, had)
+    if want["write_s"] is None:
+        raise Fail("--db-min %s is not a time fail2ban understands" % a.db_min)
+    for _ in (1, 2, 3):
+        db_data = db_text.replace(DB_TOKEN, str(want["write_s"])).encode("utf-8")
+        place(db_rel, db_data)
+        d["new"] = dump(client, trees["new"])
+        res["new"] = loaded(d["new"])
+        if not res["new"]["ok"]:
+            res["new_test"] = config_test(client, trees["new"])
+            return res
+        dbp = db_need(s2s, a.db_min, d["new"]["jails"], had)
+        if dbp["write_s"] == want["write_s"]:
+            break
+        want = dbp
+    else:
+        raise Fail("the dbpurgeage for this config did not settle")
+    slow["dbpurgeage"] = dbp
+    res["new_test"] = config_test(client, trees["new"])
+    N, acts = d["new"]["jails"], d["new"]["actions"]
+    dbp["live_s"] = s2s.num(d["live"]["server"].get("dbpurgeage"))
+    dbp["new"] = d["new"]["server"].get("dbpurgeage")
+    dbp["new_s"] = s2s.num(dbp["new"])
+    dbp["effective"] = dbp["new_s"] == dbp["write_s"]
+    dbp["changes"] = dbp["new_s"] != dbp["live_s"]
+    dbp["set_in"] = set_in(trees["new"], db_order(trees["new"]), "Definition",
+                           {"dbpurgeage"}).get("dbpurgeage", "")
+
+    # auto_sec's own jails here: sshd-slow, and recidive when auto_sec writes
+    # it now or wrote it before (and the operator has none of their own).
+    live_slow = os.path.join(trees["live"], jail_rel)
+    live_ini = ini(live_slow) if os.path.isfile(live_slow) else None
+    ours = {SLOW_JAIL}
+    if rec["write"] or (live_ini is not None and live_ini.has_section(REC_JAIL) and not rec["theirs"]):
+        ours.add(REC_JAIL)
+    res["changes"] = diff(L, N)
+    res["autosec_effect"] = diff(W, N)
+    for e in res["changes"] + res["autosec_effect"]:
+        if e["jail"] not in ours and e not in res["leaks"]:
+            res["leaks"].append(e)
+    res["change_lines"], res["leak_lines"] = lines(res["changes"]), lines(res["leaks"])
+    for before in (L, W):
+        for j in sorted((set(before) & set(N)) - ours):
+            gone = [ip for ip in addr_list(before[j])
+                    if not held(ip, addr_list(N[j])) and not covered(ip, LOOPBACK)]
+            if gone and j not in [x["jail"] for x in res["ignore_dropped"]]:
+                res["ignore_dropped"].append({"jail": j, "addresses": gone})
+
+    order = read_trace(client, trees["new"])
+    res["read_order_from_trace"] = bool(order)
+    order = order or fallback_order(trees["new"])
+    target = os.path.normpath(os.path.join(trees["new"], jail_rel))
+    slow["theirs_enabled"] = SLOW_JAIL in W
+    for f in order:
+        other = ini(f) if os.path.normpath(f) != target else None
+        if other is not None and other.has_section(SLOW_JAIL):
+            slow["foreign"].append(os.path.relpath(f, trees["new"]))
+    res["read_before_overrides"], seen = read_before_overrides(
+        trees["new"], order, SLOW_FILE, cand, conffile_md5s(a.conffiles), own=OWN_FILES + (SLOW_FILE,),
+        stock=STOCK_RECIDIVE)
+    if not seen:
+        res["read_before_overrides"] = [{"file": jail_rel, "section": "?", "key": "?",
+                                         "value": "fail2ban did not read this file", "ours": ""}]
+
+    shown = {"enabled", "maxretry", "findtime", "bantime", "backend", "logpath", "ignoreip", "banaction",
+             "port", "bantime.increment", "bantime.factor", "bantime.maxtime"}
+    slow["sshd_enabled"] = "sshd" in N
+    for j in (SLOW_JAIL, REC_JAIL):
+        if j not in N or not cand.has_section(j):
+            continue
+        slow["jails"][j] = describe(s2s, N[j], acts.get(j))
+        slow["jails"][j]["yours"] = [
+            k for k in ("maxretry", "findtime", "bantime")
+            if cand.has_option(j, k) and norm_value(k, N[j].get(k)) != norm_value(k, cand.get(j, k))]
+        slow["set_in"][j] = set_in(trees["new"], order, j, shown)
+        slow["ignore_missing"][j] = [ip for ip in a.autosec_ip if not held(ip, addr_list(N[j]))]
+        if a.controller_ip and not held(a.controller_ip, addr_list(N[j])):
+            slow["controller_open"].append(j)
+        for n, p in sorted((acts.get(j) or {}).items()):
+            if p.get("name") not in (None, j):
+                slow["follow"].append("action %s of %s would use the name %s" % (n, j, p.get("name")))
+    if SLOW_JAIL in N and "sshd" in N:
+        slow["follow"] += source_gaps(N["sshd"], N[SLOW_JAIL])
+        gap = [ip for ip in addr_list(N["sshd"]) if not held(ip, addr_list(N[SLOW_JAIL]))]
+        if gap:
+            slow["follow"].append("ignoreip: sshd-slow would not ignore %s" % " ".join(gap))
+        for k in ("ignoreself", "ignorecommand"):
+            if N["sshd"].get(k) != N[SLOW_JAIL].get(k):
+                slow["follow"].append("%s: sshd %s, sshd-slow %s" % (k, N["sshd"].get(k), N[SLOW_JAIL].get(k)))
+        fam, ref_fam = families(acts.get(SLOW_JAIL)), families(acts.get("sshd"))
+        if not set(fam) <= set(ref_fam):
+            slow["follow"].append("ban action: sshd %s, sshd-slow %s"
+                                  % (" ".join(ref_fam) or "none", " ".join(fam) or "none"))
+
+    for key, rel, data in (("jail", jail_rel, jail_data), ("db", db_rel, db_data)):
+        slow["sha256"][key] = hashlib.sha256(data).hexdigest()
+        cur = os.path.join(trees["live"], rel)
+        same = False
+        if os.path.isfile(cur) and not os.path.islink(cur):
+            with open(cur, "rb") as fh:
+                same = fh.read() == data
+        slow["differs"][key] = not same
+
+    if a.running:
+        r = running_state(client, conf, L, bool(res["changes"]) or dbp["changes"], a.runtime_ignore_file, db=True)
+        if r.get("ok"):
+            r["pid"] = server_pid(client, conf)
+            now_s = r.get("dbpurgeage_s")
+            r["db_drift"] = ({"running": now_s, "files": dbp["live_s"]}
+                             if (now_s is not None and dbp["live_s"] is not None and now_s != dbp["live_s"])
+                             else None)
+        res["running"] = r
+    return res
+
+
 def verify(a, client):
-    """After a reload: the running server must match the files on disk."""
+    """After a reload: the running server must match the files on disk. With
+    --before or --expect-jail (the slow-scanner part) also: the jails that
+    must run, dbpurgeage, and the bans and the PID since the snapshot."""
     conf = os.path.realpath(a.conf)
     d = dump(client, conf)
+    extra = bool(a.before or a.expect_jail)
     res = {"files": {"ok": d["ok"], "error": d["error"], "jails": d["order"]}}
-    res["running"] = running_state(client, conf, d["jails"], True, a.runtime_ignore_file) if d["ok"] else None
+    res["running"] = (running_state(client, conf, d["jails"], True, a.runtime_ignore_file, db=extra)
+                      if d["ok"] else None)
+    if extra and d["ok"]:
+        res["files"]["dbpurgeage_s"] = Str2Sec(client).num(d["server"].get("dbpurgeage"))
+        res["expected_missing"] = [j for j in a.expect_jail if j not in (res["running"].get("jails") or [])]
+        res["bans_lost"], res["pid"] = [], {"before": None, "after": None, "same": None}
+        if a.before:
+            res["bans_lost"], res["pid"] = since_snapshot(a.before, client, conf, a.released_jail)
     return res
 
 
@@ -586,7 +1141,13 @@ def main():
     ap.add_argument("--conf", default="/etc/fail2ban")
     ap.add_argument("--work", help="scratch directory for the three copies; must not exist")
     ap.add_argument("--candidate", help="rendered candidate file")
-    ap.add_argument("--candidate-name", default=OWN_FILES[0], choices=OWN_FILES)
+    ap.add_argument("--candidate-name", default=OWN_FILES[0], choices=OWN_FILES + (SLOW_FILE,))
+    ap.add_argument("--candidate-alt", help=SLOW_FILE + " without its [recidive] section")
+    ap.add_argument("--db-candidate", help="fail2ban.d/" + DB_FILE + " with " + DB_TOKEN + " for the seconds")
+    ap.add_argument("--db-min", help="the shortest dbpurgeage auto_sec writes (fail2ban_slow_dbpurgeage)")
+    ap.add_argument("--controller-ip", default="", help="this run's controller address (compare only)")
+    ap.add_argument("--own-file", action="append", default=[],
+                    help="another jail.d file that is auto_sec's own (repeat)")
     ap.add_argument("--allowed-jail", action="append", default=[],
                     help="jail auto_sec's file may change (repeat)")
     ap.add_argument("--autosec-ip", action="append", default=[],
@@ -596,6 +1157,11 @@ def main():
     ap.add_argument("--ssh-port", type=int, default=22)
     ap.add_argument("--running", action="store_true", help="also read the running server")
     ap.add_argument("--verify", action="store_true", help="compare the running server with --conf")
+    ap.add_argument("--snapshot", help="write the running bans and the PID to this file (0600)")
+    ap.add_argument("--before", help="with --verify: the --snapshot file to compare with")
+    ap.add_argument("--expect-jail", action="append", default=[], help="with --verify: a jail that must run (repeat)")
+    ap.add_argument("--released-jail", action="append", default=[],
+                    help="with --before: a jail this run removes on purpose (repeat)")
     ap.add_argument("--runtime-ignore-file", default=RUNTIME_IGNORE)
     # For tests only: the unpacked client of another fail2ban build, and a
     # conffile list in `dpkg-query -f '${Conffiles}'` format.
@@ -604,12 +1170,14 @@ def main():
     a = ap.parse_args()
     client = a.client.split()
     try:
-        if a.verify:
+        if a.snapshot:
+            res = snapshot(a, client)
+        elif a.verify:
             res = verify(a, client)
         else:
             if not (a.work and a.candidate):
                 raise Fail("--work and --candidate are required")
-            res = trial(a, client)
+            res = trial_slow(a, client) if a.candidate_name == SLOW_FILE else trial(a, client)
     except Fail as e:
         print("auto-sec-f2b-check: %s" % e, file=sys.stderr)
         return 2

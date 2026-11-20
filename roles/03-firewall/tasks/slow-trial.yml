@@ -1,0 +1,157 @@
+---
+# roles/03-firewall/tasks/slow-trial.yml - the trial run for the
+# slow-scanner files (read-only).
+#
+# Included with _f2b_stage (preflight | apply) by preflight.yml (PF3) and
+# fail2ban-slow.yml when fail2ban_slow_scanners is true and fail2ban is
+# installed.
+#
+# Renders the candidates from your variables into /run/auto-sec/f2b-sim and
+# runs files/auto-sec-f2b-check there (trial_slow): jail.d/00-autosec-slow.conf
+# with and without its recidive section, and fail2ban.d/00-autosec.conf with
+# a token where the seconds go. The helper copies /etc/fail2ban three times
+# and asks fail2ban's own config reader what each copy means. It says
+# whether recidive fits this host and which dbpurgeage is needed. Nothing
+# under /etc changes, so this also runs in --check. Sets _f2b_slow_trial
+# (the helper's JSON).
+#
+# R03-F6 is checked here, before the trial: a file auto_sec did not write
+# must never be treated as auto_sec's.
+
+- name: "fail2ban slow trial: auto_sec's two file names and their first lines"
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - |
+        for f in "$@"; do
+          if [ -L "$f" ]; then printf 'link %s\n' "$f"
+          elif [ -f "$f" ]; then printf 'file %s ' "$f"; head -n 1 -- "$f"; echo
+          elif [ -e "$f" ]; then printf 'other %s\n' "$f"
+          fi
+        done
+      - sh
+      - "{{ _f2b_slow_dropin }}"
+      - "{{ _f2b_slow_db_dropin }}"
+  register: _f2b_slow_own_files
+  changed_when: false
+  check_mode: false
+
+- name: "fail2ban slow trial R03-F6: a file with auto_sec's name must be auto_sec's own"
+  ansible.builtin.assert:
+    quiet: true
+    that: _f2b_foreign | length == 0
+    fail_msg: >-
+      {{ _f2b_foreign | join(', ') }} on {{ inventory_hostname }}: a file auto_sec did not write
+      has the name auto_sec uses (its first line is not auto_sec's marker, or it is not a
+      plain file). auto_sec never replaces a file it did not write. Rename it (keep the
+      .conf or .local ending so fail2ban still reads it), or set fail2ban_slow_scanners: false.
+      {{ 'Nothing has been changed.' if _f2b_stage == 'preflight' else 'The slow-scanner files have not been written.' }}
+  vars:
+    _f2b_lines: "{{ _f2b_slow_own_files.stdout_lines | default([]) | select | list }}"
+    _f2b_foreign: >-
+      {{ _f2b_lines | reject('equalto', 'file ' ~ _f2b_slow_dropin ~ ' ' ~ _f2b_marker)
+         | reject('equalto', 'file ' ~ _f2b_slow_db_dropin ~ ' ' ~ _f2b_marker)
+         | map('regex_replace', '^(file|link|other) (\S+).*$', '\2') | map('regex_replace', '[{}]', '?') | list }}
+
+- name: "fail2ban slow trial: start from an empty result"
+  ansible.builtin.set_fact:
+    _f2b_slow_trial: {}
+
+- name: "fail2ban slow trial: remove an old scratch copy"
+  ansible.builtin.file:
+    path: "{{ _f2b_sim_dir }}"
+    state: absent
+  changed_when: false
+  check_mode: false
+  diff: false
+
+- name: "fail2ban slow trial: scratch folders, root only"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ _f2b_file_owner }}"
+    mode: "0700"
+  loop:
+    - "{{ _f2b_run_dir }}"
+    - "{{ _f2b_sim_dir }}"
+  changed_when: false
+  check_mode: false
+  diff: false
+
+# The copies are only read here. `always` removes them, also when the
+# helper fails.
+- name: "fail2ban slow trial: render, compare, clean up"
+  block:
+    # _f2b_slow_rec_render and _f2b_slow_db_render are never set as facts:
+    # each template task passes its own value.
+    - name: "fail2ban slow trial: render from your variables 00-autosec-slow.conf, with and without recidive"
+      ansible.builtin.template:
+        src: 00-autosec-slow.conf.j2
+        dest: "{{ _f2b_sim_dir }}/{{ item.name }}"
+        owner: "{{ _f2b_file_owner }}"
+        mode: "0600"
+      vars:
+        _f2b_slow_rec_render: "{{ item.recidive }}"
+      loop:
+        - {name: candidate, recidive: true}
+        - {name: candidate-alt, recidive: false}
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+      check_mode: false
+      diff: false
+
+    - name: "fail2ban slow trial: render fail2ban.d/00-autosec.conf with a token for the seconds"
+      ansible.builtin.template:
+        src: 00-autosec-fail2ban.conf.j2
+        dest: "{{ _f2b_sim_dir }}/candidate-db"
+        owner: "{{ _f2b_file_owner }}"
+        mode: "0600"
+      vars:
+        _f2b_slow_db_render: "{{ _f2b_slow_db_token }}"
+      changed_when: false
+      check_mode: false
+      diff: false
+
+    # One argv list, no shell: python3 -I -c <helper> <options>. Every
+    # option value is a constant or a value preflight PF1 has checked,
+    # apart from --controller-ip: role 02's checked _ssh_controller_ip,
+    # which the helper only compares (SECURITY.md).
+    - name: "fail2ban slow trial: ask fail2ban's own config reader (read-only)"
+      ansible.builtin.command:
+        argv: "{{ _f2b_argv }}"
+      register: _f2b_slow_trial_raw
+      changed_when: false
+      failed_when: _f2b_slow_trial_raw.rc != 0 or not (_f2b_slow_trial_raw.stdout | default('') is match('^\{'))
+      check_mode: false
+      vars:
+        _f2b_rec: "{{ (fail2ban_slow_recidive_enabled | default(true) | string | lower) in ['true', 'yes', '1', 'on'] }}"
+        _f2b_argv: >-
+          {{ [_f2b_python, '-I', '-c', lookup('ansible.builtin.file', 'auto-sec-f2b-check'),
+              '--conf', _f2b_conf_dir,
+              '--work', _f2b_sim_dir ~ '/trees',
+              '--candidate', _f2b_sim_dir ~ ('/candidate' if (_f2b_rec | bool) else '/candidate-alt'),
+              '--candidate-name', '00-autosec-slow.conf',
+              '--db-candidate', _f2b_sim_dir ~ '/candidate-db',
+              '--db-min', fail2ban_slow_dbpurgeage | string,
+              '--ssh-port', ssh_port | int | string,
+              '--controller-ip', _ssh_controller_ip | default('', true) | string,
+              '--client', _f2b_client,
+              '--running']
+             + (['--candidate-alt', _f2b_sim_dir ~ '/candidate-alt'] if (_f2b_rec | bool) else [])
+             + (['--conffiles', _f2b_conffiles_file] if (_f2b_conffiles_file | length > 0) else [])
+             + (_f2b_ignore | map('regex_replace', '^', '--autosec-ip=') | list) }}
+
+    - name: "fail2ban slow trial: read the result"
+      ansible.builtin.set_fact:
+        _f2b_slow_trial: "{{ _f2b_slow_trial_raw.stdout | from_json }}"
+
+  always:
+    - name: "fail2ban slow trial: remove the scratch copy"
+      ansible.builtin.file:
+        path: "{{ _f2b_sim_dir }}"
+        state: absent
+      changed_when: false
+      check_mode: false
+      diff: false

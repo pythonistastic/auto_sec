@@ -1,0 +1,21 @@
+{# roles/03-firewall/templates/00-autosec-fail2ban.conf.j2
+   Written by tasks/slow-apply.yml (fail2ban_slow_scanners: true) as
+   fail2ban.d/00-autosec.conf. One value: _f2b_slow_db_render, the number
+   of seconds for dbpurgeage. It is the one number auto_sec takes from the
+   trial on the host (SECURITY.md): digits only, checked by
+   tasks/slow-decide.yml. In the trial's candidate the helper's token
+   stands in its place. #}
+{{ _f2b_marker }}
+# Change fail2ban_slow_dbpurgeage instead. fail2ban_slow_scanners: false
+# makes later runs leave this file alone; it does not delete it.
+#
+# dbpurgeage: how long fail2ban remembers an address after a ban, in
+# seconds. It is the largest of: fail2ban_slow_dbpurgeage, the longest ban
+# time and findtime of any jail on this server, and the value the server
+# had before.
+#
+# fail2ban reads this file right after fail2ban.conf, before fail2ban.local:
+# a dbpurgeage that YOUR files set wins.
+
+[DEFAULT]
+dbpurgeage = {{ _f2b_slow_db_render }}

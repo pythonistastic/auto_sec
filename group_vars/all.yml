@@ -177,10 +177,12 @@ ssh_max_hosts_per_run: 5
 
 # Your office/home static IP (break-glass). auto_sec uses it only where it
 # writes: in ignoreip of its fail2ban file (fail2ban_hardening_enabled:
-# true), and, when this run turns ufw on, in a rule above every other that
-# lets it reach SSH without the rate limit. With keep, or on a ufw that is
-# already on, add it to your own jail.local and ufw rules. Must be YOUR
-# address, not the server's. Set to empty string to disable.
+# true), in the ignore lists of its slow-scanner jails
+# (fail2ban_slow_scanners: true), and, when this run turns ufw on, in a
+# rule above every other that lets it reach SSH without the rate limit.
+# With keep, or on a ufw that is already on, add it to your own jail.local
+# and ufw rules. Must be YOUR address, not the server's. Set to empty
+# string to disable.
 office_static_ip: ""
 
 # More fixed IPs/CIDRs fail2ban must never ban, e.g.
@@ -188,7 +190,8 @@ office_static_ip: ""
 # go to ignoreip in [DEFAULT] of jail.d/00-autosec.conf (only with
 # fail2ban_hardening_enabled: true). An ignoreip of your own (jail.local)
 # replaces that list; the run warns when one of these addresses is then
-# missing.
+# missing. The slow-scanner jails (fail2ban_slow_scanners: true) always
+# add them to the list they take over.
 fail2ban_ignore_ips: []
 
 # --- Firewall: ufw (role 03) ----------------------------------------------
@@ -269,6 +272,44 @@ fail2ban_migrate_jail_local: false
 # jails, in jail.d/00-autosec-nginx.conf, once nginx is installed. Role 03
 # never adds nginx jails, so a host without nginx gets none.
 fail2ban_nginx_jails: true
+
+# --- fail2ban for slow scanners (role 03) ---------------------------------
+# A slow scanner tries one password every few minutes and never reaches
+# the sshd jail's limit. Off on every server, existing or new. true adds
+# two jails in auto_sec's own /etc/fail2ban/jail.d/00-autosec-slow.conf and
+# a longer memory in /etc/fail2ban/fail2ban.d/00-autosec.conf. Your
+# jail.local, fail2ban.local and jails are not changed, and fail2ban is
+# reloaded, never restarted. It needs an installed fail2ban
+# (fail2ban_hardening_enabled: true in the same run installs one). It works
+# with fail2ban_hardening_enabled: keep. Name your own addresses first
+# (office_static_ip, fail2ban_ignore_ips): a ban lasts a week. false later
+# removes nothing; the run prints the commands.
+fail2ban_slow_scanners: false
+
+# The jail sshd-slow: the failed logins the sshd jail reads, counted over a
+# longer time. maxretry failures within findtime ban for bantime. All three
+# keys are required. Times like 10m, 1h, 1d, 1w; bantime may also be -1
+# (banned until you unban the address). It cannot catch a scan spread over
+# many addresses with one or two tries each.
+fail2ban_slow_sshd:
+  findtime: "1d"
+  maxretry: 6
+  bantime: "1w"
+
+# The jail recidive: an address the other jails ban maxretry times within
+# findtime is banned for bantime, on all ports. It is left out when you
+# have a recidive jail of your own. false: auto_sec never adds it.
+fail2ban_slow_recidive_enabled: true
+fail2ban_slow_recidive:
+  findtime: "1w"
+  maxretry: 3
+  bantime: "4w"
+
+# How long fail2ban remembers an address after a ban (dbpurgeage), at
+# least. fail2ban's own default is 1d. auto_sec writes a longer time when a
+# jail bans or looks back for longer, and never a shorter time than the
+# server has now. A value of yours in fail2ban.local wins.
+fail2ban_slow_dbpurgeage: "30d"
 
 # Paranoia: standard | high. high adds fwknop (Single Packet Authorization)
 # and then needs fwknop_pcap_intf (the interface fwknopd listens on, e.g.

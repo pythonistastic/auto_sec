@@ -1,0 +1,6 @@
+---
+# The same without the recidive section (you have your own recidive jail,
+# or fail2ban_slow_recidive_enabled: false).
+render_template: 00-autosec-slow.conf.j2
+ssh_port: 22
+_f2b_slow_rec_render: false

@@ -1,0 +1,64 @@
+{# roles/03-firewall/templates/00-autosec-slow.conf.j2
+   Written by tasks/slow-apply.yml (fail2ban_slow_scanners: true) as
+   jail.d/00-autosec-slow.conf. Inputs, all checked by preflight PF1:
+   fail2ban_slow_sshd and fail2ban_slow_recidive (mappings with exactly
+   findtime, maxretry and bantime; strict values), _f2b_ignore (list of IP
+   addresses or networks) and ssh_port (integer). _f2b_slow_rec_render is a
+   yes or no: the trial says whether the recidive section fits this host.
+   Nothing read from the host is written. The only "%" are the fixed
+   references below, which fail2ban resolves itself: each one names an
+   option that exists in every fail2ban config ([sshd] backend and logpath
+   and [DEFAULT] banaction in jail.conf; ignoreip in [DEFAULT] of this
+   file, which is written together with the two references to it). #}
+{{ _f2b_marker }}
+# Change the auto_sec variables instead (fail2ban_slow_sshd,
+# fail2ban_slow_recidive, fail2ban_slow_recidive_enabled, office_static_ip,
+# fail2ban_ignore_ips, ssh_port). fail2ban_slow_scanners: false makes later
+# runs leave this file alone; it does not delete it.
+#
+# fail2ban reads this file right after jail.conf, before the other files in
+# jail.d and before jail.local.
+{% if _f2b_ignore | length > 0 %}
+#
+# ignoreip in [DEFAULT] is empty here on purpose. The jails below add your
+# addresses (office_static_ip, fail2ban_ignore_ips) to the list they take
+# over, and that needs a list to exist. An ignoreip of YOURS in jail.local
+# or in a later jail.d file replaces this empty one for every jail, as
+# before. Do not set ignoreip in jail.conf or in a file read before this
+# one: this line would cancel it.
+
+[DEFAULT]
+ignoreip =
+{% endif %}
+
+# The failed logins the sshd jail reads, counted over a longer time. The
+# %(sshd/...)s values are fail2ban's own references to the [sshd] section:
+# this jail reads what the sshd jail reads and bans with the same tool.
+[sshd-slow]
+enabled = true
+filter = sshd
+backend = %(sshd/backend)s
+logpath = %(sshd/logpath)s
+banaction = %(sshd/banaction)s
+port = {{ ssh_port | int }}
+maxretry = {{ fail2ban_slow_sshd.maxretry }}
+findtime = {{ fail2ban_slow_sshd.findtime }}
+bantime = {{ fail2ban_slow_sshd.bantime }}
+{% if _f2b_ignore | length > 0 %}
+ignoreip = %(sshd/ignoreip)s {{ _f2b_ignore | join(' ') }}
+{% endif %}
+{% if _f2b_slow_rec_render | bool %}
+
+# An address the other jails ban again and again is banned for longer, on
+# all ports. It reads fail2ban's own log file.
+[recidive]
+enabled = true
+backend = auto
+banaction = %(banaction_allports)s
+maxretry = {{ fail2ban_slow_recidive.maxretry }}
+findtime = {{ fail2ban_slow_recidive.findtime }}
+bantime = {{ fail2ban_slow_recidive.bantime }}
+{% if _f2b_ignore | length > 0 %}
+ignoreip = %(known/ignoreip)s {{ _f2b_ignore | join(' ') }}
+{% endif %}
+{% endif %}

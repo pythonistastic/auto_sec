@@ -1,0 +1,289 @@
+---
+# roles/03-firewall/tasks/slow-apply.yml - write, check, load and verify the
+# slow-scanner files.
+#
+# Included by fail2ban-slow.yml right after slow-trial.yml and
+# slow-decide.yml have passed.
+#
+# - Writes only auto_sec's own two files: jail.d/00-autosec-slow.conf and
+#   fail2ban.d/00-autosec.conf. Never jail.local or fail2ban.local.
+# - Sets dbpurgeage in the running server only when the files' value
+#   changes. Reloads fail2ban only when the trial showed a change to the
+#   jails. Never restarts, starts or stops fail2ban.
+# - After that it proves: the running server matches the files, auto_sec's
+#   jails run, no jail lost a ban it had, and the server's PID is the same.
+# - On any failure, puts the previous files back (and loads them again if
+#   this run had loaded anything), then stops the run.
+# In --check: the templates show their diff; nothing else is written.
+
+# What this include has done so far, for the rollback in `rescue`.
+- name: "fail2ban slow: nothing done yet"
+  ansible.builtin.set_fact:
+    _f2b_slow_done_jail: false
+    _f2b_slow_done_db: false
+    _f2b_slow_done_load: false
+
+- name: "fail2ban slow: write, check, load and verify"
+  block:
+    # tmpfs, root only; removed in `always` below.
+    - name: "fail2ban slow S1: keep copies of the current files for a rollback"
+      when: not ansible_check_mode
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - |
+            set -eu
+            umask 077
+            rm -rf -- "$3"
+            mkdir -p -- "$3"
+            if [ -f "$1" ] && [ ! -L "$1" ]; then cp -p -- "$1" "$3/jail"; fi
+            if [ -f "$2" ] && [ ! -L "$2" ]; then cp -p -- "$2" "$3/db"; fi
+          - sh
+          - "{{ _f2b_slow_dropin }}"
+          - "{{ _f2b_slow_db_dropin }}"
+          - "{{ _f2b_prev_dir }}"
+      changed_when: false
+
+    # Rendered from your variables, plus the trial's yes/no (recidive) and
+    # its number of seconds (slow-decide.yml has checked both).
+    - name: "fail2ban slow S2: write 00-autosec-slow.conf"
+      ansible.builtin.template:
+        src: 00-autosec-slow.conf.j2
+        dest: "{{ _f2b_slow_dropin }}"
+        owner: "{{ _f2b_file_owner }}"
+        mode: "0644"
+      vars:
+        _f2b_slow_rec_render: "{{ _f2b_slow_rec_in | bool }}"
+      register: _f2b_slow_w_jail
+
+    - name: "fail2ban slow S2: write fail2ban.d/00-autosec.conf"
+      ansible.builtin.template:
+        src: 00-autosec-fail2ban.conf.j2
+        dest: "{{ _f2b_slow_db_dropin }}"
+        owner: "{{ _f2b_file_owner }}"
+        mode: "0644"
+      vars:
+        _f2b_slow_db_render: "{{ _f2b_slow_db_s | int }}"
+      register: _f2b_slow_w_db
+
+    - name: "fail2ban slow S2: remember what changed"
+      ansible.builtin.set_fact:
+        _f2b_slow_done_jail: "{{ _f2b_slow_w_jail is changed and not ansible_check_mode }}"
+        _f2b_slow_done_db: "{{ _f2b_slow_w_db is changed and not ansible_check_mode }}"
+
+    # The trial tried exactly two files. These must be the same bytes.
+    - name: "fail2ban slow S3: read the two files as written"
+      when: not ansible_check_mode
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+        follow: false
+      loop:
+        - "{{ _f2b_slow_dropin }}"
+        - "{{ _f2b_slow_db_dropin }}"
+      register: _f2b_slow_written
+
+    - name: "fail2ban slow S3: the files are the ones the trial tried"
+      when: not ansible_check_mode
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (_f2b_slow_written.results[0].stat.checksum | default('a')) == (_f2b_slow_s.sha256.jail | default('b'))
+          - (_f2b_slow_written.results[1].stat.checksum | default('a')) == (_f2b_slow_s.sha256.db | default('b'))
+        fail_msg: >-
+          The files auto_sec wrote on {{ inventory_hostname }} are not the files its trial run
+          tried (the checksums differ). This is a bug in auto_sec.
+
+    # The trial already proved this on a copy; this checks the real files,
+    # in case something changed in between.
+    - name: "fail2ban slow S4: fail2ban-client -t on the real config"
+      when:
+        - not ansible_check_mode
+        - (_f2b_slow_done_jail | bool) or (_f2b_slow_done_db | bool)
+      ansible.builtin.command:
+        argv: "{{ _f2b_client.split() + ['-c', _f2b_conf_dir, '-t'] }}"
+      changed_when: false
+
+    # The bans and the PID stay on the host, in the rollback folder; only
+    # counts come back.
+    - name: "fail2ban slow S5: what runs now (each jail's bans, the PID), kept on the host"
+      when:
+        - not ansible_check_mode
+        - (_f2b_slow_will_reload | bool) or (_f2b_slow_will_set | bool)
+      ansible.builtin.command:
+        argv:
+          - "{{ _f2b_python }}"
+          - -I
+          - -c
+          - "{{ lookup('ansible.builtin.file', 'auto-sec-f2b-check') }}"
+          - --snapshot
+          - "{{ _f2b_prev_dir }}/snapshot.json"
+          - --conf
+          - "{{ _f2b_conf_dir }}"
+          - --client
+          - "{{ _f2b_client }}"
+      register: _f2b_slow_snap
+      changed_when: false
+      failed_when: >-
+        _f2b_slow_snap.rc != 0 or not (_f2b_slow_snap.stdout | default('') is match('^\{'))
+        or not ((_f2b_slow_snap.stdout | from_json).ok | default(false))
+
+    # Recorded before the commands: a failed command leaves fail2ban on its
+    # old config, and loading the restored files again changes nothing.
+    - name: "fail2ban slow S6: a change to the running fail2ban follows"
+      when:
+        - not ansible_check_mode
+        - (_f2b_slow_will_reload | bool) or (_f2b_slow_will_set | bool)
+      ansible.builtin.set_fact:
+        _f2b_slow_done_load: true
+
+    # The number is the one written to fail2ban.d/00-autosec.conf. No
+    # restart: fail2ban takes it at once.
+    - name: "fail2ban slow S6: set dbpurgeage in the running fail2ban"
+      when:
+        - not ansible_check_mode
+        - _f2b_slow_will_set | bool
+      ansible.builtin.command:
+        argv: "{{ _f2b_client.split() + ['-c', _f2b_conf_dir, 'set', 'dbpurgeage', _f2b_slow_db_s | int | string] }}"
+      changed_when: true
+
+    # A reload keeps every jail and ban and runs no action for them; it
+    # starts auto_sec's new jails.
+    - name: "fail2ban slow S6: reload fail2ban (auto_sec's jails change)"
+      when:
+        - not ansible_check_mode
+        - _f2b_slow_will_reload | bool
+      ansible.builtin.command:
+        argv: "{{ _f2b_client.split() + ['-c', _f2b_conf_dir, 'reload'] }}"
+      changed_when: true
+
+    - name: "fail2ban slow S6: what would be loaded (check mode)"
+      when:
+        - ansible_check_mode
+        - (_f2b_slow_will_reload | bool) or (_f2b_slow_will_set | bool)
+      ansible.builtin.debug:
+        msg: >-
+          Check mode: {{ _f2b_slow_plan }}.
+
+    # The proof: same jails and values as the files, auto_sec's jails run,
+    # dbpurgeage as in the files, no ban lost, same PID.
+    - name: "fail2ban slow S7: the running fail2ban must match the files, with its bans and PID as before"
+      when:
+        - not ansible_check_mode
+        - _f2b_slow_done_load | bool
+      ansible.builtin.command:
+        argv: "{{ _f2b_v_argv }}"
+      register: _f2b_slow_verify
+      changed_when: false
+      failed_when: false
+      until: >-
+        _f2b_slow_verify.rc == 0 and (_f2b_slow_verify.stdout | default('') is match('^\{'))
+        and ((_f2b_slow_verify.stdout | from_json).running.same_jails_as_disk | default(false, true))
+        and ((_f2b_slow_verify.stdout | from_json).running.drift | default(['?']) | length == 0)
+        and ((_f2b_slow_verify.stdout | from_json).expected_missing | default(['?']) | length == 0)
+      retries: 5
+      delay: 2
+      vars:
+        _f2b_v_argv: >-
+          {{ [_f2b_python, '-I', '-c', lookup('ansible.builtin.file', 'auto-sec-f2b-check'),
+              '--verify', '--conf', _f2b_conf_dir, '--client', _f2b_client,
+              '--before', _f2b_prev_dir ~ '/snapshot.json', '--expect-jail', 'sshd-slow']
+             + (['--expect-jail', 'recidive'] if (_f2b_slow_rec_in | bool) else [])
+             + (['--released-jail', 'recidive'] if (_f2b_slow_rec_gone | default(false) | bool) else []) }}
+
+    - name: "fail2ban slow S7: verified"
+      when:
+        - not ansible_check_mode
+        - _f2b_slow_done_load | bool
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _f2b_slow_verify.rc == 0
+          - _f2b_v.running.same_jails_as_disk | default(false, true)
+          - _f2b_v.running.drift | default(['?']) | length == 0
+          - _f2b_v.expected_missing | default(['?']) | length == 0
+          - _f2b_v.bans_lost | default(['?']) | length == 0
+          - (_f2b_v.pid.same | default(none)) is not false
+          - >-
+            (_f2b_v.running.dbpurgeage_s | default(none) is none)
+            or ((_f2b_v.running.dbpurgeage_s | int) == (_f2b_v.files.dbpurgeage_s | default(-1) | int))
+        fail_msg: >-
+          After the change, fail2ban on {{ inventory_hostname }} is not as planned: running jails
+          {{ _f2b_v.running.jails | default('?') }}, jails in the files {{ _f2b_v.files.jails | default('?') }},
+          differences {{ _f2b_v.running.drift | default('?') }}, jails of auto_sec that do not run
+          {{ _f2b_v.expected_missing | default('?') }}, bans that are gone {{ _f2b_v.bans_lost | default('?') }},
+          PID before and after {{ _f2b_v.pid.before | default('?') }} and {{ _f2b_v.pid.after | default('?') }},
+          dbpurgeage running {{ _f2b_v.running.dbpurgeage_s | default('?') }} s and in the files
+          {{ _f2b_v.files.dbpurgeage_s | default('?') }} s
+          {{ _f2b_slow_verify.stderr | default('') | regex_replace('[{}]', '?') }}.
+      vars:
+        _f2b_v: "{{ (_f2b_slow_verify.stdout | from_json) if (_f2b_slow_verify.stdout | default('') is match('^\\{')) else {} }}"
+
+    # The PID comes from the pid file fail2ban's own client names. When it
+    # could not be read, that one check did not happen: say so.
+    - name: "fail2ban slow S7: the PID could not be compared"
+      when:
+        - not ansible_check_mode
+        - _f2b_slow_done_load | bool
+        - (_f2b_v.pid.same | default(none)) is none
+      ansible.builtin.debug:
+        msg: >-
+          NOTE: auto_sec could not read fail2ban's PID on {{ inventory_hostname }} before or after
+          the change, so it did not check that the process is the same. The jails, their
+          values and their bans were checked.
+      vars:
+        _f2b_v: "{{ (_f2b_slow_verify.stdout | from_json) if (_f2b_slow_verify.stdout | default('') is match('^\\{')) else {} }}"
+
+  rescue:
+    - name: "fail2ban slow rollback: put back the previous files"
+      when: (_f2b_slow_done_jail | bool) or (_f2b_slow_done_db | bool)
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - |
+            rc=0
+            if [ "$4" = yes ]; then
+              if [ -f "$3/jail" ]; then cp -p -- "$3/jail" "$1" || rc=1; else rm -f -- "$1" || rc=1; fi
+            fi
+            if [ "$5" = yes ]; then
+              if [ -f "$3/db" ]; then cp -p -- "$3/db" "$2" || rc=1; else rm -f -- "$2" || rc=1; fi
+            fi
+            exit "$rc"
+          - sh
+          - "{{ _f2b_slow_dropin }}"
+          - "{{ _f2b_slow_db_dropin }}"
+          - "{{ _f2b_prev_dir }}"
+          - "{{ 'yes' if (_f2b_slow_done_jail | bool) else 'no' }}"
+          - "{{ 'yes' if (_f2b_slow_done_db | bool) else 'no' }}"
+      register: _f2b_slow_rb_files
+      failed_when: false
+
+    # A reload also puts dbpurgeage back to the value of the files.
+    - name: "fail2ban slow rollback: load the previous config again"
+      when: _f2b_slow_done_load | bool
+      ansible.builtin.command:
+        argv: "{{ _f2b_client.split() + ['-c', _f2b_conf_dir, 'reload'] }}"
+      register: _f2b_slow_rb_reload
+      failed_when: false
+
+    - name: "fail2ban slow rollback: stop the run"
+      ansible.builtin.fail:
+        msg: >-
+          The slow-scanner change on {{ inventory_hostname }} failed at "{{ ansible_failed_task.name | default('?') }}":
+          {{ ((ansible_failed_result.msg | default('')) ~ ' ' ~ (ansible_failed_result.stderr | default('')))
+             | string | regex_replace('[{}]', '?') | regex_replace('\s+', ' ') | trim | truncate(900) }}.
+          {% if (_f2b_slow_done_jail | bool) or (_f2b_slow_done_db | bool) %}{{ 'Put the previous files back.' if (_f2b_slow_rb_files.rc | default(1)) == 0
+          else 'Could not put the previous files back: check ' ~ _f2b_slow_dropin ~ ' and ' ~ _f2b_slow_db_dropin ~ ' by hand.' }} {% endif %}{% if _f2b_slow_done_load | bool %}{{ 'Loaded the previous config again.'
+          if (_f2b_slow_rb_reload.rc | default(1)) == 0 else 'Could not reload fail2ban: run `sudo fail2ban-client -t` and `sudo fail2ban-client reload` by hand.' }}
+          {% else %}fail2ban was not reloaded, so it still runs the config it had.{% endif %}
+
+  always:
+    - name: "fail2ban slow: remove the rollback copy"
+      ansible.builtin.file:
+        path: "{{ _f2b_prev_dir }}"
+        state: absent
+      changed_when: false
+      check_mode: false
+      diff: false

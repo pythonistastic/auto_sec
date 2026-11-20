@@ -6,7 +6,10 @@
 # _f2b_run_dir ... pointing into its work directory, and puts stubs for
 # dpkg-query and systemctl first in PATH (fail2ban "installed, active,
 # enabled"). The steps that need root are left out: F1 (apt) and F11
-# (systemd). Everything else is what fail2ban.yml runs.
+# (systemd). Everything else is what fail2ban.yml runs. With
+# fail2ban_slow_scanners: true, fail2ban-slow.yml runs as it is (it needs
+# no root). lab_plan_out: a file for role 03's plan lines. lab_between: a
+# command that runs between the preflight and the write.
 - name: Role 03 fail2ban lab (unprivileged)
   hosts: localhost
   connection: local
@@ -18,8 +21,28 @@
         tasks_from: preflight
       tags: [always]
 
+    - name: "Lab: write role 03's plan lines"
+      when: lab_plan_out is defined
+      tags: [always]
+      check_mode: false
+      changed_when: false
+      ansible.builtin.copy:
+        dest: "{{ lab_plan_out }}"
+        mode: "0600"
+        content: "{{ {'plan': _plan_03, 'line': _f2b_plan} | to_nice_json }}"
+
   tasks:
+    # Lab only: something else changes fail2ban after the plan (lab_between,
+    # an argv list).
+    - name: "Lab: a change between the preflight and the write"
+      when: lab_between is defined
+      tags: [always]
+      ansible.builtin.command:
+        argv: "{{ lab_between }}"
+      changed_when: false
+
     - name: "Apply: fail2ban.yml F3-F10 and F12"
+      when: _f2b_enabled | bool
       tags: [fail2ban]
       block:
         - name: "F3 trial run (after the other roles)"
@@ -49,6 +72,14 @@
           ansible.builtin.include_role:
             name: 03-firewall
             tasks_from: report
+
+    # What main.yml includes after the fail2ban part (fail2ban_slow_scanners: true).
+    - name: "Apply: fail2ban-slow.yml"
+      when: _f2b_slow | bool
+      tags: [fail2ban]
+      ansible.builtin.include_role:
+        name: 03-firewall
+        tasks_from: fail2ban-slow
 
     # What role 05 includes after it has installed nginx (lab_nginx: true).
     - name: "Role 05: auto_sec's nginx jails"

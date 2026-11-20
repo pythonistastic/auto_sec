@@ -1,0 +1,7 @@
+---
+# fail2ban_slow_scanners with the role defaults: jail.d/00-autosec-slow.conf
+# with its recidive section (tasks/slow-trial.yml renders it with and
+# without; the trial says which one fits the host).
+render_template: 00-autosec-slow.conf.j2
+ssh_port: 22
+_f2b_slow_rec_render: true

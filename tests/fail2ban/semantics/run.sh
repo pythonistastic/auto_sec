@@ -7,17 +7,26 @@
 # (roles/03-firewall/files/auto-sec-f2b-check) runs their fail2ban-client
 # (-d, -t, -vvv) on copies of their stock /etc/fail2ban. The templates are
 # rendered by the real role files through render.yml. lab.py has the list
-# of checks (S1-S16).
+# of checks (S1-S23).
+#
+# The same for the slow-scanner files of fail2ban_slow_scanners
+# (jail.d/00-autosec-slow.conf and fail2ban.d/00-autosec.conf, S17-S20), and
+# each build's own database and ban-time code run without a server (S21).
 #
 # With a Python that can import asyncore (Python 3.12+: pip install
 # pyasyncore), a real fail2ban 1.0.2 server (noble build) also runs as this
 # user, on a Unix socket in the work directory, with an action that only
 # writes a log: reload/restart semantics (S13), the helper's drift check
 # (S15) and, with --ansible, role 03's own task files run by
-# ansible-playbook against that server (S16).
+# ansible-playbook against that server (S16, and S23 for the slow-scanner
+# part). S22 runs the slow-scanner jails on the 1.0.2 server and on a
+# 1.1.0 server (resolute build): a slow scanner, a person's typos,
+# recidive, growing and permanent bans. fail2ban 0.11.2 (jammy) does not
+# start with pyasyncore alone, so it has the config checks only.
 #
 # Usage: tests/fail2ban/semantics/run.sh [--cache DIR]... [--dists "LIST"]
-#          [--server-python PY] [--require-server] [--ansible PLAYBOOK]... [--keep]
+#          [--server-python PY] [--require-server] [--ansible PLAYBOOK]...
+#          [--jobs N] [--keep]
 #   --cache DIR          where the .debs are kept. Searched 3 levels deep. Repeatable:
 #                        all are searched, a missing file is downloaded into the FIRST.
 #                        Default: ~/.cache/auto-sec-fail2ban-semantics
@@ -25,7 +34,10 @@
 #   --server-python PY   Python for the lab server (default: python3 if it imports
 #                        asyncore, else the server checks are skipped)
 #   --require-server     fail instead of skipping the server checks
-#   --ansible PLAYBOOK   an ansible-playbook binary for S16 (repeat for several versions)
+#   --ansible PLAYBOOK   an ansible-playbook binary for S16 and S23 (repeat for several versions)
+#   --jobs N             checks that run side by side: the builds, the S16 runs of
+#                        each --ansible, and the S23 cases (default 4; 1 = one
+#                        after the other)
 #   --keep               keep the work directory and print its path
 # Needs: curl dpkg-deb sha256sum python3 ansible-playbook.
 # Exit 0 = every check passed, 1 = a check failed, 2 = setup problem.
@@ -41,6 +53,7 @@ KEEP=0
 SERVER_PY=""
 REQUIRE_SERVER=0
 ANSIBLES=()
+JOBS=4
 
 die() { echo "ERROR: $*" >&2; exit 2; }
 
@@ -51,6 +64,7 @@ while [ $# -gt 0 ]; do
     --server-python) [ $# -ge 2 ] || die "--server-python needs a path"; SERVER_PY=$2; shift 2 ;;
     --require-server) REQUIRE_SERVER=1; shift ;;
     --ansible) [ $# -ge 2 ] || die "--ansible needs a path"; ANSIBLES+=("$2"); shift 2 ;;
+    --jobs) [ $# -ge 2 ] || die "--jobs needs a number"; JOBS=$2; shift 2 ;;
     --keep) KEEP=1; shift ;;
     -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
@@ -61,6 +75,7 @@ CACHE=${CACHES[0]}
 for d in $DISTS; do
   case " $ALL_DISTS " in *" $d "*) ;; *) die "unknown dist: $d" ;; esac
 done
+case $JOBS in ''|*[!0-9]*|0) die "--jobs needs a number from 1" ;; esac
 for t in curl dpkg-deb sha256sum python3 ansible-playbook; do
   command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"
 done
@@ -123,18 +138,28 @@ for d in $DISTS; do
 done
 
 # --- render the role's templates for each case -------------------------------
-for c in default ips empty port2222 legacy04 backend nginx; do
+render() { # case: the role's template for cases/<case>.yml -> $W/render/<case>.conf
   # Ansible refuses to start without a UTF-8 locale.
   LC_ALL=C.UTF-8 ANSIBLE_LOCALHOST_WARNING=False ANSIBLE_INVENTORY_UNPARSED_WARNING=False \
   ANSIBLE_NOCOLOR=1 ANSIBLE_RETRY_FILES_ENABLED=False \
-    ansible-playbook "$HERE/render.yml" -e "@$HERE/cases/$c.yml" \
-      -e "render_dest=$W/render/$c.conf" >"$W/render/$c.log" 2>&1 \
-    || { cat "$W/render/$c.log" >&2; die "rendering case $c failed"; }
+    ansible-playbook "$HERE/render.yml" -e "@$HERE/cases/$1.yml" \
+      -e "render_dest=$W/render/$1.conf" >"$W/render/$1.log" 2>&1
+}
+RENDER_CASES="default ips empty port2222 legacy04 backend nginx
+  slow slow-norec slow-ips slow-ips-norec slow-perm slow-db"
+if [ "$JOBS" -gt 1 ]; then
+  for c in $RENDER_CASES; do render "$c" & done
+  wait
+else
+  for c in $RENDER_CASES; do render "$c"; done
+fi
+for c in $RENDER_CASES; do
+  [ -s "$W/render/$c.conf" ] || { cat "$W/render/$c.log" >&2; die "rendering case $c failed"; }
 done
 
 # --- the checks ----------------------------------------------------------------
 args=(--work "$W" --dists "$DISTS" --rendered "$W/render" --here "$HERE" --roles "$ROOT/roles"
-      --helper "$ROOT/roles/03-firewall/files/auto-sec-f2b-check" --fixtures "$HERE/fixtures")
+      --helper "$ROOT/roles/03-firewall/files/auto-sec-f2b-check" --fixtures "$HERE/fixtures" --jobs "$JOBS")
 [ -n "$SERVER_PY" ] && args+=(--server-python "$SERVER_PY")
 for a in "${ANSIBLES[@]}"; do args+=(--ansible "$a"); done
 python3 -I -B "$HERE/lab.py" "${args[@]}"

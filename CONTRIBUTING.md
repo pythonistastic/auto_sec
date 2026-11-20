@@ -57,7 +57,9 @@ or broaden OS support are welcome.
   the first rule.
 - **fail2ban changes go to auto_sec's own file.** Role 03 writes only
   `/etc/fail2ban/jail.d/00-autosec.conf` (and role 05 only
-  `00-autosec-nginx.conf`). Never write `jail.local`, never add a
+  `00-autosec-nginx.conf`). With `fail2ban_slow_scanners: true` it also
+  writes `jail.d/00-autosec-slow.conf` and `fail2ban.d/00-autosec.conf`.
+  Never write `jail.local` or `fail2ban.local`, never add a
   `restart fail2ban` handler: fail2ban is reloaded only when the trial
   run shows an effective change. CI checks both.
 - **Update settings go to auto_sec's own file.** Role 01 writes only
@@ -167,7 +169,9 @@ machine or on a server you care about.
   auto_sec 0.1–0.4 `jail.local`, the refusals and warnings. With a
   Python that can import `asyncore` (`pip install pyasyncore` on Python
   3.12+), a real fail2ban 1.0.2 server also runs as your user: reload
-  and restart semantics, and role 03's own task files against it.
+  and restart semantics, and role 03's own task files against it. The
+  slow-scanner jails also run on a 1.1.0 server. `--jobs 1` runs the
+  checks one after the other.
 - **Update semantics** (`tests/base/semantics/`). Real
   unattended-upgrades builds from the same five releases: role 01's own
   task files run against lab apt configurations, and each release's

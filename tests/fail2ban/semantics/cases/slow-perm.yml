@@ -1,0 +1,13 @@
+---
+# Both jails ban until you unban the address (bantime -1).
+render_template: 00-autosec-slow.conf.j2
+ssh_port: 22
+fail2ban_slow_sshd:
+  findtime: "1d"
+  maxretry: 6
+  bantime: -1
+fail2ban_slow_recidive:
+  findtime: "1w"
+  maxretry: 3
+  bantime: "-1"
+_f2b_slow_rec_render: true

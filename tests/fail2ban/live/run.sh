@@ -10,7 +10,7 @@
 # name=03-firewall tasks_from=preflight, tags always).
 #
 # Usage: bash tests/fail2ban/live/run.sh [--cases "LIST"]
-#   --cases  a subset of: c7 c1 c2 c6 c3 c5 c9 c4 c8 (always run in this
+#   --cases  a subset of: c7 c1 c2 c6 c3 c5 c9 c4 c8 c10 (always run in this
 #            order; c2 and c6 need c1). Default: all.
 # Cases:
 #   c7  --check with fail2ban purged: rc 0, "not installed yet", nothing new in /etc
@@ -26,6 +26,14 @@
 #       -e fail2ban_migrate_jail_local=true moved to a 0600 backup, nginx jails
 #       gone, sshd values as in 0.3, the ban stays
 #   c8  fail2ban installed but disabled and stopped: file written, NOTE, not started
+#   c10 fail2ban_slow_scanners (0.6.1) on the canary's layout with live bans and
+#       fail2ban_hardening_enabled keep. NOT RUN YET: written with the feature,
+#       it has never run on a runner. rc 0, jail.local byte-identical, no
+#       00-autosec.conf, auto_sec's two slow-scanner files written, sshd-slow the
+#       only new jail (the canary has its own recidive), every other jail's
+#       values and both bans as before, the bans still in the firewall, same main
+#       PID, one reload, dbpurgeage 8w; a second run changes nothing; the switch
+#       back to false removes nothing and says so (N03-F8)
 # Logs: $RUNNER_TEMP/fail2ban-live/logs. Exit 0 = every check passed.
 set -u -o pipefail
 export LC_ALL=C.UTF-8   # ansible needs a UTF-8 locale
@@ -33,7 +41,7 @@ export LC_ALL=C.UTF-8   # ansible needs a UTF-8 locale
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
 FIX=$ROOT/tests/fail2ban/semantics/fixtures
-ALL_CASES="c7 c1 c2 c6 c3 c5 c9 c4 c8"
+ALL_CASES="c7 c1 c2 c6 c3 c5 c9 c4 c8 c10"
 CASES=$ALL_CASES
 
 die() { echo "ERROR: $*" >&2; exit 2; }
@@ -64,6 +72,8 @@ LOGS=$WORK/logs
 INV=$WORK/inventory.yml
 F2B=/etc/fail2ban
 OWN=$F2B/jail.d/00-autosec.conf
+SLOW=$F2B/jail.d/00-autosec-slow.conf
+SLOW_DB=$F2B/fail2ban.d/00-autosec.conf
 MARKER='# Written by auto_sec (role 03). Do not edit: the next run replaces this file.'
 rm -rf "$WORK"
 mkdir -p "$LOGS" || die "cannot create $WORK"
@@ -115,11 +125,21 @@ wait_f2b() {
 }
 restart_f2b() { sudo -n systemctl restart fail2ban.service && wait_f2b && sleep 2; }
 layout() { # jail.local-file|none: a clean /etc/fail2ban with that jail.local, fail2ban restarted
-  sudo -n rm -f "$OWN" "$F2B/jail.d/00-autosec-nginx.conf" "$F2B/jail.d/zz-"*.local "$F2B/jail.local"
+  sudo -n rm -f "$OWN" "$F2B/jail.d/00-autosec-nginx.conf" "$F2B/jail.d/zz-"*.local "$F2B/jail.local" "$SLOW" "$SLOW_DB"
   [ "$1" = none ] || sudo -n install -m 0644 "$1" "$F2B/jail.local"
   restart_f2b
 }
 ban() { f2b set sshd banip 203.0.113.5 >/dev/null; f2b set recidive banip 198.51.100.7 >/dev/null 2>&1; sleep 1; }
+jail_values() { # one line per running jail: name maxretry findtime bantime
+  local j
+  for j in $(jails); do
+    printf '%s %s %s %s\n' "$j" "$(f2b get "$j" maxretry)" "$(f2b get "$j" findtime)" "$(f2b get "$j" bantime)"
+  done
+}
+dbpurgeage() { f2b get dbpurgeage 2>/dev/null | sed -n 's/.*- \(-\{0,1\}[0-9]*\)seconds.*/\1/p'; }
+fw_has() { # address: is it in a firewall rule or set (nftables on 24.04, iptables on 22.04)?
+  { sudo -n nft list ruleset 2>/dev/null; sudo -n iptables-save 2>/dev/null; } | grep -Fq -- "$1"
+}
 
 snapshot() { # name: jail.local, own file, dump, PID, bans, firewall, log position
   printf '%s\n' "$(sum_of "$F2B/jail.local")" "$(sum_of "$OWN")" "$(dump_sum)" "$(mainpid)" \
@@ -300,6 +320,62 @@ case_c8() {
   expect c8 "fail2ban.service active" "$(systemctl is-active fail2ban.service)" inactive
   expect c8 "fail2ban.service enabled" "$(systemctl is-enabled fail2ban.service 2>/dev/null)" disabled
   sudo -n systemctl enable --now fail2ban.service >/dev/null 2>&1
+}
+
+# NOT RUN YET (see the header). fail2ban for slow scanners, 0.6.1.
+case_c10() {
+  local rc=0 values
+  echo "      note: case c10 is new in 0.6.1 and has not run on a runner before"
+  layout "$WORK/canary.jail.local"
+  ban
+  snapshot c10-before
+  values=$(jail_values)
+  mark
+  play c10 -e fail2ban_hardening_enabled=keep -e fail2ban_slow_scanners=true || rc=$?
+  expect c10 "run rc" "$rc" 0
+  expect c10 "jail.local byte-identical" "$(sum_of "$F2B/jail.local")" "$(snap_line c10-before 1)"
+  expect c10 "00-autosec.conf (keep: not written)" "$(sum_of "$OWN")" absent
+  expect c10 "00-autosec-slow.conf line 1" "$(sudo -n head -n 1 "$SLOW" 2>/dev/null)" "$MARKER"
+  expect c10 "fail2ban.d/00-autosec.conf line 1" "$(sudo -n head -n 1 "$SLOW_DB" 2>/dev/null)" "$MARKER"
+  if sudo -n grep -q '^\[recidive\]' "$SLOW"; then
+    fail c10 "auto_sec's file has a recidive section next to the canary's own"
+  else
+    pass c10 "no recidive section in auto_sec's file (the canary has its own)"
+  fi
+  log_has c10 c10 "you have one of your own" "N03-F9: the canary's own recidive stays"
+  expect c10 "main PID" "$(mainpid)" "$(snap_line c10-before 4)"
+  expect c10 "jails: sshd-slow is the only new one" "$(jails)" \
+    "$(printf '%s sshd-slow\n' "$(snap_line c10-before 5)" | tr ' ' '\n' | sort | paste -sd' ' -)"
+  expect c10 "every other jail's maxretry, findtime and bantime" "$(jail_values | grep -v '^sshd-slow ')" "$values"
+  expect c10 "sshd-slow maxretry/findtime/bantime" \
+    "$(f2b get sshd-slow maxretry)/$(f2b get sshd-slow findtime)/$(f2b get sshd-slow bantime)" "6/86400/604800"
+  expect c10 "sshd bans" "$(banned sshd)" "203.0.113.5"
+  expect c10 "recidive bans" "$(banned recidive)" "198.51.100.7"
+  if fw_has 203.0.113.5 && fw_has 198.51.100.7; then
+    pass c10 "both banned addresses are still in the firewall"
+  else
+    fail c10 "a banned address is gone from the firewall"
+  fi
+  expect c10 "dbpurgeage follows the canary's bantime.maxtime (8w)" "$(dbpurgeage)" 4838400
+  expect c10 "reloads" "$(new_log "$LOGPOS" | grep -c 'Reload finished')" 1
+  log_has c10 c10 "fail2ban slow S7: verified" "the role's own proof (jails, bans, PID) ran"
+
+  rc=0
+  mark
+  play c10-second -e fail2ban_hardening_enabled=keep -e fail2ban_slow_scanners=true || rc=$?
+  expect c10 "second run rc" "$rc" 0
+  log_has c10 c10-second "changed=0" "second run: nothing changed"
+  if new_log "$LOGPOS" | grep -q 'Reload'; then fail c10 "second run reloaded fail2ban"; else pass c10 "second run: no reload"; fi
+
+  rc=0
+  snapshot c10-on
+  play c10-off -e fail2ban_hardening_enabled=keep || rc=$?
+  expect c10 "the switch back to false: rc" "$rc" 0
+  log_has c10 c10-off "from an earlier run stay and still apply" "N03-F8 names the files that stay"
+  expect c10 "00-autosec-slow.conf stays" "$(sudo -n head -n 1 "$SLOW" 2>/dev/null)" "$MARKER"
+  expect c10 "jails stay" "$(jails)" "$(snap_line c10-on 5)"
+  sudo -n rm -f "$SLOW" "$SLOW_DB"
+  restart_f2b
 }
 
 setup

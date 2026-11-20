@@ -10,7 +10,10 @@
 # three times (as it is now; without auto_sec's file; with the candidate)
 # and asks fail2ban's own config reader (`fail2ban-client -c COPY -d` and
 # `-t`) what each copy means. Nothing under /etc changes, so this also runs
-# in --check. Sets _f2b_trial (the helper's JSON) and _f2b_nginx_ours.
+# in --check. Sets _f2b_trial (the helper's JSON), _f2b_nginx_ours, and
+# _f2b_slow_ours / _f2b_slow_rec_ours (auto_sec's 00-autosec-slow.conf is in
+# place, and it holds a recidive section): the jails of that file are
+# auto_sec's own too, so [DEFAULT] values may reach them.
 #
 # R03-F6 is checked here, before the trial: a file auto_sec did not write must
 # never be treated as auto_sec's.
@@ -21,15 +24,21 @@
       - sh
       - -c
       - |
-        for f in "$@"; do
+        for f in "$1" "$2"; do
           if [ -L "$f" ]; then printf 'link %s\n' "$f"
           elif [ -f "$f" ]; then printf 'file %s ' "$f"; head -n 1 -- "$f"; echo
           elif [ -e "$f" ]; then printf 'other %s\n' "$f"
           fi
         done
+        if [ -f "$3" ] && [ ! -L "$3" ] && [ "$(head -n 1 -- "$3")" = "$4" ]; then
+          echo 'slow-ours'
+          if grep -qx '\[recidive\]' -- "$3"; then echo 'slow-recidive'; fi
+        fi
       - sh
       - "{{ _f2b_dropin }}"
       - "{{ _f2b_nginx_dropin }}"
+      - "{{ _f2b_slow_dropin }}"
+      - "{{ _f2b_marker }}"
   register: _f2b_own_files
   changed_when: false
   check_mode: false
@@ -45,7 +54,7 @@
       .conf or .local ending so fail2ban still reads it) and run again.
       {{ 'Nothing has been changed.' if _f2b_stage == 'preflight' else 'fail2ban has not been changed.' }}
   vars:
-    _f2b_lines: "{{ _f2b_own_files.stdout_lines | default([]) | select | list }}"
+    _f2b_lines: "{{ _f2b_own_files.stdout_lines | default([]) | select('match', '^(file|link|other) ') | list }}"
     _f2b_foreign: >-
       {{ _f2b_lines | reject('equalto', 'file ' ~ _f2b_dropin ~ ' ' ~ _f2b_marker)
          | reject('equalto', 'file ' ~ _f2b_nginx_dropin ~ ' ' ~ _f2b_nginx_marker)
@@ -54,6 +63,8 @@
 - name: "fail2ban trial: which jails are auto_sec's own"
   ansible.builtin.set_fact:
     _f2b_nginx_ours: "{{ ('file ' ~ _f2b_nginx_dropin ~ ' ' ~ _f2b_nginx_marker) in (_f2b_own_files.stdout_lines | default([])) }}"
+    _f2b_slow_ours: "{{ 'slow-ours' in (_f2b_own_files.stdout_lines | default([])) }}"
+    _f2b_slow_rec_ours: "{{ 'slow-recidive' in (_f2b_own_files.stdout_lines | default([])) }}"
     _f2b_trial: {}
 
 - name: "fail2ban trial: remove an old scratch copy"
@@ -122,7 +133,9 @@
       vars:
         _f2b_jails: >-
           {{ _f2b_kinds[_f2b_kind].jails
-             + (_f2b_kinds['nginx'].jails if (_f2b_kind == 'main' and (_f2b_nginx_ours | bool)) else []) }}
+             + (_f2b_kinds['nginx'].jails if (_f2b_kind == 'main' and (_f2b_nginx_ours | bool)) else [])
+             + (['sshd-slow'] if (_f2b_kind == 'main' and (_f2b_slow_ours | bool)) else [])
+             + (['recidive'] if (_f2b_kind == 'main' and (_f2b_slow_rec_ours | bool)) else []) }}
         _f2b_argv: >-
           {{ [_f2b_python, '-I', '-c', lookup('ansible.builtin.file', 'auto-sec-f2b-check'),
               '--conf', _f2b_conf_dir,
@@ -133,6 +146,7 @@
               '--client', _f2b_client,
               '--running']
              + (['--conffiles', _f2b_conffiles_file] if (_f2b_conffiles_file | length > 0) else [])
+             + (['--own-file=00-autosec-slow.conf'] if (_f2b_slow_ours | bool) else [])
              + (_f2b_jails | map('regex_replace', '^', '--allowed-jail=') | list)
              + ((_f2b_ignore | map('regex_replace', '^', '--autosec-ip=') | list) if _f2b_kind == 'main' else [])
              + ((_f2b_defaults | dict2items | map(attribute='key') | map('regex_replace', '^', '--autosec-key=') | list)

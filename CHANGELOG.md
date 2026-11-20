@@ -34,6 +34,36 @@ changes. auto_sec is a personal research project, not a production service — s
   scan also ran once, as root, on a real Ubuntu 24.04 server with
   cloud-init 26.1, and printed what that server's own records show. The
   check in `full-adopt-live` has not run yet.
+- **fail2ban for slow scanners, opt-in per server
+  (`fail2ban_slow_scanners: true`).** A scanner that tries one SSH
+  password every few minutes never reaches the `sshd` jail's limit. Off
+  by default on `existing` and on `new`. It also works with
+  `fail2ban_hardening_enabled: keep` on an installed fail2ban.
+  - `sshd-slow`: the `sshd` jail's failed logins, counted over a day
+    (6 in 1 day, banned for 1 week; `fail2ban_slow_sshd`).
+  - `recidive`: 3 bans by the other jails in 1 week, banned for 4 weeks
+    on all ports (`fail2ban_slow_recidive`). Left out when you have your
+    own, when fail2ban does not log to a file, when its ban action is
+    another firewall tool than the `sshd` jail's (N03-F9), or with
+    `fail2ban_slow_recidive_enabled: false`.
+  - A longer memory: `dbpurgeage` is at least `fail2ban_slow_dbpurgeage`
+    (30 days), set in the running fail2ban without a restart.
+  - Two files of auto_sec's own: `jail.d/00-autosec-slow.conf` and
+    `fail2ban.d/00-autosec.conf`. fail2ban is reloaded, never restarted.
+    The run then proves that no jail lost a ban and that fail2ban's PID
+    is the same.
+  - The new jails ignore what your `sshd` jail ignores, plus
+    `office_static_ip` and `fail2ban_ignore_ips` (N03-F12 when the
+    computer you run it from is not exempt). `bantime` may be `-1`.
+  - Refusals before any change: fail2ban is not installed (R03-F8); a
+    jail or section `sshd-slow` of yours (R03-F9); another jail would
+    change (R03-F10); `sshd-slow` cannot follow your `sshd` jail
+    (R03-F11). M03-F1 stops the step when it would do more than the plan
+    showed. Notes N03-F8 to N03-F13.
+  - Limits: it cannot catch a scan spread over many addresses with one
+    or two tries each. Lab tests: the config on five fail2ban builds, the
+    behaviour on unprivileged fail2ban 1.0.2 and 1.1.0 servers. The live
+    case `c10` has not run yet.
 
 ## [0.6.0] - 2026-11-18
 

@@ -718,6 +718,61 @@ firewall_closed_ok: ["3000/tcp"]          # listens now, may close
   stop ignoring an address that the old file's `ignoreip` line holds
   (add it to `fail2ban_ignore_ips` first).
 
+### Slow scanners (opt-in)
+
+A slow scanner tries one SSH password every few minutes. The `sshd` jail
+counts failures in a short window (auto_sec's default: 4 in 10 minutes),
+so it never reaches the limit. `fail2ban_slow_scanners: true` adds three
+things. It is off on every server, `existing` or `new`, and it also works
+with `fail2ban_hardening_enabled: keep` when fail2ban is installed.
+
+- **`sshd-slow`**: the same failed logins, counted over a day. 6 in 1 day
+  ban for 1 week (`fail2ban_slow_sshd`). It reads what your `sshd` jail
+  reads and bans with the same tool.
+- **`recidive`**: an address the other jails ban 3 times in 1 week is
+  banned for 4 weeks, on all ports (`fail2ban_slow_recidive`). It is for
+  addresses the `sshd` jail and your other jails ban again and again.
+  `sshd-slow` alone cannot reach it, because it bans an address at most
+  once a week; its ban counts as one of the three. It is left out when
+  you have a `recidive` jail of your own, when fail2ban does not log to
+  a file, or when its ban would use another firewall tool than the
+  `sshd` jail. The run says which. `fail2ban_slow_recidive_enabled:
+  false` leaves it out by choice.
+- **A longer memory** (`dbpurgeage`). By default fail2ban forgets an
+  address about a day after a short ban, so ban times that should grow
+  start over. auto_sec sets at least `fail2ban_slow_dbpurgeage` (30
+  days), more when a jail bans or looks back for longer, and never less
+  than the server has.
+
+auto_sec writes two files of its own:
+`/etc/fail2ban/jail.d/00-autosec-slow.conf` and
+`/etc/fail2ban/fail2ban.d/00-autosec.conf`. Your `jail.local`,
+`fail2ban.local` and jails are not changed, and fail2ban is reloaded, not
+restarted. After the reload the run checks that every other jail has the
+values and the bans it had, and that fail2ban's process is the same.
+
+- **Name your own addresses first** (`office_static_ip`,
+  `fail2ban_ignore_ips`). A ban now lasts a week, and 6 mistyped
+  passwords in a day are enough. The new jails ignore what your `sshd`
+  jail ignores, plus these addresses. The run warns when the computer
+  you run it from is not exempt.
+- **The first reload looks back a day.** `sshd-slow` counts the failed
+  logins of the last day when it starts, so it can ban many addresses at
+  once.
+- **What it cannot catch:** a scan spread over many addresses, with one
+  or two tries from each. Every address stays under the limit.
+- With `bantime.increment` on (auto_sec's `fail2ban_defaults` turn it
+  on), a repeat ban is longer each time, and it comes after fewer failed
+  logins. Without a `bantime.maxtime` there is no limit; auto_sec sets
+  none, and the run says so.
+- `bantime: -1` bans until you unban
+  (`sudo fail2ban-client unban <address>`).
+- The run stops, before it changes anything, when a jail or section
+  named `sshd-slow` is yours, when another jail would change, or when
+  fail2ban is not installed.
+- `false` later removes nothing. The run names the two files and the
+  commands to remove them.
+
 ## The layers
 
 | # | Role | Purpose |
