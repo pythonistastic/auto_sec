@@ -10,6 +10,10 @@ changes. auto_sec is a personal research project, not a production service — s
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.6.1] - 2026-11-22
+
 ### Added
 
 - **"The hosting provider may know root's password"** (role 01, note
@@ -957,7 +961,8 @@ Backups/restore, fwknop, app/DB/TLS roles, Telegram delivery, `active`
 mode, and non-Ubuntu-22.04 targets are shipped but **not yet validated
 end-to-end**. See [docs/RETROSPECTIVE.md](docs/RETROSPECTIVE.md).
 
-[Unreleased]: https://github.com/pythonistastic/auto_sec/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/pythonistastic/auto_sec/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.6.1
 [0.6.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.6.0
 [0.5.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.5.0
 [0.4.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.4.0
