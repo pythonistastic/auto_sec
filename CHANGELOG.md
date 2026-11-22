@@ -30,10 +30,13 @@ changes. auto_sec is a personal research project, not a production service — s
   with `su`, can then become root without a password.
 - Both checks only read, and never the hash. auto_sec never changes or
   locks root's password: the provider's console is the way back in after
-  a lockout. Tested in the lab (`tests/base/semantics`). The read-only
-  scan also ran once, as root, on a real Ubuntu 24.04 server with
-  cloud-init 26.1, and printed what that server's own records show. The
-  check in `full-adopt-live` has not run yet.
+  a lockout. Tested in the lab (`tests/base/semantics`). On GitHub's
+  Ubuntu 22.04 and 24.04 runners the check ran as root
+  (`full-adopt-live`); root's password is locked there, so only the
+  "locked" answer ran live. On one real Ubuntu 24.04 server with
+  cloud-init 26.1, the scan and a full run gave what that server's own
+  records show: no note, because the password was changed after
+  cloud-init set it.
 - **fail2ban for slow scanners, opt-in per server
   (`fail2ban_slow_scanners: true`).** A scanner that tries one SSH
   password every few minutes never reaches the `sshd` jail's limit. Off
@@ -61,9 +64,16 @@ changes. auto_sec is a personal research project, not a production service — s
     (R03-F11). M03-F1 stops the step when it would do more than the plan
     showed. Notes N03-F8 to N03-F13.
   - Limits: it cannot catch a scan spread over many addresses with one
-    or two tries each. Lab tests: the config on five fail2ban builds, the
-    behaviour on unprivileged fail2ban 1.0.2 and 1.1.0 servers. The live
-    case `c10` has not run yet.
+    or two tries each.
+  - Where it was tested: in the lab, the config on five fail2ban builds
+    and the behaviour on unprivileged fail2ban 1.0.2 and 1.1.0 servers.
+    On GitHub's Ubuntu 22.04 and 24.04 runners (fail2ban 0.11.2 with
+    iptables, 1.0.2 with nftables), the live case `c10`. On one real
+    Ubuntu 24.04 server with its own `jail.local` and `recidive`: plan
+    only, a check run and a real run. That run added `sshd-slow`, kept
+    every ban, and fail2ban stayed the same process. `sshd-slow` banned
+    24 addresses in its first seconds, from the last day's failed
+    logins.
 
 ## [0.6.0] - 2026-11-18
 

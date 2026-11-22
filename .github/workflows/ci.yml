@@ -361,8 +361,8 @@ jobs:
   # (fail2ban_slow_scanners): the same config checks on all five builds,
   # the jails on real 1.0.2 and 1.1.0 servers (a slow scanner, typos,
   # recidive, growing and permanent bans), and the role's task files. The
-  # job is longer than before, and its time on a runner is not measured
-  # yet: the limit went from 30 to 60 minutes.
+  # job is longer than before: it took 17 minutes on a runner (0.6.1), and
+  # the limit went from 30 to 60 minutes.
   fail2ban-semantics:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -437,8 +437,8 @@ jobs:
   # come through unchanged (same dump, PID, bans, firewall set; no reload),
   # refusals, and the migration of a 0.3 jail.local. 22.04 has fail2ban
   # 0.11.2 with iptables, 24.04 fail2ban 1.0.2 with nftables.
-  # Ran on GitHub's runners for v0.5.0, and with 0.6's changes. Case c10
-  # (fail2ban_slow_scanners, 0.6.1) is written and has not run yet.
+  # Ran on GitHub's runners for v0.5.0, with 0.6's changes, and with case
+  # c10 (fail2ban_slow_scanners, 0.6.1).
   fail2ban-live:
     name: fail2ban-live (${{ matrix.os }})
     strategy:

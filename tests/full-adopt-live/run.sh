@@ -27,8 +27,8 @@
 #      (N01-R1, N01-R2) fit what `passwd -S root` says on this runner
 #
 # GITHUB-HOSTED RUNNERS ONLY (tests/full-live/lib.sh refuses elsewhere).
-# Ran green on GitHub's Ubuntu 22.04 and 24.04 runners (0.6). Case r is new
-# in 0.6.1 and has not run yet.
+# Ran green on GitHub's Ubuntu 22.04 and 24.04 runners (0.6, and 0.6.1 with
+# case r; root's password is locked there, so only that answer ran).
 # Usage: bash tests/full-adopt-live/run.sh
 # Logs: $RUNNER_TEMP/full-adopt-live/logs. Exit 0 = every check passed.
 set -u -o pipefail
@@ -168,8 +168,8 @@ case_c() {
   log_lacks c c-run1 "needrestart" "needrestart not mentioned (no apt run)"
 }
 
-# Root's password (role 01's B14, notes N01-R1 and N01-R2; new in 0.6.1,
-# NOT RUN YET). The runner is a cloud-init machine. What the plan and the
+# Root's password (role 01's B14, notes N01-R1 and N01-R2; new in
+# 0.6.1). The runner is a cloud-init machine. What the plan and the
 # report say must fit what `passwd -S root` says here: L (locked), NP
 # (empty) or P (a password). Case d proves /etc/shadow is unchanged.
 case_r() {

@@ -27,8 +27,8 @@
 #       gone, sshd values as in 0.3, the ban stays
 #   c8  fail2ban installed but disabled and stopped: file written, NOTE, not started
 #   c10 fail2ban_slow_scanners (0.6.1) on the canary's layout with live bans and
-#       fail2ban_hardening_enabled keep. NOT RUN YET: written with the feature,
-#       it has never run on a runner. rc 0, jail.local byte-identical, no
+#       fail2ban_hardening_enabled keep. Ran green on both runners (0.6.1).
+#       rc 0, jail.local byte-identical, no
 #       00-autosec.conf, auto_sec's two slow-scanner files written, sshd-slow the
 #       only new jail (the canary has its own recidive), every other jail's
 #       values and both bans as before, the bans still in the firewall, same main
@@ -322,10 +322,9 @@ case_c8() {
   sudo -n systemctl enable --now fail2ban.service >/dev/null 2>&1
 }
 
-# NOT RUN YET (see the header). fail2ban for slow scanners, 0.6.1.
+# fail2ban for slow scanners, 0.6.1 (see the header).
 case_c10() {
   local rc=0 values
-  echo "      note: case c10 is new in 0.6.1 and has not run on a runner before"
   layout "$WORK/canary.jail.local"
   ban
   snapshot c10-before
