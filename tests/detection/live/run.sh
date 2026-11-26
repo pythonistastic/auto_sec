@@ -130,7 +130,10 @@ mark_out() { # wait until the mark of the last auto_sec run has run out (20 s af
   local i=0 t
   while [ "$i" -lt 40 ]; do
     t=$(sudo -n stat -c %Y /run/auto-sec/detect-planned 2>/dev/null) || return 0
-    [ $(( $(date +%s) - t )) -ge 900 ] && return 0
+    # 902, not 900: both times here are whole seconds, so 900 can be a
+    # real 899.1 s, and a stop right then is still quiet (the first run on
+    # GitHub's runners lost that race on two of three machines).
+    [ $(( $(date +%s) - t )) -ge 902 ] && return 0
     sleep 1
     i=$((i + 1))
   done
