@@ -33,7 +33,7 @@
 #      touched, a login still sends its message; removed again
 #
 # GITHUB-HOSTED RUNNERS ONLY (tests/full-live/lib.sh refuses elsewhere).
-# NOT RUN YET: written with 0.7; it has not run on a runner.
+# Ran green on GitHub's Ubuntu 22.04 and 24.04 runners (0.7).
 # Usage: bash tests/detection/live/run.sh
 # Logs: $RUNNER_TEMP/detection-live/logs. Exit 0 = every check passed.
 set -u -o pipefail

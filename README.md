@@ -1249,8 +1249,12 @@ tests/                   lab tests (no root) and live tests (CI runners only)
   root: the login hook, the real `pam_exec.so` of Ubuntu 22.04 and 24.04
   and Debian 12 and 13, the real `pam-auth-update` of those four and of
   Ubuntu 26.04, and the role's own task files with a real sender and the
-  real undo script. Their live tests on GitHub's VMs have **not run
-  yet**, and they have never run on a real server. Ubuntu 26.04's
+  real undo script. Their live tests ran on GitHub's Ubuntu 22.04 and
+  24.04 VMs: the install under the undo, real logins (keys, passwords,
+  `su`, `sudo`, a console login), a hook that hangs, a stopped sender
+  and removal. On one real Ubuntu 24.04 server already in use, a full
+  run installed them, and a real console login sent its message.
+  Debian 12 and 13 ran in the lab only. Ubuntu 26.04's
   `pam_exec.so` could not be loaded in the lab. Its `timeout` is a new
   program (uutils): it ends a hanging hook after 1 second too, but not a
   process the hook started (the hook starts none).

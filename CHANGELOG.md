@@ -93,6 +93,10 @@ tells you; it ends no session and bans nobody.
 - The undo guard (`auto-sec-ssh-guard`) knows `--pam`: a revert puts the
   PAM files back and reloads nothing. `--ufw` and `--pam` cannot be
   combined.
+- The CVE watch's refusal R11-3 (a daemon-reload would load unit edits
+  of yours) no longer counts auto_sec's own units. The undo's boot unit
+  is updated without a reload, so its edit could have refused a later
+  run.
 
 ### Upgrading
 
@@ -118,8 +122,15 @@ tells you; it ends no session and bans nobody.
   the journal reader on log lines of those releases; the sender against
   a fake Telegram; and the role's task files against lab trees, with a
   real sender and the real undo script, on ansible-core 2.16 and the
-  current one. NOT RUN YET: the live job `detection-live` and the new
-  `--pam` guard cases on GitHub's runners. Never run on a real server.
+  current one. On GitHub's Ubuntu 22.04 and 24.04 runners
+  (`detection-live`, and the guard's `--pam` cases): the install under
+  the undo, logins with keys and with passwords, `su`, `sudo -i`,
+  `sudo -s`, a console login on a new terminal, a hook that hangs (that
+  login took about 1.2 s instead of 0.3 s), a stopped sender, an undone
+  PAM change, and removal byte for byte. On one real Ubuntu 24.04 server
+  already in use: plan only, a check run and the real install; the test
+  message arrived, and so did the alert for a real console login.
+  Debian 12 and 13 ran in the lab only.
 - Ubuntu 26.04: its `pam_exec.so` could not be loaded in the lab (it
   needs a newer C library than the lab has), so the hook's line is
   untested with it. Its `timeout` is a new program (uutils). In the lab

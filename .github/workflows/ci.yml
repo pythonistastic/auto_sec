@@ -300,7 +300,7 @@ jobs:
   # Unit tests of the SSH undo guard with the runner's real systemd: real
   # transient timers, an absolute deadline across a daemon-reload, flock,
   # hash-checked revert. 22.04 also covers systemd 249. 0.7 adds the --pam
-  # mode that role 08 uses for its login hook (NOT RUN YET on a runner).
+  # mode that role 08 uses for its login hook.
   guard:
     strategy:
       fail-fast: false
@@ -810,6 +810,7 @@ jobs:
   # and the role's own task files against lab trees on the current
   # ansible-core and on 2.16, with the real undo guard script and a real
   # sender. The real Telegram is never called. A SKIP line fails the job.
+  # It took 25 to 37 minutes on a runner (0.7).
   detection-semantics:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -849,7 +850,8 @@ jobs:
   # message); an injected failure of the login test puts the PAM files
   # back; removal leaves the common PAM files byte for byte as before.
   # 22.04: pam-auth-update cannot try a new profile on a copy (N08-6).
-  # NOT RUN YET on GitHub's runners.
+  # Ran green on both runners and with ansible-core 2.16 (0.7): about 112
+  # checks on each machine, in about 10 minutes.
   detection-live:
     name: detection-live (${{ matrix.os }}, ${{ matrix.ansible_core }})
     strategy:

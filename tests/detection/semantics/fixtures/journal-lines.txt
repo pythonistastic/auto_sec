@@ -34,8 +34,9 @@
 #   Webmin miniserv.pl 2.303: syslog("info", "Successful login as $authuser
 #          from $loghost"), identifier = the `pam` value of miniserv.conf
 #          (webmin, usermin).
-# NOT RUN YET on a real server of each release: the live jobs
-# (tests/detection/live) capture the real lines on Ubuntu 22.04 and 24.04.
+# The live jobs (tests/detection/live) run the reader on the real lines of
+# Ubuntu 22.04 and 24.04, and ran green there (0.7). For Debian 12 and 13
+# and Ubuntu 26.04 there are only the lines in this file.
 
 # --- sshd: a password ---
 {"sets": ["jammy", "bookworm", "noble"], "origin": "format", "rec": {"_EXE": "/usr/sbin/sshd", "SYSLOG_IDENTIFIER": "sshd", "_UID": "0", "_PID": "4101", "__REALTIME_TIMESTAMP": "1795000000000000", "MESSAGE": "Accepted password for root from 203.0.113.5 port 40022 ssh2"}, "want": {"kind": "accepted", "svc": "sshd", "method": "password", "user": "root", "rhost": "203.0.113.5", "port": "40022", "fp": "", "app": "4101", "ts": "1795000000"}}
