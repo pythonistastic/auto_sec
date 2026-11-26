@@ -23,7 +23,8 @@ Commands (each one is a systemd unit of its own):
                  (auto-sec-alive.timer).
   check          the independent checker (auto-sec-check.timer, every 5
                  minutes). Sends its own message when something is wrong,
-                 and again every hour until it is fixed.
+                 and again every hour until it is fixed. Quiet while an
+                 auto_sec run works on detection.
   stopped UNIT   says that a detection unit stopped or failed
                  (auto-sec-notify@.service).
   test           sends a test message now and prints its id.
@@ -1201,10 +1202,32 @@ def health(conf, now):
     return problems, st, count
 
 
+def planned(now):
+    """Is an auto_sec run working on detection right now?
+
+    The run leaves a mark under /run/auto-sec (tmpfs, root only) while it
+    installs, changes or removes detection, and lets it run out 20 seconds
+    after it is done. A mark that a dead run left behind counts for 15
+    minutes.
+    """
+    try:
+        return now - os.stat(P(PLANNED)).st_mtime < 900
+    except OSError:
+        return False
+
+
 def cmd_check(conf):
     now = time.time()
     path = os.path.join(P(STATE), "check.json")
     prev = read_json(path, {})
+    if planned(now):
+        # Half of detection is in place on purpose (the units run before the
+        # PAM line is there): a check now would call that a problem. The
+        # run itself checks the result at its end; the next check is 5
+        # minutes away.
+        log("an auto_sec run is working on detection: no check now")
+        write_json(path, dict(prev, last_run=now))
+        return 0
     found, _st, _count = health(conf, now)
     problems = [text for _code, text in found]
     codes = sorted(code for code, _text in found)
@@ -1249,12 +1272,9 @@ def cmd_stopped(conf, unit, result):
     """A detection unit stopped or failed. Sent by auto-sec-notify@.service."""
     now = time.time()
     unit = safe(unit, 60)
-    try:
-        if now - os.stat(P(PLANNED)).st_mtime < 900:
-            log("%s stopped during an auto_sec run: no message" % unit)
-            return 0
-    except OSError:
-        pass
+    if planned(now):
+        log("%s stopped during an auto_sec run: no message" % unit)
+        return 0
     try:
         running = subprocess.run([tool("systemctl"), "is-system-running"], capture_output=True, text=True,
                                  timeout=15, check=False).stdout.strip()

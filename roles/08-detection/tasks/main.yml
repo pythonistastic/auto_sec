@@ -19,9 +19,10 @@
 #   D6  the status line for the plan's next run and for the report
 # Nothing is written, started or sent in --check.
 #
-# While this run restarts detection units, a mark under /run/auto-sec keeps
-# the "the watcher was stopped" message quiet. It runs out 20 seconds after
-# the role is done.
+# While this run works on detection, a mark under /run/auto-sec keeps the
+# "the watcher was stopped" message and the 5-minute checker quiet: the
+# units run before the PAM line is in place, and the checker would call
+# that a problem. The mark runs out 20 seconds after the role is done.
 
 - name: "Detection: the preflight must have run in this play"
   ansible.builtin.assert:
@@ -73,8 +74,10 @@
       when: not ansible_check_mode
       block:
         # --- D2 ---------------------------------------------------------------
+        # Also for a PAM change alone: until the line is in place the
+        # checker would call the missing line a problem.
         - name: "Detection D2: an auto_sec run is working on the detection units"
-          when: (_det_plan.units | length > 0) or (_det_plan.reload | bool)
+          when: (_det_plan.units | length > 0) or (_det_plan.reload | bool) or (_det_plan.pam | bool)
           ansible.builtin.command:
             argv: [sh, -c, 'umask 077; mkdir -p -- "${1%/*}" && : > "$1"', sh, "{{ _det_planned }}"]
           changed_when: false

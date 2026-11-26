@@ -146,10 +146,10 @@ _det_guard_paths: "{{ (_det_pam_files | map('regex_replace', '^', _det_pam_root)
 # The checksums of those files (without the profile) from before detection
 # was installed: a removal says whether they are byte for byte the same.
 _det_pam_before: /var/lib/auto-sec/detect/pam-before.json
-# While a run restarts or removes detection units, this file (tmpfs, root
-# only) keeps the "the watcher was stopped" message quiet. The run lets it
-# run out 20 seconds after it is done; left behind by a run that died, it
-# counts for 15 minutes.
+# While a run installs, changes or removes detection, this file (tmpfs,
+# root only) keeps the "the watcher was stopped" message and the checker
+# quiet. The run lets it run out 20 seconds after it is done; left behind
+# by a run that died, it counts for 15 minutes.
 _det_planned: /run/auto-sec/detect-planned
 
 # Role 02's undo guard (the same paths as in role 02's defaults).

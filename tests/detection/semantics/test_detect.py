@@ -921,6 +921,33 @@ class TestChecker(WithSink):
         self.run_cmd("check")
         self.assertEqual(len(self.sink.messages()), 4)
 
+    def test_quiet_while_an_auto_sec_run_works_on_detection(self):
+        # An install starts the units before the PAM line is in place. On a slow connection the
+        # checker's first run falls into that gap: it must not call it a problem.
+        self.beats()
+        os.remove(os.path.join(self.lab.root, "usr/share/pam-configs/auto-sec-login-alert"))
+        with open(os.path.join(self.lab.root, "etc/pam.d/common-session"), "w") as fh:
+            fh.write("session\trequired\tpam_unix.so \n# end of pam-auth-update config\n")
+        marker = os.path.join(self.lab.root, "run/auto-sec/detect-planned")
+        open(marker, "w").close()
+        r = self.run_cmd("check")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("an auto_sec run is working on detection", r.stderr)
+        self.assertEqual(self.sink.messages(), [])
+        path = os.path.join(self.lab.state_dir, "check.json")
+        self.assertGreater(load(path)["last_run"], time.time() - 60)     # the services see that it still runs
+        # the run is done and the PAM line is in place: nothing was ever said, nothing is said now
+        self.lab.pam_ok()
+        os.utime(marker, (time.time() - 1000, time.time() - 1000))
+        self.run_cmd("check")
+        self.assertEqual(self.sink.messages(), [])
+        # without a run going on, the same gap IS a problem
+        os.remove(os.path.join(self.lab.root, "usr/share/pam-configs/auto-sec-login-alert"))
+        self.run_cmd("check")
+        self.assertEqual(len(self.sink.messages()), 1)
+        self.assertIn("the PAM profile /usr/share/pam-configs/auto-sec-login-alert is missing or was changed",
+                      self.sink.messages()[0]["text"])
+
     def test_each_thing_it_asks(self):
         def problems():
             self.run_cmd("check")

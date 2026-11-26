@@ -126,7 +126,7 @@ debconf_profiles() {
   sudo -n sed -n '/^Name: libpam-runtime\/profiles$/,/^$/p' /var/cache/debconf/config.dat 2>/dev/null | sed -n 's/^Value: //p'
 }
 units_active() { local u n=0; for u in $UNITS; do [ "$(systemctl is-active "$u" 2>/dev/null)" = active ] && n=$((n + 1)); done; echo "$n"; }
-mark_out() { # wait until the mark of the last auto_sec run has run out (20 s after it): stop messages are quiet until then
+mark_out() { # wait until the mark of the last auto_sec run has run out (20 s after it): stop messages and the checker are quiet until then
   local i=0 t
   while [ "$i" -lt 40 ]; do
     t=$(sudo -n stat -c %Y /run/auto-sec/detect-planned 2>/dev/null) || return 0
@@ -260,6 +260,7 @@ case_i() {
   expect i "no daemon-reload for the new unit files" "$(reloads_since "$t0")" 0
   expect i "no test message (it comes after the PAM step) and no login alert" "$(others_since 0)" 0
   # The settings say "login hook", and the hook is not in PAM: the checker says so.
+  mark_out
   sudo -n systemctl start auto-sec-check.service || true
   expect_msg i "the checker tells the chat that the login hook is not in PAM" 0 \
     "auto_sec detection problem: $HOST .*the login hook's line is no longer in /etc/pam.d/common-session"
@@ -272,6 +273,11 @@ case_a() {
   base=$(msg_count)
   dplay a-install || rc=$?
   expect a "the run: rc" "$rc" 0
+  # The units run before the PAM line is in place: the checker's timer may
+  # fire in that gap. It waits for the end of the run instead of calling
+  # the gap a problem.
+  expect a "the checker sent no problem message during the install" \
+    "$(new_msgs "$base" | grep -c '^auto_sec detection problem:' || true)" 0
   expect a "common-session holds auto_sec's line once" "$(sudo -n grep -cFx -- "$LINE" /etc/pam.d/common-session)" 1
   expect a "no other common PAM file names the hook" \
     "$(sudo -n grep -l auto-sec-login-hook /etc/pam.d/common-auth /etc/pam.d/common-account /etc/pam.d/common-password /etc/pam.d/common-session-noninteractive 2>/dev/null | wc -l)" 0
@@ -296,6 +302,7 @@ case_a() {
   expect_msg a "that test message is in the chat" "$base" "^auto_sec test ${id:-none}: alerts from $HOST reach this chat"
   expect a "status: on, both sensors" "$(jget verdict) $(jget mode)" "on hook+journal"
   expect a "status: no problem" "$(jget problems)" "[]"
+  mark_out
   sudo -n systemctl start auto-sec-check.service || true
   expect_msg a "the checker says that detection works again" "$base" "auto_sec detection is working again on $HOST"
   settle >/dev/null
@@ -445,6 +452,7 @@ case_s() {
     pass s "status: detection: DEAD since <time>"
   else fail s "status says: $(head -n 1 "$LOGS/status-dead.out")"; fi
   base=$(settle)
+  mark_out
   sudo -n systemctl start auto-sec-check.service || true
   expect_msg s "the independent checker says so by itself" "$base" \
     "auto_sec detection problem: $HOST \| - the sender is not running .*repeats every hour"
@@ -459,6 +467,7 @@ case_s() {
   expect s "the next run: rc" "$rc" 0
   expect s "status: on again" "$(jget verdict)" on
   base=$(settle)
+  mark_out
   sudo -n systemctl start auto-sec-check.service || true
   expect_msg s "the checker says that it works again" "$base" "auto_sec detection is working again on $HOST"
 

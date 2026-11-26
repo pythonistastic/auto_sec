@@ -384,6 +384,17 @@ class Lab:
             detect.ROOT = ""
 
 
+def run_out(lab):
+    """Let the mark of the last auto_sec run be past (20 s after the run, on a real server).
+
+    While it counts, stop messages and the checker are quiet.
+    """
+    mark = lab.path("run/auto-sec/detect-planned")
+    if os.path.exists(mark):
+        old = time.time() - 1000
+        os.utime(mark, (old, old))
+
+
 def fixture(**want):
     for ln in read(FIXTURES).split("\n"):
         if ln.startswith("{"):
@@ -867,16 +878,19 @@ def a7_journal_only(ctx):
           r.rc == 0 and bool(re.search(r"\[W08-2\] WARNING: detection: DEAD since 20\d\d-\d\d-\d\d \d\d:\d\d:\d\d UTC \(the sender is not running", r.n))
           and r.has("08 detection: start: auto-sec-alert.service: the sender (start)") and r.out["status"]["verdict"] == "dead"
           and r.out["report"].startswith("detection: DEAD since 20"), (r.rc, r.out and r.out["report"], r.n[-900:]))
+    run_out(lab)
     c = lab.detect("check")
     msgs = ctx.sink.new(wait=5)
     check(WHO, "a7 the independent checker says so in the chat by itself (it does not need the sender)",
           len(msgs) == 1 and msgs[0].startswith("auto_sec detection problem: localhost") and "the sender is not running" in msgs[0]
           and "repeats every hour" in msgs[0], (c.returncode, msgs))
+    run_out(lab)
     lab.detect("check")
     eq(WHO, "a7 ... once, not at every check", ctx.sink.new(wait=2), [])
     r = lab.play(v2)
     check(WHO, "a7 the next run starts it again: detection is on", r.rc == 0 and r.after["status"]["verdict"] == "on"
           and lab.calls() == ["start auto-sec-alert.service"], (r.rc, r.after, r.n[-600:]))
+    run_out(lab)
     lab.detect("check")
     msgs = ctx.sink.new(wait=5)
     check(WHO, "a7 ... and the checker says that it works again", len(msgs) == 1 and msgs[0].startswith("auto_sec detection is working again on localhost"), msgs)
@@ -1007,11 +1021,13 @@ def a8_hook(ctx):
         # the checker notices a PAM line that went away
         text = read(lab.path("etc/pam.d/common-session"))
         pam.write(lab.path("etc/pam.d/common-session"), text.replace(LINE + "\n", ""))
+        run_out(lab)
         lab.detect("check")
         msgs = ctx.sink.new(wait=5)
         check(who, "a8 someone takes the hook's line out of PAM: the checker says so in the chat",
               len(msgs) == 1 and "the login hook's line is no longer in /etc/pam.d/common-session" in msgs[0], msgs)
         pam.write(lab.path("etc/pam.d/common-session"), text)
+        run_out(lab)
         lab.detect("check")
         ctx.sink.new(wait=5)
 

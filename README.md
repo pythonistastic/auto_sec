@@ -952,8 +952,8 @@ place, under the undo, and before pam-auth-update runs for real (N08-6).
 
 - Each service restarts by itself.
 - When one stops or fails, a small unit of its own sends "the watcher
-  was stopped". Not at shutdown, and not while an auto_sec run restarts
-  it.
+  was stopped". Not at shutdown, and not while an auto_sec run works on
+  detection (the checker waits for the end of that run too).
 - A checker runs every 5 minutes on a timer of its own. It asks: do the
   two sensors and the sender run, is the hook's line still in PAM, does
   the queue move, did the last daily message go out, can messages be
