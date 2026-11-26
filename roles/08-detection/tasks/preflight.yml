@@ -325,6 +325,9 @@
       failed_when: false
       check_mode: false
 
+    # auto_sec's own units do not count: a daemon-reload may load them. The
+    # undo's boot unit is one: a run that updates it reloads nothing (it is
+    # only read at boot), so its edit stays unloaded until the next reload.
     - name: "Detection preflight R08-5: a daemon-reload must not load edits of yours"
       when: _det_plan.reload | bool
       ansible.builtin.assert:
@@ -339,7 +342,7 @@
         _det_pending_units: >-
           {{ _det_pf_ndr.stdout_lines | default([]) | select('match', '^U ') | map('regex_replace', '^U ', '')
              | select('match', '^[A-Za-z0-9@._:\\\\-]{1,128}$')
-             | reject('match', '^auto-sec-(alert|login-watch|alive|check|notify@)') | unique | list }}
+             | reject('match', '^auto-sec-') | unique | list }}
 
     - name: "Detection preflight: the PAM change needs the automatic undo and a login test"
       when: _det_plan.pam | bool
@@ -497,7 +500,7 @@
         _det_pending_units: >-
           {{ _det_pf_ndr_rm.stdout_lines | default([]) | select('match', '^U ') | map('regex_replace', '^U ', '')
              | select('match', '^[A-Za-z0-9@._:\\\\-]{1,128}$')
-             | reject('match', '^auto-sec-(alert|login-watch|alive|check|notify@)') | unique | list }}
+             | reject('match', '^auto-sec-') | unique | list }}
 
 # --- Only a test message (-e detection_test_alert=true, nothing else asked) --------
 

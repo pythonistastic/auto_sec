@@ -5,8 +5,9 @@
 # `auto-sec-detect --root <lab>` looks for it.
 #   $LAB_SD/calls        every call, one per line
 #   $LAB_SD/unit.<name>  the state of a unit ("active"); no file = inactive
-#   $LAB_SD/pending      when it exists: one unit with edits systemd has not
-#                        loaded (for R08-5)
+#   $LAB_SD/pending      when it exists: the units with edits systemd has
+#                        not loaded, one name per line (an empty file:
+#                        lab-edited.service). For R08-5
 #   $LAB_SENDER          the command of the real sender against the lab root.
 #                        `start auto-sec-alert.service` runs it in the
 #                        background (pid in $LAB_SD/sender.pid, output in
@@ -21,6 +22,7 @@ printf '%s\n' "$*" >> "$d/calls"
 cmd=${1-}
 [ $# -gt 0 ] && shift
 state() { if [ -f "$d/unit.$1" ]; then cat "$d/unit.$1"; else echo inactive; fi; }
+pending() { if [ -s "$d/pending" ]; then cat "$d/pending"; elif [ -e "$d/pending" ]; then echo lab-edited.service; fi; }
 stop_sender() {
   [ -f "$d/sender.pid" ] || return 0
   pid=$(cat "$d/sender.pid")
@@ -44,12 +46,12 @@ case $cmd in
     for u in $units; do
       echo "Id=$u"
       echo "ActiveState=$(state "$u")"
-      if [ -e "$d/pending" ] && [ "$u" = lab-edited.service ]; then echo "NeedDaemonReload=yes"; else echo "NeedDaemonReload=no"; fi
+      if pending | grep -qxF -- "$u"; then echo "NeedDaemonReload=yes"; else echo "NeedDaemonReload=no"; fi
       echo
     done
     if [ -n "${LAB_ON_SHOW:-}" ]; then sh -c "$LAB_ON_SHOW"; fi ;;
   list-units)
-    if [ -e "$d/pending" ]; then echo "lab-edited.service loaded active running a unit with edits"; fi ;;
+    pending | while IFS= read -r u; do echo "$u loaded active running a unit with edits"; done ;;
   is-active)
     st=$(state "${1-}")
     if [ "$st" = active ] && [ "${1-}" = auto-sec-login-watch.service ]; then touch "${LAB_BEATS:?}/watch.alive"; fi

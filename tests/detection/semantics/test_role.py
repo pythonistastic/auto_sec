@@ -840,10 +840,16 @@ def a7_journal_only(ctx):
     r = lab.play(v2)
     check(WHO, "a7 R08-5: a changed unit file needs a daemon-reload, which would load unit edits of yours: refused",
           r.rc != 0 and r.has("[R08-5] localhost has unit edits systemd has not loaded yet: lab-edited.service") and r.has(NOTHING), (r.rc, r.n[-500:]))
-    os.remove(os.path.join(lab.sd, "pending"))
+    # auto_sec's own units may be loaded by that daemon-reload. The undo's boot unit is one: a run
+    # that updates it reloads nothing, so its edit is still unloaded when the next run comes.
+    with open(os.path.join(lab.sd, "pending"), "w", encoding="ascii") as fh:
+        fh.write("auto-sec-ssh-guard-boot.service\nauto-sec-alive.timer\n")
     lab.calls()
     ctx.sink.new()
     r = lab.play(v2)
+    os.remove(os.path.join(lab.sd, "pending"))
+    check(WHO, "a7 unloaded edits only in auto_sec's own units (the undo's boot unit) are no refusal",
+          r.rc == 0 and not r.has("[R08-5]"), (r.rc, r.n[-500:]))
     check(WHO, "a7 a new daily time: the timer file is replaced, with a daemon-reload, and no test message when detection_test_alert is false",
           r.rc == 0 and r.has("replace: %s/etc/systemd/system/auto-sec-alive.timer: daily at 07:30 server time" % L)
           and r.has("daemon-reload: systemd (a detection unit file changes)") and r.has("timer: auto-sec-alive.timer: the daily message (restart)")
