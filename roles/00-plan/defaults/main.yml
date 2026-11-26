@@ -36,9 +36,13 @@ _plan_do_words:
   - timer
   - network-call
   - local-file
+  - remove
+  - stop
 
 # How the totals line counts the items. local-file is a file on this
-# computer (the report), so it is not a server change.
+# computer (the report), so it is not a server change. remove (a file of
+# auto_sec's own goes) and stop (a unit of auto_sec's own stops) are counted
+# on their own: only role 08's removal of login alerts uses them.
 _plan_count_files: [write, replace, sudoers, cron]
 _plan_count_services: [start, restart, reload, daemon-reload, enable, timer]
 _plan_count_rules: [add-rule, policy]
@@ -47,7 +51,7 @@ _plan_count_rules: [add-rule, policy]
 #   sel:  facts or play vars that say the tags select the role (any of them)
 #   cfg:  the play var that says the layer is configured (site.yml _layer_NN)
 #   off_text: the line when it is not configured
-#   managed: false for roles that change nothing in 0.6
+#   managed: false for a role that never changes anything (role 09)
 _plan_roles:
   - {id: "01", name: base, sel: [_base_role_runs]}
   - {id: "02", name: ssh, sel: [_ssh_role_runs], cfg: _ssh_enabled, off_text: "off (ssh_hardening_enabled: false)"}
@@ -56,7 +60,7 @@ _plan_roles:
   - {id: "05", name: app, sel: [_sel_05], cfg: _layer_05, off_text: "skipped (app_type is not set)"}
   - {id: "06", name: database, sel: [_sel_06], cfg: _layer_06, off_text: "skipped (db_engine is not set)"}
   - {id: "07", name: backups, sel: [_sel_07], cfg: _layer_07, off_text: "skipped (b2_bucket is not set)"}
-  - {id: "08", name: detection, sel: [_l08_role_runs], managed: false}
+  - {id: "08", name: detection, sel: [_l08_role_runs], cfg: _det_cfg, off_text: "off (detection_enabled: false)"}
   - {id: "09", name: watcher, sel: [_l09_role_runs], managed: false}
   - {id: "10", name: report, sel: [_sel_10], cfg: _layer_10}
   - {id: "11", name: cve, sel: [_sel_11], cfg: _layer_11, off_text: "skipped (cve_watch_enabled: false)"}

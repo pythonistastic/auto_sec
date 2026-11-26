@@ -1,0 +1,736 @@
+---
+# roles/08-detection/tasks/preflight.yml
+#
+# Role 08's read-only preflight. site.yml imports this file in pre_tasks
+# with tags [always], after tasks/legacy.yml (W08-1), so a refusal comes
+# BEFORE any role changes anything. It also runs in --check. vars.yml
+# (pre-task 2) has checked every detection_* value.
+#
+# What it reads (SECURITY.md): which of auto_sec's own files are there
+# (checksums and a yes/no for the header line; no line of detect.conf),
+# the states of auto_sec's own units, `auto-sec-detect status --json`
+# when detection is installed, and the trial of the PAM change on a copy
+# (pam-trial.yml). It writes only scratch copies under /run/auto-sec
+# (tmpfs, root only, removed again).
+#
+#   R08-3  a file with one of auto_sec's names that auto_sec did not write
+#   R08-4  python3, journalctl or systemctl is missing
+#   R08-5  a daemon-reload would load unit edits of yours
+#   R08-6  the login test needs a brand-new SSH login (or local mode)
+#   R08-7  an earlier automatic undo is still pending
+#   R08-P1 to R08-P7  the PAM change (pam-decide.yml)
+#
+# Facts set on every host:
+#   _det_role_runs  bool  the tags select role 08 ("detection")
+#   _det_installed  bool  files of auto_sec's detection are on the host
+#   _det_cfg        bool  role 08 has something to say in the plan
+#   _det_apply      bool  role 08 main installs or changes something
+#   _det_do_remove  bool  role 08 main takes detection out
+#   _det_plan       dict  what main does (write, dirs, links, reload, units, pam, test, now)
+#   _det_status     dict  auto-sec-detect's own status (filtered)
+#   _det_report     str   one line for the report (role 10)
+#   _plan_08        list  plan items {role, part, do, what, note}
+#   _plan_08_notes  list  the status line and the notes, shown under the plan
+
+- name: "Detection preflight: does this run apply role 08?"
+  ansible.builtin.set_fact:
+    _det_role_runs: >-
+      {{ (('all' in ansible_run_tags) or ('tagged' in ansible_run_tags) or ('detection' in ansible_run_tags))
+         and ('detection' not in ansible_skip_tags) and ('tagged' not in ansible_skip_tags)
+         and ('all' not in ansible_skip_tags) }}
+    _plan_08: []
+    _plan_08_notes: []
+    _det_notes: []
+    _det_pam_change: false
+    _det_pam_blind: false
+    _det_pam_note: ""
+    _det_pam_pf: {}
+    _det_pam: {}
+
+# --- What is there now ---------------------------------------------------------
+
+- name: "Detection preflight: reads"
+  when: _det_role_runs | bool
+  block:
+    - name: "Detection preflight: auto_sec's own files, folders and links"
+      ansible.builtin.include_tasks:
+        file: read.yml
+
+    - name: "Detection preflight: what is installed, and what is not auto_sec's"
+      ansible.builtin.set_fact:
+        _det_installed: >-
+          {{ (_det_order + ['profile']) | map('extract', _det_now) | selectattr('type', 'equalto', 'file')
+             | selectattr('own') | list | length > 0 }}
+        _det_foreign: >-
+          {%- set out = [] -%}
+          {%- for n in _det_order + ['profile'] -%}
+          {%- set t = _det_now[n] | default({'type': 'absent', 'own': false}) -%}
+          {%- if t.type != 'absent' and not (t.type == 'file' and t.own) -%}
+          {%- set _ = out.append(_det_profile if n == 'profile' else _det_targets[n].dest) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- for d in _det_dirs -%}
+          {%- if (_det_now[d.path].type | default('absent')) not in ['absent', 'dir'] -%}{%- set _ = out.append(d.path) -%}{%- endif -%}
+          {%- endfor -%}
+          {%- for r in _det_run -%}
+          {%- set t = _det_now[r.unit] | default({'type': 'absent', 'own': false}) -%}
+          {%- if t.type != 'absent' and not t.own -%}{%- set _ = out.append(_det_unit_dir ~ '/' ~ r.wants ~ '/' ~ r.unit) -%}{%- endif -%}
+          {%- endfor -%}
+          {{ out + _det_elsewhere }}
+
+    # Detection's own answer to "are you alive?". Only when both the
+    # program and its settings are auto_sec's own files.
+    - name: "Detection preflight: ask detection for its status (read-only)"
+      when:
+        - (_det_now.detect.own | default(false)) and (_det_now.conf.own | default(false))
+      ansible.builtin.command:
+        argv: "{{ _det_cmd + ['status', '--json'] }}"
+      register: _det_pf_status
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Detection preflight: remember the status"
+      when: _det_pf_status is not skipped
+      ansible.builtin.set_fact:
+        _det_status: "{{ _det_st_clean }}"
+      vars:
+        _det_st_raw: >-
+          {{ (_det_pf_status.stdout | from_json)
+             if ((_det_pf_status.rc | default(1)) == 0 and (_det_pf_status.stdout | default('')) is match('^\{.*\}\s*$'))
+             else {} }}
+        _det_st_clean:
+          verdict: "{{ _det_st_raw.verdict if (_det_st_raw.verdict | default('')) in ['on', 'dead', 'absent'] else 'unread' }}"
+          line: "{{ _det_st_raw.line | default('detection: its status could not be read') | string | regex_replace('[^ -~]', '?') | regex_replace('[{}]', '?') | truncate(300) }}"
+          mode: "{{ _det_st_raw.mode if (_det_st_raw.mode | default('')) in ['hook+journal', 'journal'] else '' }}"
+          test_mode: "{{ _det_st_raw.test_mode | default(false) | bool }}"
+          last_hook: "{{ _det_st_raw.last_hook | default(0) | int }}"
+
+- name: "Detection preflight: what role 08 has to do in this run"
+  ansible.builtin.set_fact:
+    _det_cfg: >-
+      {{ (_det_enabled | bool) or (_det_remove | bool) or (_det_installed | bool) or (_det_test_forced | bool) }}
+    _det_want: >-
+      {{ 'install' if (_det_enabled | bool) else ('remove' if (_det_remove | bool) else 'nothing') }}
+
+# --- R08-3: never replace or remove a file auto_sec cannot prove is its own ----
+
+- name: "Detection preflight R08-3: a file with auto_sec's name must be auto_sec's own"
+  when:
+    - _det_role_runs | bool
+    - _det_want != 'nothing'
+  ansible.builtin.assert:
+    quiet: true
+    that: _det_foreign | default([]) | length == 0
+    fail_msg: >-
+      [R08-3] {{ _det_foreign | default([]) | join(', ') }} on {{ inventory_hostname }}
+      {{ 'is' if (_det_foreign | default([]) | length == 1) else 'are' }} not auto_sec's: the header line is
+      missing or was changed, or it is a link or a folder where a file belongs. auto_sec never
+      replaces or removes a file it did not write. Move it away (or put the header line back if
+      the file is auto_sec's and you edited it), then run again; or set detection_enabled: false.
+      Nothing has been changed.
+
+# --- Install or change -----------------------------------------------------------
+
+- name: "Detection preflight: install or change"
+  when:
+    - _det_role_runs | bool
+    - _det_want == 'install'
+  block:
+    - name: "Detection preflight: python3, journalctl and systemctl"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        get_checksum: false
+      loop: ["{{ _det_python }}", /usr/bin/journalctl, /usr/bin/systemctl]
+      register: _det_pf_tools
+
+    - name: "Detection preflight R08-4: login alerts need python3 and systemd's journal"
+      ansible.builtin.assert:
+        quiet: true
+        that: _det_pf_tools.results | map(attribute='stat') | map(attribute='exists') | reject | list | length == 0
+        fail_msg: >-
+          [R08-4] {{ _det_pf_tools.results | rejectattr('stat.exists') | map(attribute='item') | join(', ') }}
+          {{ 'is' if (_det_pf_tools.results | rejectattr('stat.exists') | list | length == 1) else 'are' }} missing on
+          {{ inventory_hostname }}. Login alerts need python3 and systemd (journalctl, systemctl), which
+          Ubuntu and Debian have. auto_sec installs no package for them. Set detection_enabled: false
+          on this server. Nothing has been changed.
+
+    # The hook file is installed with the PAM line, and stays out in
+    # journal-reader-only mode. A hook that an earlier run put into PAM
+    # stays there and keeps working: false removes nothing.
+    - name: "Detection preflight: PAM trial (the login hook)"
+      when: (_det_hook_wanted | bool) or (_det_now.profile.type | default('absent')) != 'absent'
+      ansible.builtin.include_tasks:
+        file: pam-trial.yml
+
+    - name: "Detection preflight: is the login hook in PAM now?"
+      ansible.builtin.set_fact:
+        _det_hook_there: "{{ _det_pam.enabled | default(false) | bool }}"
+        _det_hook_on: "{{ (_det_hook_wanted | bool) or (_det_pam.enabled | default(false) | bool) }}"
+
+    - name: "Detection preflight: refuse or plan the PAM change"
+      when: _det_hook_wanted | bool
+      ansible.builtin.include_tasks:
+        file: pam-decide.yml
+      vars:
+        _det_stage: preflight
+        _det_pam_do: enable
+
+    - name: "Detection preflight: remember the trial"
+      when: _det_hook_wanted | bool
+      ansible.builtin.set_fact:
+        _det_pam_pf: "{{ _det_pam }}"
+
+    # Render every file from your variables and role constants on the host
+    # (scratch, root only) to know which ones would change.
+    - name: "Detection preflight: scratch folders, root only"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ _det_file_owner }}"
+        mode: "0700"
+      loop:
+        - "{{ _det_run_dir }}"
+        - "{{ _det_sim_dir }}"
+      changed_when: false
+      check_mode: false
+      diff: false
+
+    - name: "Detection preflight: render the files this run would write"
+      block:
+        - name: "Detection preflight: render the templates (the settings hold the Telegram token)"
+          ansible.builtin.template:
+            src: "{{ _det_targets[item].template }}"
+            dest: "{{ _det_sim_dir }}/{{ item }}"
+            owner: "{{ _det_file_owner }}"
+            mode: "0600"
+          loop: "{{ _det_names | select('in', _det_targets | dict2items | selectattr('value.template', 'defined') | map(attribute='key') | list) | list }}"
+          changed_when: false
+          check_mode: false
+          diff: false
+          no_log: true
+
+        - name: "Detection preflight: copy the other files"
+          ansible.builtin.copy:
+            src: "{{ _det_targets[item].src }}"
+            dest: "{{ _det_sim_dir }}/{{ item }}"
+            owner: "{{ _det_file_owner }}"
+            mode: "0600"
+          loop: "{{ _det_names | select('in', _det_targets | dict2items | selectattr('value.src', 'defined') | map(attribute='key') | list) | list }}"
+          changed_when: false
+          check_mode: false
+          diff: false
+
+        - name: "Detection preflight: their sha256"
+          ansible.builtin.stat:
+            path: "{{ _det_sim_dir }}/{{ item }}"
+            checksum_algorithm: sha256
+          loop: "{{ _det_names }}"
+          register: _det_pf_sim
+          check_mode: false
+
+      always:
+        - name: "Detection preflight: remove the scratch folder"
+          ansible.builtin.file:
+            path: "{{ _det_sim_dir }}"
+            state: absent
+          changed_when: false
+          check_mode: false
+          diff: false
+
+    - name: "Detection preflight: unit states"
+      ansible.builtin.command:
+        argv: "{{ [_det_systemctl, 'show', '-p', 'Id', '-p', 'ActiveState'] + (_det_run | map(attribute='unit') | list) }}"
+      register: _det_pf_units
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Detection preflight: decide"
+      ansible.builtin.set_fact:
+        _det_plan:
+          names: "{{ _det_names }}"
+          write: "{{ _det_write }}"
+          dirs: "{{ _det_mkdirs }}"
+          links: "{{ _det_links }}"
+          reload: "{{ _det_reload | bool }}"
+          units: "{{ _det_unit_do }}"
+          pam: "{{ (_det_hook_wanted | bool) and (_det_pam_change | bool) }}"
+          test: "{{ _det_test | bool }}"
+          fresh: "{{ not (_det_installed | bool) }}"
+          now: "{{ _det_now }}"
+      vars:
+        _det_new: "{{ dict(_det_names | zip(_det_pf_sim.results | map(attribute='stat') | map(attribute='checksum'))) }}"
+        _det_write: >-
+          {%- set out = [] -%}
+          {%- for n in _det_names -%}
+          {%- if (_det_now[n].sha | default('')) != _det_new[n] -%}{%- set _ = out.append(n) -%}{%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+        _det_mkdirs: >-
+          {%- set out = [] -%}
+          {%- for d in _det_dirs -%}
+          {%- set t = _det_now[d.path] | default({'type': 'absent'}) -%}
+          {%- if t.type != 'dir' or t.mode != (d.mode | regex_replace('^0', '')) or t.owner != _det_file_owner -%}{%- set _ = out.append(d.path) -%}{%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+        _det_links: >-
+          {{ _det_run | map(attribute='unit') | reject('in', _det_now | dict2items | selectattr('value.type', 'equalto', 'link')
+                                                         | map(attribute='key') | list) | list }}
+        # A unit file that is replaced needs a daemon-reload; a new one does not.
+        _det_reload: >-
+          {{ _det_write | select('in', _det_unit_names) | map('extract', _det_now) | selectattr('type', 'equalto', 'file') | list | length > 0 }}
+        # `systemctl show` prints one block per unit, each starting with Id=.
+        _det_active: >-
+          {%- set out = {} -%}
+          {%- set cur = {'id': ''} -%}
+          {%- for ln in _det_pf_units.stdout_lines | default([]) -%}
+          {%- if ln.startswith('Id=') -%}{%- set _ = cur.update({'id': ln[3:]}) -%}
+          {%- elif ln.startswith('ActiveState=') and cur.id | length > 0 -%}{%- set _ = out.update({cur.id: ln[12:]}) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+        _det_unit_do: >-
+          {%- set out = {} -%}
+          {%- for r in _det_run -%}
+          {%- set ns = namespace(touched=false) -%}
+          {%- for n in _det_write if r.unit in (_det_restart_for[n] | default([])) -%}{%- set ns.touched = true -%}{%- endfor -%}
+          {%- if (_det_active[r.unit] | default('inactive')) != 'active' -%}{%- set _ = out.update({r.unit: 'start'}) -%}
+          {%- elif ns.touched -%}{%- set _ = out.update({r.unit: 'restart'}) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+        _det_changes: >-
+          {{ (_det_write | length > 0) or (_det_unit_do | length > 0) or ((_det_hook_wanted | bool) and (_det_pam_change | bool)) }}
+        _det_test: "{{ (_det_test_forced | bool) or ((_det_test_install | bool) and (_det_changes | bool)) }}"
+
+    - name: "Detection preflight: unit edits systemd has not loaded yet"
+      when: _det_plan.reload | bool
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - |
+            systemctl list-units --all --no-legend --plain --full 2>/dev/null \
+              | awk '$2 == "loaded" { print $1 }' \
+              | xargs -r -d '\n' systemctl show -p Id,NeedDaemonReload -- 2>/dev/null \
+              | awk 'function flush() { if (nd == "yes" && id != "") print "U " id; id = ""; nd = "" }
+                     /^Id=/ { id = substr($0, 4) }
+                     /^NeedDaemonReload=/ { nd = substr($0, 18) }
+                     /^$/ { flush() }
+                     END { flush() }'
+            exit 0
+      register: _det_pf_ndr
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Detection preflight R08-5: a daemon-reload must not load edits of yours"
+      when: _det_plan.reload | bool
+      ansible.builtin.assert:
+        quiet: true
+        that: _det_pending_units | length == 0
+        fail_msg: >-
+          [R08-5] {{ inventory_hostname }} has unit edits systemd has not loaded yet:
+          {{ _det_pending_units | join(', ') }}. Updating auto_sec's detection units needs a
+          daemon-reload, which would load them too. Check them, run sudo systemctl daemon-reload
+          yourself, then run again. Nothing has been changed.
+      vars:
+        _det_pending_units: >-
+          {{ _det_pf_ndr.stdout_lines | default([]) | select('match', '^U ') | map('regex_replace', '^U ', '')
+             | select('match', '^[A-Za-z0-9@._:\\\\-]{1,128}$')
+             | reject('match', '^auto-sec-(alert|login-watch|alive|check|notify@)') | unique | list }}
+
+    - name: "Detection preflight: the PAM change needs the automatic undo and a login test"
+      when: _det_plan.pam | bool
+      block:
+        - name: "Detection preflight: is an earlier undo still pending?"
+          ansible.builtin.stat:
+            path: "{{ _det_guard_pending }}"
+            get_checksum: false
+          register: _det_pf_pending
+
+        - name: "Detection preflight R08-7: no earlier change may still be waiting for its undo"
+          ansible.builtin.assert:
+            quiet: true
+            that: not (_det_pf_pending.stat.exists | default(false))
+            fail_msg: >-
+              [R08-7] An earlier auto_sec change on {{ inventory_hostname }} is still waiting for its
+              automatic undo ({{ _det_guard_pending }} exists). Check with
+              `sudo auto-sec-ssh-guard status`, wait for the undo or run
+              `sudo auto-sec-ssh-guard revert <id>`, then run again. Nothing has been changed.
+
+        # The login test after the PAM change is a brand-new SSH login through
+        # Ansible's ssh plugin (role 02's prove.yml). Only extra vars beat the
+        # test's own task variables (see role 02's preflight P3).
+        - name: "Detection preflight R08-6: the login test needs Ansible's ssh connection (or local mode)"
+          when: not (_ssh_local_mode | default(false) | bool)
+          ansible.builtin.assert:
+            quiet: true
+            that:
+              - (ansible_connection | default('ssh')) in ['ssh', 'smart', 'ansible.builtin.ssh', 'ansible.legacy.ssh']
+              - ansible_ssh_args == '-o AutosecProbe=task-var'
+              - not (ansible_become | bool)
+            fail_msg: >-
+              [R08-6] After it adds its login hook to PAM, auto_sec tests a brand-new SSH login
+              through Ansible's ssh connection. This run uses ansible_connection
+              "{{ ansible_connection | default('ssh') }}"{{ ', and -e ansible_ssh_args or -e ansible_become on the command line would replace the options of that test'
+              if (ansible_ssh_args != '-o AutosecProbe=task-var' or (ansible_become | bool)) else '' }}.
+              Use ansible_connection: ssh without those -e options (or local mode: then `su` is the
+              test), or set detection_login_hook: false. Nothing has been changed.
+          vars:
+            ansible_ssh_args: -o AutosecProbe=task-var
+            ansible_become: false
+
+    - name: "Detection preflight: does anything change?"
+      ansible.builtin.set_fact:
+        _det_apply: >-
+          {{ (_det_plan.write | length > 0) or (_det_plan.dirs | length > 0) or (_det_plan.links | length > 0)
+             or (_det_plan.units | length > 0) or (_det_plan.pam | bool) or (_det_plan.test | bool) }}
+
+# --- Take detection out (-e detection_remove=true) --------------------------------
+
+- name: "Detection preflight: removal"
+  when:
+    - _det_role_runs | bool
+    - _det_want == 'remove'
+  block:
+    - name: "Detection preflight: PAM trial (taking the login hook out)"
+      ansible.builtin.include_tasks:
+        file: pam-trial.yml
+
+    - name: "Detection preflight: refuse or plan the PAM change"
+      ansible.builtin.include_tasks:
+        file: pam-decide.yml
+      vars:
+        _det_stage: preflight
+        _det_pam_do: remove
+
+    - name: "Detection preflight: is an earlier undo still pending?"
+      when: _det_pam_change | bool
+      ansible.builtin.stat:
+        path: "{{ _det_guard_pending }}"
+        get_checksum: false
+      register: _det_pf_pending_rm
+
+    - name: "Detection preflight R08-7: no earlier change may still be waiting for its undo"
+      when: _det_pam_change | bool
+      ansible.builtin.assert:
+        quiet: true
+        that: not (_det_pf_pending_rm.stat.exists | default(false))
+        fail_msg: >-
+          [R08-7] An earlier auto_sec change on {{ inventory_hostname }} is still waiting for its
+          automatic undo ({{ _det_guard_pending }} exists). Check with
+          `sudo auto-sec-ssh-guard status`, wait for the undo or run
+          `sudo auto-sec-ssh-guard revert <id>`, then run again. Nothing has been changed.
+
+    - name: "Detection preflight R08-6: the login test needs Ansible's ssh connection (or local mode)"
+      when:
+        - _det_pam_change | bool
+        - not (_ssh_local_mode | default(false) | bool)
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (ansible_connection | default('ssh')) in ['ssh', 'smart', 'ansible.builtin.ssh', 'ansible.legacy.ssh']
+          - ansible_ssh_args == '-o AutosecProbe=task-var'
+          - not (ansible_become | bool)
+        fail_msg: >-
+          [R08-6] After it takes its login hook out of PAM, auto_sec tests a brand-new SSH login
+          through Ansible's ssh connection. Use ansible_connection: ssh without -e ansible_ssh_args
+          and -e ansible_become (or local mode: then `su` is the test). Nothing has been changed.
+      vars:
+        ansible_ssh_args: -o AutosecProbe=task-var
+        ansible_become: false
+
+    - name: "Detection preflight: what a removal takes out"
+      ansible.builtin.set_fact:
+        _det_plan:
+          rm_files: >-
+            {{ _det_order | select('in', _det_now | dict2items | selectattr('value.type', 'equalto', 'file') | map(attribute='key') | list) | list }}
+          rm_links: >-
+            {{ _det_run | map(attribute='unit') | select('in', _det_now | dict2items | selectattr('value.type', 'equalto', 'link')
+                                                           | map(attribute='key') | list) | list }}
+          rm_dirs: >-
+            {{ _det_dirs | map(attribute='path') | select('in', _det_now | dict2items | selectattr('value.type', 'equalto', 'dir')
+                                                           | map(attribute='key') | list) | list }}
+          pam: "{{ _det_pam_change | bool }}"
+          now: "{{ _det_now }}"
+
+    - name: "Detection preflight: is there anything to take out?"
+      ansible.builtin.set_fact:
+        _det_do_remove: >-
+          {{ (_det_plan.rm_files | length > 0) or (_det_plan.rm_links | length > 0) or (_det_plan.rm_dirs | length > 0)
+             or (_det_plan.pam | bool) }}
+
+    - name: "Detection preflight: unit edits systemd has not loaded yet"
+      when: _det_do_remove | bool
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - |
+            systemctl list-units --all --no-legend --plain --full 2>/dev/null \
+              | awk '$2 == "loaded" { print $1 }' \
+              | xargs -r -d '\n' systemctl show -p Id,NeedDaemonReload -- 2>/dev/null \
+              | awk 'function flush() { if (nd == "yes" && id != "") print "U " id; id = ""; nd = "" }
+                     /^Id=/ { id = substr($0, 4) }
+                     /^NeedDaemonReload=/ { nd = substr($0, 18) }
+                     /^$/ { flush() }
+                     END { flush() }'
+            exit 0
+      register: _det_pf_ndr_rm
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Detection preflight R08-5: a daemon-reload must not load edits of yours"
+      when: _det_do_remove | bool
+      ansible.builtin.assert:
+        quiet: true
+        that: _det_pending_units | length == 0
+        fail_msg: >-
+          [R08-5] {{ inventory_hostname }} has unit edits systemd has not loaded yet:
+          {{ _det_pending_units | join(', ') }}. Taking auto_sec's detection units out ends with a
+          daemon-reload, which would load them too. Check them, run sudo systemctl daemon-reload
+          yourself, then run again. Nothing has been changed.
+      vars:
+        _det_pending_units: >-
+          {{ _det_pf_ndr_rm.stdout_lines | default([]) | select('match', '^U ') | map('regex_replace', '^U ', '')
+             | select('match', '^[A-Za-z0-9@._:\\\\-]{1,128}$')
+             | reject('match', '^auto-sec-(alert|login-watch|alive|check|notify@)') | unique | list }}
+
+# --- Only a test message (-e detection_test_alert=true, nothing else asked) --------
+
+- name: "Detection preflight: a test message on demand"
+  when:
+    - _det_role_runs | bool
+    - _det_want == 'nothing'
+    - _det_test_forced | bool
+    - (_det_now.detect.own | default(false)) and (_det_now.conf.own | default(false))
+  ansible.builtin.set_fact:
+    _det_plan: {write: [], dirs: [], links: [], reload: false, units: {}, pam: false, test: true, fresh: false, names: [], now: "{{ _det_now }}"}
+    _det_apply: true
+
+# --- Notes, the plan and the report line ---------------------------------------------
+
+- name: "Detection preflight: Webmin's settings (two words of them, read-only)"
+  when:
+    - _det_role_runs | bool
+    - _det_want == 'install'
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - |
+        f=$1
+        [ -f "$f" ] || { echo "W absent"; exit 0; }
+        s=$(sed -n 's/^syslog=\([01]\)$/\1/p' -- "$f" | tail -n 1)
+        p=$(sed -n 's/^pam=\([a-z][a-z0-9_-]\{0,31\}\)$/\1/p' -- "$f" | tail -n 1)
+        echo "W present syslog=${s:-unset} pam=${p:-unset}"
+      - sh
+      - "{{ _det_webmin_conf }}"
+  register: _det_pf_webmin
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Detection preflight: notes"
+  when: _det_role_runs | bool
+  ansible.builtin.set_fact:
+    _det_notes: >-
+      {%- set out = [] -%}
+      {%- if (_det_status.verdict | default('')) == 'dead' -%}
+      {%- set _ = out.append('[W08-2] ' ~ _det_status.line ~ ". Alerts may not reach you. On the server: sudo auto-sec-detect status") -%}
+      {%- elif (_det_status.line | default('')) | length > 0 -%}
+      {%- set _ = out.append(_det_status.line) -%}
+      {%- endif -%}
+      {%- if _det_status.test_mode | default(false) | bool -%}
+      {%- set _ = out.append('TEST MODE: messages go to a sink on the server itself, not to Telegram') -%}
+      {%- endif -%}
+      {%- if _det_want == 'nothing' and (_det_installed | bool) -%}
+      {%- set _ = out.append("[N08-1] login alerts of an earlier run stay on this server and keep working (detection_enabled: false removes nothing). To take them out, run once with -e detection_remove=true: the plan then lists every file and the PAM line that go.") -%}
+      {%- endif -%}
+      {%- if _det_want == 'install' -%}
+      {%- if not (_det_hook_wanted | bool) and not (_det_hook_there | default(false) | bool) -%}
+      {%- set _ = out.append("[N08-2] journal reader only (detection_login_hook: false): no PAM file is touched. A login is then seen from the lines sshd, login, su and sudo write to the journal; a door that logs nothing there is not seen.") -%}
+      {%- elif not (_det_hook_wanted | bool) -%}
+      {%- set _ = out.append("[N08-2] detection_login_hook is false, but the login hook of an earlier run is still in PAM and keeps working (false removes nothing). To take it out, remove detection (-e detection_remove=true) and install it again.") -%}
+      {%- endif -%}
+      {%- if (_det_hook_on | default(false) | bool) and (_ssh_enabled | default(false) | bool) and (_ssh_before.root.usepam | default('yes') | lower) == 'no' -%}
+      {%- set _ = out.append("[N08-3] sshd runs with UsePAM no on this server: the login hook does not see SSH logins. The journal reader does, and every SSH alert will say that the hook did not report it.") -%}
+      {%- endif -%}
+      {%- set w = (_det_pf_webmin.stdout_lines | default([]) | select('match', '^W present syslog=(0|1|unset) pam=([a-z][a-z0-9_-]{0,31}|unset)$') | first | default('')) -%}
+      {%- if w | length > 0 -%}
+      {%- if 'syslog=1' in w and ('pam=webmin' in w or 'pam=usermin' in w or 'pam=unset' in w) -%}
+      {%- set _ = out.append("[N08-4] Webmin is installed: its logins are read from the journal (its line \"Successful login as ...\") and, for accounts it checks with PAM, by the login hook. Webmin itself is not changed.") -%}
+      {%- else -%}
+      {%- set _ = out.append("[N08-4] Webmin is installed, but it does not log to syslog under the name webmin (" ~ w[10:] ~ " in miniserv.conf): the journal reader does not see its logins. The login hook sees those of accounts Webmin checks with PAM. Webmin itself is not changed.") -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- if (_det_quiet_accounts | length == 0) and (_det_quiet_fps | length == 0) -%}
+      {%- set _ = out.append("[N08-5] the quiet list is empty: every login sends a message, also the logins of auto_sec's own runs. To keep them quiet, put the key's fingerprint (ssh-keygen -lf <key>.pub) in detection_quiet_ssh_keys.") -%}
+      {%- endif -%}
+      {%- if (_ssh_local_mode | default(false) | bool) and (_det_plan.pam | default(false) | bool) -%}
+      {%- set _ = out.append("[N08-8] local mode: the login test after the PAM change is `su` on the server itself, not a new SSH login from your computer.") -%}
+      {%- endif -%}
+      {%- endif -%}
+      {{ out }}
+
+# "what" holds your values and constant names only; what was read on the
+# host goes in "note".
+- name: "Detection preflight: plan lines (install or change)"
+  when:
+    - _det_role_runs | bool
+    - _det_apply | bool
+  ansible.builtin.set_fact:
+    _plan_08: >-
+      {%- set out = [] -%}
+      {%- if _det_plan.dirs | length > 0 -%}
+      {%- set _ = out.append({'role': '08', 'part': 'detection', 'do': 'write', 'what': 'folders, root only (0700): ' ~ (_det_plan.dirs | join(', ')), 'note': ''}) -%}
+      {%- endif -%}
+      {%- for n in _det_plan.write -%}
+      {%- set what = _det_targets[n].dest -%}
+      {%- if n == 'conf' -%}
+      {%- set what = what ~ ' (0600): the Telegram token and chat id; quiet accounts: ' ~ ((_det_quiet_accounts | join(', ')) or 'none')
+                     ~ '; quiet SSH keys: ' ~ ((_det_quiet_labels | join(', ')) or 'none')
+                     ~ '; daily message at ' ~ detection_heartbeat_time ~ ' server time; '
+                     ~ ('login hook and journal reader' if (_det_hook_on | bool) else 'journal reader only')
+                     ~ ('; TEST MODE: messages go to ' ~ _det_ci_api if (_det_ci_api | length > 0) else '') -%}
+      {%- elif n == 'alive_timer' -%}
+      {%- set what = what ~ ': daily at ' ~ detection_heartbeat_time ~ ' server time' -%}
+      {%- endif -%}
+      {%- set _ = out.append({'role': '08', 'part': 'detection', 'do': ('write' if (_det_now[n].type | default('absent')) == 'absent' else 'replace'), 'what': what, 'note': ''}) -%}
+      {%- endfor -%}
+      {%- if _det_plan.reload | bool -%}
+      {%- set _ = out.append({'role': '08', 'part': 'detection', 'do': 'daemon-reload', 'what': 'systemd (a detection unit file changes)', 'note': ''}) -%}
+      {%- endif -%}
+      {%- for r in _det_run -%}
+      {%- set act = _det_plan.units[r.unit] | default('') -%}
+      {%- set link = r.unit in _det_plan.links -%}
+      {%- if act | length > 0 or link -%}
+      {%- set _ = out.append({'role': '08', 'part': 'detection',
+                              'do': ('timer' if r.unit.endswith('.timer') else (act or 'enable')),
+                              'what': r.unit ~ ': ' ~ r.what ~ (' (start at boot)' if link else '') ~ ((' (' ~ act ~ ')') if act | length > 0 else ''),
+                              'note': ''}) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- if _det_plan.pam | bool -%}
+      {%- set _ = out.append({'role': '08', 'part': 'pam', 'do': 'write', 'what': _det_profile ~ ' (the PAM profile, "Default: no")', 'note': ''}) -%}
+      {%- set _ = out.append({'role': '08', 'part': 'pam', 'do': 'write',
+                              'what': "/etc/pam.d/common-session: one line added with pam-auth-update --enable: '" ~ _det_pam_line_shown
+                                      ~ "' (it also updates its own records in /var/lib/pam and in debconf's database); put back after "
+                                      ~ (detection_revert_seconds | int) ~ ' s unless a login test works',
+                              'note': _det_pam_note}) -%}
+      {%- if not ((_ssh_enabled | default(false) | bool) and (_ssh_role_runs | default(false) | bool) and (_ssh_needs_write | default(false) | bool))
+            and not (_fw_will_turn_on | default(false) | bool) -%}
+      {%- set _ = out.append({'role': '08', 'part': 'undo', 'do': 'write',
+                              'what': _det_guard_bin ~ ' and /etc/systemd/system/' ~ _det_guard_unit ~ ' (the automatic undo)',
+                              'note': 'written only where they differ from the files already there'}) -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- if _det_plan.fresh | bool -%}
+      {%- set _ = out.append({'role': '08', 'part': 'detection', 'do': 'network-call',
+                              'what': 'from now on, from the server to api.telegram.org: a message at every login that is not quiet, one a day at '
+                                      ~ detection_heartbeat_time ~ ', and one when detection stops or has a problem', 'note': ''}) -%}
+      {%- endif -%}
+      {%- if _det_plan.test | bool -%}
+      {%- set _ = out.append({'role': '08', 'part': 'detection', 'do': 'network-call',
+                              'what': 'one test message now, from the server to api.telegram.org', 'note': 'the run prints its id'}) -%}
+      {%- endif -%}
+      {{ out }}
+
+- name: "Detection preflight: plan lines (removal)"
+  when:
+    - _det_role_runs | bool
+    - _det_do_remove | bool
+  ansible.builtin.set_fact:
+    _plan_08: >-
+      {%- set out = [] -%}
+      {%- if (_det_now.detect.own | default(false)) and (_det_now.conf.own | default(false)) -%}
+      {%- set _ = out.append({'role': '08', 'part': 'removal', 'do': 'network-call',
+                              'what': 'one last message, from the server to api.telegram.org: login alerts are being taken out', 'note': ''}) -%}
+      {%- endif -%}
+      {%- if _det_plan.pam | bool -%}
+      {%- set _ = out.append({'role': '08', 'part': 'pam', 'do': 'write',
+                              'what': "/etc/pam.d/common-session: auto_sec's line taken out with pam-auth-update --remove"
+                                      ~ " (it also updates its own records in /var/lib/pam and in debconf's database); put back after "
+                                      ~ (detection_revert_seconds | int) ~ ' s unless a login test works',
+                              'note': _det_pam_note}) -%}
+      {%- set _ = out.append({'role': '08', 'part': 'pam', 'do': 'remove', 'what': _det_profile, 'note': ''}) -%}
+      {%- if not ((_ssh_enabled | default(false) | bool) and (_ssh_role_runs | default(false) | bool) and (_ssh_needs_write | default(false) | bool))
+            and not (_fw_will_turn_on | default(false) | bool) -%}
+      {%- set _ = out.append({'role': '08', 'part': 'undo', 'do': 'write',
+                              'what': _det_guard_bin ~ ' and /etc/systemd/system/' ~ _det_guard_unit ~ ' (the automatic undo)',
+                              'note': 'written only where they differ from the files already there'}) -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- for r in _det_run -%}
+      {%- if (_det_now[_det_unit_file[r.unit]].type | default('absent')) == 'file' or r.unit in _det_plan.rm_links -%}
+      {%- set _ = out.append({'role': '08', 'part': 'removal', 'do': 'stop', 'what': r.unit, 'note': ''}) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- for u in _det_plan.rm_links -%}
+      {%- set _ = out.append({'role': '08', 'part': 'removal', 'do': 'remove',
+                              'what': _det_unit_dir ~ '/' ~ (_det_run | selectattr('unit', 'equalto', u) | map(attribute='wants') | first) ~ '/' ~ u ~ ' (a link)', 'note': ''}) -%}
+      {%- endfor -%}
+      {%- for n in _det_plan.rm_files -%}
+      {%- set _ = out.append({'role': '08', 'part': 'removal', 'do': 'remove', 'what': _det_targets[n].dest, 'note': ''}) -%}
+      {%- endfor -%}
+      {%- if _det_plan.rm_dirs | length > 0 -%}
+      {%- set _ = out.append({'role': '08', 'part': 'removal', 'do': 'remove',
+                              'what': "auto_sec's own files in " ~ _det_queue ~ ' and ' ~ _det_state ~ ', then the folders that are empty: ' ~ (_det_plan.rm_dirs | join(', ')),
+                              'note': "a file that is not auto_sec's stays, and so does its folder"}) -%}
+      {%- endif -%}
+      {%- set _ = out.append({'role': '08', 'part': 'removal', 'do': 'daemon-reload', 'what': 'systemd (the detection units are gone)', 'note': ''}) -%}
+      {{ out }}
+  vars:
+    _det_unit_file:
+      auto-sec-alert.service: sender
+      auto-sec-login-watch.service: watch
+      auto-sec-alert.path: path
+      auto-sec-alive.timer: alive_timer
+      auto-sec-check.timer: check_timer
+
+- name: "Detection preflight: notes for the plan, and the report line"
+  ansible.builtin.set_fact:
+    _plan_08_notes: >-
+      {{ _det_notes
+         + ((["removal: nothing of auto_sec's detection is on this server"])
+            if (_det_want == 'remove' and (_det_role_runs | bool) and not (_det_do_remove | bool)) else [])
+         + ((['a test message was asked for (-e detection_test_alert=true), but login alerts are not installed on this server'])
+            if (_det_want == 'nothing' and (_det_test_forced | bool) and (_det_role_runs | bool) and not (_det_apply | bool)) else []) }}
+    _det_report: >-
+      {%- if not (_det_role_runs | bool) -%}not checked in this run (role 08 is not selected by --tags)
+      {%- elif _det_want == 'remove' and (_det_do_remove | bool) -%}being taken out by this run (-e detection_remove=true)
+      {%- elif (_det_status.verdict | default('')) in ['on', 'dead'] -%}{{ _det_status.line }}{{ ' (' ~ ('login hook and journal reader' if _det_status.mode == 'hook+journal' else 'journal reader only') ~ ')' if (_det_status.mode | default('') | length > 0) else '' }}{{ '; detection_enabled is false, and that removes nothing' if _det_want == 'nothing' else '' }}
+      {%- elif _det_installed | bool -%}files of auto_sec's login alerts are on the server, but their status could not be read
+      {%- elif _det_want == 'install' -%}not installed yet: this run installs it
+      {%- else -%}off (detection_enabled: false): no login alerts from auto_sec on this server
+      {%- endif -%}
+
+# The plan shows role 08's notes only when the tags select role 08 and it
+# has something to say there; a dead detector is said in every case.
+- name: "Detection preflight W08-2: detection is DEAD"
+  when:
+    - _det_role_runs | bool
+    - (_det_status.verdict | default('')) == 'dead'
+  ansible.builtin.debug:
+    msg: >-
+      [W08-2] WARNING: {{ _det_status.line }} on {{ inventory_hostname }}. Alerts may not reach you.
+      On the server: sudo auto-sec-detect status
+
+- name: "Detection preflight: summary"
+  when:
+    - _det_role_runs | bool
+    - _det_cfg | bool
+  ansible.builtin.debug:
+    msg:
+      asked_for: "{{ {'install': 'detection_enabled: true', 'remove': '-e detection_remove=true', 'nothing': 'detection_enabled: false'}[_det_want] }}"
+      installed_now: "{{ _det_installed }}"
+      status: "{{ _det_status.line | default('not installed') }}"
+      sensors: "{{ ('login hook and journal reader' if (_det_hook_on | bool) else 'journal reader only') if _det_want == 'install' else '-' }}"
+      this_run: >-
+        {{ ('writes ' ~ (_det_plan.write | default([]) | length) ~ ' file(s), ' ~ (_det_plan.units | default({}) | length) ~ ' unit(s) to start or restart'
+            ~ (', the PAM line' if (_det_plan.pam | default(false) | bool) else '') ~ (', a test message' if (_det_plan.test | default(false) | bool) else ''))
+           if (_det_apply | bool) else ('takes detection out' if (_det_do_remove | bool) else 'no change') }}
+      notes: "{{ _det_notes }}"

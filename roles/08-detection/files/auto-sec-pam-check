@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""auto-sec-pam-check - trial run of auto_sec's one PAM change (role 08).
+
+Read-only. Role 08 runs it as root with `python3 -I -c <this file>`, as one
+argv list without a shell, in its preflight and again right before the
+change. It answers: what would pam-auth-update do on THIS host?
+
+How: it copies the five common PAM files (/etc/pam.d/common-*),
+pam-auth-update's own records (/var/lib/pam/*) and the profiles
+(/usr/share/pam-configs/*) into a scratch folder (--work, on tmpfs, root
+only, removed by the caller), and runs the host's own pam-auth-update
+there with --root. debconf gets a database of its own in the same scratch
+folder (DEBCONF_SYSTEMRC), so nothing on the host is written: not the PAM
+files, not /var/lib/pam, not debconf's database.
+
+The trial runs:
+  base    pam-auth-update --package              nothing asked for. If this
+          alone changes a file, changes that are not auto_sec's are waiting
+  probe   --package, with one more profile that is only in the copy. Does
+          this pam-auth-update read the copy's profiles at all? Ubuntu
+          22.04's reads the host's own before it reads --root
+  enable  --package --enable auto-sec-login-alert   with auto_sec's profile
+          (--candidate) in the copy
+  remove  --package --remove auto-sec-login-alert   and the profile deleted
+
+pam-auth-update exits 0 when it refuses hand-edited files; it only says
+"Local modifications to /etc/pam.d/common-*, not updating." This helper
+reads that, and compares every file before and after.
+
+Two guards around the trial itself:
+  - pam-auth-update ignores an option it does not know, without a word.
+    One that has no --root option would run every "trial" on the host's
+    real PAM files. So this helper first reads the tool (a Perl script)
+    for that option, and starts nothing when it is not there
+    ("root_option": false, "usable": false).
+  - It takes the checksums of the host's own files before the first
+    trial and after the last one. A file that differs is listed in
+    "host_changed": something else changed it at that moment, or this
+    pam-auth-update wrote outside the copy (R08-P7).
+
+It also reads the files in /etc/pam.d for one more question: does a PAM
+service read a user's own environment file (pam_env.so user_readenv=1)
+before the common session lines run? The login hook runs as root with
+PAM's environment, so on such a server role 08 does not add it (R08-P6).
+
+Usage:
+  auto-sec-pam-check --work DIR --expect-line LINE [--candidate FILE]
+                     [--before FILE] [--sysroot DIR] [--tool PATH]
+    --expect-line  the one line auto_sec's profile adds to common-session,
+                   as pam-auth-update writes it (a role constant)
+    --candidate    auto_sec's profile, rendered from role constants
+    --before       the checksums kept when detection was installed
+                   (/var/lib/auto-sec/detect/pam-before.json)
+    --sysroot, --tool   lab only (tests/detection): read the host files
+                   under another root; another pam-auth-update
+
+Prints one JSON object. Every string that came from the host is cut to
+printable ASCII, with "{" and "}" replaced by "?" (so it can never be read
+as a template), and shortened. Exit 0 = the JSON is the answer; 2 = usage.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+
+PROFILE = "auto-sec-login-alert"
+HEADER = "X-Written-By: auto_sec (role 08). auto_sec changes this file only while this line is first."
+COMMON = ["common-auth", "common-account", "common-password", "common-session", "common-session-noninteractive"]
+STATE = ["auth", "account", "password", "session", "session-noninteractive", "seen"]
+REFUSED = "Local modifications to /etc/pam.d/common-*, not updating."
+HOOK_WORD = "auto-sec-login-hook"
+# A profile that exists only in a trial copy: does pam-auth-update read the
+# copy's profiles? Its "Default: no" keeps it out of every PAM file.
+PROBE = "auto-sec-trial-probe"
+PROBE_TEXT = ("Name: auto_sec trial probe (only ever in a scratch copy)\nDefault: no\nPriority: 0\n"
+              "Session-Type: Additional\nSession:\n\toptional\tpam_permit.so\n")
+TOOL = "/usr/sbin/pam-auth-update"
+# How pam-auth-update (a Perl script) names its option for another root.
+ROOT_OPTION = b"'--root'"
+NO_ROOT_OPTION = ("this pam-auth-update has no --root option, so the change cannot be tried on a copy first "
+                  "(it would run on the real PAM files)")
+TEMPLATES = "/var/lib/dpkg/info/libpam-runtime.templates"
+MAX_PROFILES = 200
+MAX_BYTES = 262144
+
+
+def clean(text, limit=200):
+    text = "".join(c if 32 <= ord(c) < 127 else (" " if c == "\t" else "?") for c in str(text))
+    return text.replace("{", "?").replace("}", "?")[:limit]
+
+
+def kind(path):
+    """absent | file | link | other"""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return "absent"
+    if stat.S_ISLNK(st.st_mode):
+        return "link"
+    return "file" if stat.S_ISREG(st.st_mode) else "other"
+
+
+def sha(path):
+    if kind(path) != "file":
+        return kind(path)
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            h.update(fh.read(MAX_BYTES + 1))
+    except OSError:
+        return "unreadable"
+    return h.hexdigest()
+
+
+def read_lines(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(MAX_BYTES).decode("utf-8", "replace").split("\n")
+    except OSError:
+        return []
+
+
+def knows_root(tool):
+    """Does this pam-auth-update have a --root option?
+
+    It ignores an option it does not know, so one without --root would
+    take `--root <copy> --package` as plain `--package` and run on the
+    host's real files. Only a tool whose own text names the option is
+    ever started.
+    """
+    try:
+        with open(tool, "rb") as fh:
+            return ROOT_OPTION in fh.read(MAX_BYTES)
+    except OSError:
+        return False
+
+
+def targets():
+    return [("etc/pam.d/" + n) for n in COMMON] + [("var/lib/pam/" + n) for n in STATE]
+
+
+def snapshot(root):
+    return {rel: sha(os.path.join(root, rel)) for rel in targets()}
+
+
+def copy_host(sysroot, sim):
+    """Copy what pam-auth-update reads and writes. Returns problems found."""
+    problems = []
+    for d in ("etc/pam.d", "var/lib/pam", "usr/share/pam-configs"):
+        os.makedirs(os.path.join(sim, d), mode=0o700, exist_ok=True)
+    for rel in targets():
+        src = os.path.join(sysroot, rel)
+        k = kind(src)
+        if k == "file":
+            shutil.copy2(src, os.path.join(sim, rel))
+        elif k != "absent":
+            problems.append("/%s is a %s, not a plain file" % (rel, k))
+        elif rel.startswith("etc/pam.d/"):
+            problems.append("/%s is missing" % rel)
+    pdir = os.path.join(sysroot, "usr/share/pam-configs")
+    try:
+        names = sorted(os.listdir(pdir))
+    except OSError:
+        names = []
+        problems.append("/usr/share/pam-configs cannot be read")
+    if len(names) > MAX_PROFILES:
+        problems.append("/usr/share/pam-configs holds more than %d files" % MAX_PROFILES)
+        names = names[:MAX_PROFILES]
+    for name in names:
+        src = os.path.join(pdir, name)
+        if kind(src) == "file" and os.path.getsize(src) <= MAX_BYTES:
+            shutil.copy2(src, os.path.join(sim, "usr/share/pam-configs", name))
+    return problems
+
+
+def write_debconf(work):
+    """A debconf database of the trial's own, so the host's is never written."""
+    ddir = os.path.join(work, "debconf")
+    os.makedirs(ddir, mode=0o700, exist_ok=True)
+    conf = os.path.join(work, "debconf.conf")
+    with open(conf, "w", encoding="ascii") as fh:
+        fh.write("Config: configdb\nTemplates: templatedb\n\n"
+                 "Name: configdb\nDriver: File\nFilename: %s/config.dat\n\n"
+                 "Name: templatedb\nDriver: File\nFilename: %s/templates.dat\n" % (ddir, ddir))
+    return conf
+
+
+def run_tool(tool, sim, debconf_conf, extra):
+    env = {
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "LC_ALL": "C",
+        "DEBIAN_FRONTEND": "noninteractive",
+        "DEBCONF_SYSTEMRC": debconf_conf,
+        "DEBCONF_NOWARNINGS": "yes",
+        "HOME": "/nonexistent",
+    }
+    try:
+        p = subprocess.run([tool, "--root", sim] + extra, env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=120, check=False)
+        out = (p.stdout + b"\n" + p.stderr).decode("utf-8", "replace")
+        return {"rc": p.returncode, "refused": REFUSED in out,
+                "said": [clean(x) for x in out.split("\n") if x.strip()][:8]}
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"rc": -1, "refused": False, "said": [clean(type(exc).__name__ + ": " + str(exc))]}
+
+
+def line_diff(before, after):
+    """Lines only in `after` (added) and only in `before` (removed), by count."""
+    def count(lines):
+        c = {}
+        for ln in lines:
+            c[ln] = c.get(ln, 0) + 1
+        return c
+    cb, ca = count(before), count(after)
+    added, removed = [], []
+    for ln in after:
+        if ca.get(ln, 0) > cb.get(ln, 0) and ln not in added:
+            added.extend([ln] * (ca[ln] - cb.get(ln, 0)))
+    for ln in before:
+        if cb.get(ln, 0) > ca.get(ln, 0) and ln not in removed:
+            removed.extend([ln] * (cb[ln] - ca.get(ln, 0)))
+    return added, removed
+
+
+def in_additional_block(lines, wanted):
+    """Is `wanted` between the "Additional" marker and the end marker?"""
+    inside = False
+    for ln in lines:
+        if ln.startswith('# and here are more per-package modules (the "Additional" block)'):
+            inside = True
+        elif ln.startswith("# end of pam-auth-update config"):
+            inside = False
+        elif inside and ln == wanted:
+            return True
+    return False
+
+
+def user_env_early(root):
+    """PAM services that read a user's own environment file before the hook runs.
+
+    pam_exec gives PAM's environment to the program it starts, and for the
+    login hook that program runs as root. On a stock Debian or Ubuntu
+    nothing a user chose is in that environment when the common session
+    lines run: sshd reads ~/.pam_environment (pam_env.so user_readenv=1,
+    where the release still has it) only after them. A PAM file that reads
+    it earlier would let that user hand root a variable such as LD_PRELOAD.
+    Returns [[service, "auth" | "session"], ...] for the services whose
+    session stack holds the common session lines.
+    """
+    pdir = os.path.join(root, "etc/pam.d")
+    try:
+        names = sorted(n for n in os.listdir(pdir) if re.match(r"^[A-Za-z0-9_.@-]{1,64}$", n))[:MAX_PROFILES]
+    except OSError:
+        return []
+    files = {}
+    for name in names:
+        path = os.path.join(pdir, name)
+        if os.path.isfile(path):
+            files[name] = read_lines(path)
+
+    def flat(name, want, depth, seen):
+        """One stack of one service file, includes followed: [(file, module, args)]."""
+        out = []
+        if depth > 8 or name in seen or name not in files:
+            return out
+        for raw in files[name]:
+            tok = raw.split("#", 1)[0].split()
+            if not tok:
+                continue
+            if tok[0] == "@include":
+                if len(tok) > 1:
+                    out += flat(os.path.basename(tok[1]), want, depth + 1, seen | {name})
+                continue
+            if tok[0].lstrip("-") != want or len(tok) < 3:
+                continue
+            i = 1
+            if tok[1].startswith("["):
+                while i < len(tok) - 1 and not tok[i].endswith("]"):
+                    i += 1
+            rest = tok[i + 1:]
+            if tok[1] in ("include", "substack"):
+                if rest:
+                    out += flat(os.path.basename(rest[0]), want, depth + 1, seen | {name})
+            elif rest:
+                out.append((name, os.path.basename(rest[0]), rest[1:]))
+        return out
+
+    def reads_user_env(entry):
+        return entry[1] == "pam_env.so" and "user_readenv=1" in entry[2]
+
+    found = []
+    for svc in sorted(files):
+        if svc.startswith("common-"):
+            continue
+        session = flat(svc, "session", 0, frozenset())
+        first = next((i for i, e in enumerate(session) if e[0] == "common-session"), None)
+        if first is None:
+            continue        # this service never runs the common session lines
+        if any(reads_user_env(e) for e in flat(svc, "auth", 0, frozenset())):
+            found.append([clean(svc, 64), "auth"])
+        if any(reads_user_env(e) for i, e in enumerate(session) if i < first or e[0] == "common-session"):
+            found.append([clean(svc, 64), "session"])
+    return found[:10]
+
+
+def trial(tool, sysroot, work, name, extra, candidate, drop_profile, probe=False):
+    sim = os.path.join(work, name)
+    shutil.rmtree(sim, ignore_errors=True)
+    problems = copy_host(sysroot, sim)
+    prof = os.path.join(sim, "usr/share/pam-configs", PROFILE)
+    if probe:
+        with open(os.path.join(sim, "usr/share/pam-configs", PROBE), "w", encoding="ascii") as fh:
+            fh.write(PROBE_TEXT)
+    if candidate:
+        shutil.copyfile(candidate, prof)
+    if drop_profile and kind(prof) != "absent":
+        os.remove(prof)
+    before = snapshot(sim)
+    before_session = read_lines(os.path.join(sim, "etc/pam.d/common-session"))
+    conf = write_debconf(os.path.join(work, name + "-db"))
+    res = run_tool(tool, sim, conf, extra)
+    after = snapshot(sim)
+    after_session = read_lines(os.path.join(sim, "etc/pam.d/common-session"))
+    added, removed = line_diff(before_session, after_session)
+    res.update({
+        "problems": problems,
+        "changed": sorted("/" + rel for rel in targets() if before[rel] != after[rel]),
+        "after": {"/" + rel: after[rel] for rel in targets()},
+        "session_added": [clean(x, 300) for x in added][:20],
+        "session_removed": [clean(x, 300) for x in removed][:20],
+        "_added_raw": added,
+        "_removed_raw": removed,
+        "_after_session": after_session,
+    })
+    return res
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--work", required=True)
+    ap.add_argument("--expect-line", required=True)
+    ap.add_argument("--candidate", default="")
+    ap.add_argument("--before", default="")
+    ap.add_argument("--sysroot", default="/")
+    ap.add_argument("--tool", default=TOOL)
+    try:
+        a = ap.parse_args()
+    except SystemExit:
+        return 2
+    want = a.expect_line
+    root = a.sysroot
+    out = {"profile_name": PROFILE}
+
+    # --- what is there now -------------------------------------------------
+    tool_ok = kind(a.tool) == "file" and os.access(a.tool, os.X_OK)
+    modules = [os.path.join(root, d, m, "security/pam_exec.so").replace("//", "/")
+               for d in ("usr/lib", "lib") for m in sorted(_listdir(os.path.join(root, d)))]
+    modules += [os.path.join(root, d, "security/pam_exec.so") for d in ("usr/lib", "lib", "usr/lib64", "lib64")]
+    out["tool"] = tool_ok
+    out["root_option"] = tool_ok and knows_root(a.tool)
+    out["templates"] = kind(TEMPLATES) == "file" or a.tool != TOOL
+    out["pam_exec"] = any(kind(m) == "file" for m in modules)
+    out["timeout"] = kind(os.path.join(root, "usr/bin/timeout")) in ("file", "link") and \
+        os.access(os.path.join(root, "usr/bin/timeout"), os.X_OK)
+    prof = os.path.join(root, "usr/share/pam-configs", PROFILE)
+    pk = kind(prof)
+    first = read_lines(prof)[0] if pk == "file" else ""
+    out["profile"] = "absent" if pk == "absent" else ("ours" if (pk == "file" and first == HEADER) else "foreign")
+    out["profile_sha256"] = sha(prof) if pk == "file" else ""
+    out["candidate_sha256"] = sha(a.candidate) if a.candidate else ""
+    session_now = read_lines(os.path.join(root, "etc/pam.d/common-session"))
+    hook_lines = []
+    for n in COMMON:
+        for ln in read_lines(os.path.join(root, "etc/pam.d", n)):
+            if HOOK_WORD in ln and not ln.lstrip().startswith("#"):
+                hook_lines.append([n, ln])
+    # auto_sec's own lines: the one this release writes, and the ones the
+    # profile on the host gives while that profile carries auto_sec's header
+    # (an older release's line, which this run replaces).
+    own = {want}
+    if out["profile"] == "ours":
+        own.update("session" + ln for ln in read_lines(prof)[1:] if ln.startswith("\t"))
+    out["enabled"] = want in session_now
+    out["enabled_in_block"] = in_additional_block(session_now, want)
+    out["hook_lines"] = [[n, clean(ln, 300)] for n, ln in hook_lines][:10]
+    out["hook_lines_other"] = [[n, clean(ln, 300)] for n, ln in hook_lines
+                               if not (n == "common-session" and ln in own and in_additional_block(session_now, ln))][:10]
+    out["now"] = {"/" + rel: sha(os.path.join(root, rel)) for rel in targets()}
+    out["now"]["/usr/share/pam-configs/" + PROFILE] = sha(prof)
+    out["user_env_early"] = user_env_early(root)
+
+    usable = tool_ok and out["templates"] and out["root_option"]
+    out["usable"] = usable
+    out["host_changed"] = []
+    if not usable:
+        # Nothing is started. (Without the --root option the "trial" would
+        # be a real run.)
+        out["problems"] = [NO_ROOT_OPTION] if (tool_ok and not out["root_option"]) else []
+        print(json.dumps(out, sort_keys=True))
+        return 0
+
+    os.makedirs(a.work, mode=0o700, exist_ok=True)
+    host_before = snapshot(root)
+
+    # --- base: would pam-auth-update change anything by itself? -------------
+    # An exact copy of the host, nothing asked for. One change does not
+    # count: a profile of auto_sec's that is there but not enabled (it has
+    # "Default: no") gets its name noted in /var/lib/pam/seen.
+    seen_before = set(read_lines(os.path.join(root, "var/lib/pam/seen")))
+    base = trial(a.tool, root, a.work, "base", ["--package"], "", False)
+    seen_after = set(read_lines(os.path.join(a.work, "base", "var/lib/pam/seen")))
+    out["refused"] = bool(base["refused"])
+    out["problems"] = base["problems"]
+    out["base"] = _public(base)
+    pending = base["changed"] if not base["refused"] else []
+    if pending == ["/var/lib/pam/seen"] and (seen_after - seen_before) == {PROFILE} and seen_before <= seen_after:
+        pending = []
+    out["pending"] = pending
+
+    # --- does this pam-auth-update read the profiles of the copy? ---------------
+    # Ubuntu 22.04's reads /usr/share/pam-configs before it reads its --root
+    # option, so it always reads the host's profiles and never sees one that
+    # is only in the copy. It writes the name of every profile it read to
+    # "seen": the probe's name is missing there when it did not read the copy.
+    reads_copy = True
+    if a.candidate and not base["refused"]:
+        trial(a.tool, root, a.work, "probe", ["--package"], "", False, probe=True)
+        reads_copy = PROBE in read_lines(os.path.join(a.work, "probe", "var/lib/pam/seen"))
+    out["reads_copy"] = reads_copy
+
+    # --- enable ----------------------------------------------------------------
+    if a.candidate:
+        en = trial(a.tool, root, a.work, "enable", ["--package", "--enable", PROFILE], a.candidate, False)
+        added, removed = en["_added_raw"], en["_removed_raw"]
+        # Blind: the trial could not try the profile this run would install,
+        # because pam-auth-update read the host's profiles and the host has
+        # no such profile yet, or another version of it. Role 08 then runs
+        # this trial again right after it has put the profile in place,
+        # under the automatic undo and before pam-auth-update is run for
+        # real. (With the same profile already on the host, what it read is
+        # what the run installs: the trial is good.)
+        blind = (not reads_copy) and out["profile_sha256"] != out["candidate_sha256"]
+        # The only allowed difference in common-session: auto_sec's line comes
+        # in (once), and an older line of auto_sec's own may go.
+        ours_gone = [ln for ln in removed if HOOK_WORD in ln]
+        allowed_files = {"/etc/pam.d/common-session", "/var/lib/pam/session", "/var/lib/pam/seen"}
+        en_ok = (
+            en["rc"] == 0 and not en["refused"] and not en["problems"]
+            and want in en["_after_session"] and en["_after_session"].count(want) == 1
+            and in_additional_block(en["_after_session"], want)
+            and [ln for ln in added if ln != want] == []
+            and len(ours_gone) == len(removed)
+            and set(en["changed"]) <= allowed_files
+        )
+        out["enable"] = _public(en)
+        out["enable"]["ok"] = bool(en_ok) and not blind
+        out["enable"]["blind"] = bool(blind)
+        out["enable"]["noop"] = en["changed"] == [] and not blind
+        out["enable"]["unexpected"] = sorted(set(en["changed"]) - allowed_files)
+
+    # --- remove ----------------------------------------------------------------
+    rm = trial(a.tool, root, a.work, "remove", ["--package", "--remove", PROFILE], "", True)
+    radded, rremoved = rm["_added_raw"], rm["_removed_raw"]
+    allowed_files = {"/etc/pam.d/common-session", "/var/lib/pam/session", "/var/lib/pam/seen"}
+    rm_ok = (
+        rm["rc"] == 0 and not rm["refused"] and not rm["problems"]
+        and radded == [] and [ln for ln in rremoved if HOOK_WORD not in ln] == []
+        and not any(HOOK_WORD in ln for ln in rm["_after_session"] if not ln.lstrip().startswith("#"))
+        and set(rm["changed"]) <= allowed_files
+    )
+    out["remove"] = _public(rm)
+    out["remove"]["ok"] = bool(rm_ok)
+    out["remove"]["noop"] = rm["changed"] == []
+    out["remove"]["unexpected"] = sorted(set(rm["changed"]) - allowed_files)
+    # Byte for byte as before detection was installed?
+    orig = _load_before(a.before)
+    if orig is None:
+        out["remove"]["as_before"] = "unknown"
+        out["remove"]["differs"] = []
+    else:
+        differs = sorted(p for p in rm["after"] if p in orig and orig[p] != rm["after"][p])
+        out["remove"]["as_before"] = "yes" if not differs else "no"
+        out["remove"]["differs"] = differs
+    # The trials write only their copies. The host's own files must be what
+    # they were before the first trial.
+    host_after = snapshot(root)
+    out["host_changed"] = sorted("/" + rel for rel in targets() if host_before[rel] != host_after[rel])
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
+def _listdir(path):
+    try:
+        return [n for n in os.listdir(path) if re.match(r"^[A-Za-z0-9_.-]+-linux-gnu[A-Za-z0-9_]*$", n)]
+    except OSError:
+        return []
+
+
+def _public(res):
+    return {k: v for k, v in res.items() if not k.startswith("_")}
+
+
+def _load_before(path):
+    """The checksums kept at install: {"/etc/pam.d/common-auth": "<sha256>", ...}"""
+    if not path or kind(path) != "file":
+        return None
+    try:
+        with open(path, encoding="ascii") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    good = {}
+    for k, v in data.items():
+        if isinstance(k, str) and isinstance(v, str) and re.match(r"^(absent|[0-9a-f]{64})$", v) and k in ["/" + t for t in targets()]:
+            good[k] = v
+    return good or None
+
+
+if __name__ == "__main__":
+    sys.exit(main())

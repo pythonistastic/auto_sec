@@ -1,0 +1,14 @@
+# Written by auto_sec (role 08). auto_sec changes this file only while this line is first.
+[Unit]
+Description=auto_sec login alerts: the daily "still alive" message
+OnSuccess=auto-sec-notify@%n.service
+OnFailure=auto-sec-notify@%n.service
+
+[Timer]
+# Server time. After a time the server was off, it is sent at the next start.
+OnCalendar=*-*-* {{ detection_heartbeat_time }}:00
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

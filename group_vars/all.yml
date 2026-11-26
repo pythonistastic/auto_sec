@@ -324,7 +324,7 @@ backup_retention_daily: 7
 backup_retention_weekly: 4
 backup_retention_monthly: 6
 
-# Alerts (Telegram bot): backup status and the CVE watch.
+# Alerts (Telegram bot): login alerts, backup status and the CVE watch.
 telegram_bot_token: "CHANGE_ME"
 telegram_chat_id: "CHANGE_ME"
 
@@ -333,12 +333,68 @@ telegram_chat_id: "CHANGE_ME"
 # it in the same run); roles 05 and 07 use it.
 app_dir: "/opt/app"
 
-# Detection (roles 08 and 09) is not managed in 0.6: the 0.1-0.5 detectors
-# did not work as documented (issue #18). auto_sec installs nothing there
-# and warns when old detectors are still on a server. Their variables
-# (watcher_*, revshell_*, recon_*, ssh_pattern_watcher_enabled) do nothing
-# in 0.6; the run lists them when they are set. Detection returns,
-# rewritten, in 0.7.
+# --- Login alerts (role 08) ----------------------------------------------
+# Off on every server, existing or new. With true, the server sends a
+# Telegram message for every login that is not on your quiet list: on the
+# console, over SSH, with su, sudo -i, sudo -s and Webmin. It only tells
+# you. It never ends a session, bans an address or locks an account.
+# It needs telegram_bot_token and telegram_chat_id (the run stops without
+# them, R08-1). Every run then says "detection: on, last alive message
+# <time>" or "detection: DEAD since <time>" in the plan and the report.
+# The limits: if the server cannot reach Telegram, no message can tell you
+# so. Watch for the daily message. And whoever is root on the server can
+# switch all of it off.
+detection_enabled: false
+
+# true: both sensors. The login hook is one line in /etc/pam.d/common-session,
+# added with Debian's own pam-auth-update, under the automatic undo.
+# false: journal reader only. No PAM file is touched. Use it where your
+# common PAM files have hand edits (the run then stops with R08-P1 and
+# says so).
+detection_login_hook: true
+
+# Accounts whose logins send no message. They are counted in the daily
+# message. root cannot be listed: a root login is quiet only over SSH with
+# one of the keys below. An account listed here is quiet however it logs
+# in, also with a password: list only accounts you trust that far. (Its
+# login on the console still sends a message.)
+detection_quiet_accounts: []
+
+# SSH keys whose logins send no message, for any account (this is how
+# auto_sec's own runs stay quiet). Each item is a fingerprint as
+# `ssh-keygen -lf key.pub` prints it, or a mapping with a label:
+#   - "SHA256:91kTeUIf2aJCD8UWjmPB35/8mOW3iviwpjZ8Yz+JXR8"
+#   - { fingerprint: "SHA256:kYCVg3P00Hi90avKsg7gku5eBXW1oNQSGxCAndEHFOQ", label: "auto_sec runs" }
+# Never quiet, whatever is listed: a console login, a root SSH login with a
+# password or with another key, and root through su, sudo or Webmin.
+detection_quiet_ssh_keys: []
+
+# When the daily "still alive" message is sent, in the server's own time.
+# Quoted, "HH:MM". If it stops coming, detection is dead (or Telegram
+# cannot be reached).
+detection_heartbeat_time: "09:00"
+
+# true: a test message when a run installs or changes detection. The run
+# prints its id: look for it in your chat. To send one on any run, pass
+# -e detection_test_alert=true.
+detection_test_alert: true
+
+# Seconds the automatic undo waits for the login test after the PAM change
+# (120-1800).
+detection_revert_seconds: 300
+
+# One-off switch: pass with -e on one run, never in host_vars, and only
+# with detection_enabled: false. Takes detection out again: the PAM line
+# (with pam-auth-update --remove, under the automatic undo), the units and
+# every file of auto_sec's own. The plan lists each one first.
+# detection_enabled: false alone removes nothing.
+detection_remove: false
+
+# The detectors of auto_sec 0.1-0.5 (role 09, and role 08's audit rules) did
+# not work as documented (issue #18) and are gone. auto_sec warns when they
+# are still on a server. Their variables (watcher_*, revshell_*, recon_*,
+# ssh_pattern_watcher_enabled) do nothing; the run lists them when they are
+# set.
 
 # --- CVE watch (role 11) -------------------------------------------------
 # Off by default. When on, it adds a daily root timer that reads the

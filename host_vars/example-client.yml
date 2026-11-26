@@ -149,8 +149,25 @@ cve_watch_min_severity: "high"   # low | moderate | high | critical
 # cve_watch_include_dev: false   # dev-only deps are not shipped
 # cve_watch_hour: 6              # daily scan hour (local time)
 
-# Detection (roles 08/09) is not managed in 0.6 (issue #18), so there are
-# no watcher_* or revshell_* settings here any more.
+# --- Login alerts (role 08) --------------------------------------------
+# Off by default, also on a new server. With true, the server sends a
+# Telegram message for every login that is not on your quiet list
+# (console, SSH, su, sudo -i, sudo -s, Webmin), one "still alive" message a
+# day, and one when detection itself stops. It only tells you: it ends no
+# session and bans nobody. It needs telegram_bot_token and telegram_chat_id
+# (group_vars/all.yml or your vault).
+# detection_enabled: true
+# The key auto_sec's own runs log in with, so that they stay quiet
+# (`ssh-keygen -lf ~/.ssh/id_ed25519.pub` prints the fingerprint):
+# detection_quiet_ssh_keys:
+#   - { fingerprint: "SHA256:REPLACE-WITH-YOUR-KEYS-FINGERPRINT", label: "my laptop" }
+# detection_quiet_accounts: ["backup-pull"]   # never root
+# detection_heartbeat_time: "09:00"           # the daily message; QUOTE it
+# detection_login_hook: false                 # journal reader only: no PAM file is touched
+# To take login alerts out again: set detection_enabled: false and run
+# once with -e detection_remove=true.
+# (The detectors of auto_sec 0.1-0.5 are gone, issue #18: there are no
+# watcher_* or revshell_* settings any more.)
 
 # --- An existing server ---------------------------------------------------
 # A server that already runs something (the auto_sec canary, for example)
@@ -165,6 +182,7 @@ cve_watch_min_severity: "high"   # low | moderate | high | critical
 #   fail2ban_hardening_enabled: keep  # your jail.local stays in charge
 #   firewall_state: keep              # auto_sec runs no ufw command
 #   cve_watch_enabled: false
+#   detection_enabled: false          # login alerts: off until you turn them on
 #   ssh_admin_user: root
 #   ssh_admin_public_keys: ["ssh-ed25519 AAAA... you@laptop"]
 #   ssh_permit_root_login: keep

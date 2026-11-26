@@ -357,7 +357,7 @@ if [ "$DB_ENGINE" != "none" ]; then
 fi
 
 # ------------------------------------------------------------------ alerts
-say "Telegram alerts (backup status and the CVE watch)"
+say "Telegram alerts (login alerts, backup status and the CVE watch)"
 note "1) In Telegram, open @BotFather and run /newbot to get a bot TOKEN."
 note "2) Open your new bot and press START / send it any message"
 note "   (Telegram won't let a bot message you until you do)."
@@ -690,6 +690,39 @@ if confirm "Turn on the CVE watch?" n; then
     || die "Not a usable folder: $APP_DIR (an absolute path like /opt/app)"
 fi
 
+# ------------------------------------------------------------ login alerts
+# Role 08, off unless chosen, and only offered when Telegram is set: without
+# a bot and a chat no alert could go out (the run would stop with R08-1).
+say "Login alerts (role 08)"
+note "The server sends you a Telegram message when someone logs in: on the"
+note "console, over SSH, with su or sudo, or in Webmin. It only tells you."
+note "It ends no session and bans nobody. Once a day it says that it is"
+note "still alive. It adds one line to the server's PAM settings (under the"
+note "automatic undo) and a few small services, all run by root."
+note "If the server cannot reach Telegram, no message can tell you so: watch"
+note "for the daily message."
+DETECT="false"; QUIET_FP=""
+if [ "$TG_TOKEN" != "CHANGE_ME" ] && [ "$TG_CHAT" != "CHANGE_ME" ]; then
+  if confirm "Turn on login alerts?" n; then
+    DETECT="true"
+    # Your own key can stay quiet, so auto_sec's own runs do not message you.
+    FP="$(ssh-keygen -lf /dev/stdin <<<"$DEPLOY_PUBKEY" 2>/dev/null | awk '{print $2}' || true)"
+    if [[ "$FP" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]]; then
+      note "Logins with your own key (${FP}) can stay quiet."
+      note "Otherwise every auto_sec run sends you a message too. A root login"
+      note "with a password or with any other key always sends one."
+      confirm "Keep logins with this key quiet?" y && QUIET_FP="$FP"
+    else
+      note "Every login will send a message, also auto_sec's own runs. To keep"
+      note "your key quiet later, add its fingerprint (ssh-keygen -lf key.pub)"
+      note "to detection_quiet_ssh_keys in $HOSTVARS."
+    fi
+  fi
+else
+  note "Login alerts need the Telegram bot from above, so they stay off."
+  note "You can turn them on later in $HOSTVARS (detection_enabled: true)."
+fi
+
 # ------------------------------------------------------------ approval
 say "Your OK before changes"
 note "Every run first prints a plan: what it would change, and a plan id."
@@ -717,9 +750,9 @@ fi
 # source of a newline is a .pub file holding more than one key.
 for v in ACCOUNT ADMIN_USER AGE_PUBLIC APP_DIR APP_PORT APP_TYPE APPROVE AUTOSEC_SERVER \
          B2_APP_KEY B2_BUCKET B2_KEY_ID CLIENT_NAME CVE DB_ENGINE DB_NAME DB_PASSWORD \
-         DB_USER DEPLOY_PUBKEY DEPLOY_USER DOMAIN EGRESS EXCLUDE_DOCKER FW_STATE \
+         DB_USER DEPLOY_PUBKEY DEPLOY_USER DETECT DOMAIN EGRESS EXCLUDE_DOCKER FW_STATE \
          FWKNOP_HMAC FWKNOP_KEY HOST_CHOICE LE_EMAIL NODE_VERSION NOW_USER OFFICE_IP \
-         PARANOIA PASSWORD_AUTH PCAP_INTF PERMIT_ROOT REBOOT_CHOICE REBOOT_TIME \
+         PARANOIA PASSWORD_AUTH PCAP_INTF PERMIT_ROOT QUIET_FP REBOOT_CHOICE REBOOT_TIME \
          SERVER_IP SSH_KEY_FILE TG_CHAT TG_TOKEN TZ_CHOICE; do
   case "${!v-}" in
     *$'\n'*|*$'\r'*) die "$v contains a newline; refusing to write $HOSTVARS. (A .pub file with several keys? Pick one.)" ;;
@@ -805,6 +838,15 @@ say "Writing ${HOSTVARS}"
   echo "# CVE watch (role 11): sends app_dir's package names and versions to"
   echo "# api.osv.dev once a day when true."
   echo "cve_watch_enabled: $(yaml_str "${CVE}")"
+  echo
+  echo "# Login alerts (role 08): a Telegram message for every login that is not"
+  echo "# on your quiet list. false removes nothing: to take them out again, run"
+  echo "# once with -e detection_remove=true."
+  echo "detection_enabled: $(yaml_str "${DETECT}")"
+  if [ -n "$QUIET_FP" ]; then
+    echo "detection_quiet_ssh_keys:"
+    echo "  - { fingerprint: $(yaml_str "${QUIET_FP}"), label: 'your own key' }"
+  fi
   echo
   echo "telegram_bot_token: $(yaml_str "${TG_TOKEN}")"
   echo "telegram_chat_id: $(yaml_str "${TG_CHAT}")"
@@ -969,6 +1011,11 @@ fi
 if [ "$APPROVE" = "true" ]; then
   note "A run that would change the server stops at the plan until you add"
   note "-e autosec_approve=<plan id> (the id the plan prints)."
+fi
+if [ "$DETECT" = "true" ]; then
+  note "Login alerts: the run sends a test message and prints its id. Look for"
+  note "that id in your Telegram chat. Every later run says in its plan"
+  note "whether detection is on, and when the last daily message went out."
 fi
 note "auto_sec is a personal research project, not a finished product. Try"
 note "it on a throwaway server first, and do not put the playbook in cron."

@@ -9,7 +9,7 @@
 # files back at an absolute deadline. After a reboot inside the window,
 # auto-sec-ssh-guard-boot.service puts them back before sshd and ufw start.
 #
-#   arm <id> <deadline_epoch_utc> [--f2b-ignore <ip>] [--ufw] -- <path>...
+#   arm <id> <deadline_epoch_utc> [--f2b-ignore <ip>] [--ufw | --pam] -- <path>...
 #                   Snapshot each path (or note that it is absent), then
 #                   start the revert timer. Refuses with 7 (another change
 #                   is pending), 8 (the CURRENT config fails sshd -t),
@@ -20,6 +20,11 @@
 #                   `ufw --force disable`, then puts the paths back. sshd -t
 #                   (here) and the sshd reload (at revert) then happen only
 #                   when a path is under /etc/ssh/.
+#                   --pam (role 08 adding or removing its login hook with
+#                   pam-auth-update): a revert only puts the paths back. PAM
+#                   reads its files at every login, so nothing is reloaded.
+#                   sshd -t and the sshd reload happen only when a path is
+#                   under /etc/ssh/, as with --ufw.
 #   check <id>      0 = armed by <id> and the timer is waiting.
 #                   3 = already reverted or deadline passed, 4 = not
 #                   pending, 6 = pending but the revert timer is not active.
@@ -83,7 +88,7 @@ warn() { "$LOGGER" -t "$TAG" -p user.err -- "$*" >/dev/null 2>&1 || true; printf
 
 usage() {
   cat >&2 <<'EOF'
-usage: auto-sec-ssh-guard arm <id> <deadline_epoch_utc> [--f2b-ignore <ip>] [--ufw] -- <path>...
+usage: auto-sec-ssh-guard arm <id> <deadline_epoch_utc> [--f2b-ignore <ip>] [--ufw | --pam] -- <path>...
        auto-sec-ssh-guard check <id>
        auto-sec-ssh-guard disarm <id>
        auto-sec-ssh-guard revert <id> | revert --boot
@@ -179,9 +184,9 @@ verdict() {  # <before> <written> <current>
 
 short() { case $1 in sha256:*) echo "${1:0:19}" ;; *) echo "$1" ;; esac; }
 
-# Whether a change involves sshd: always without --ufw (role 02's own
-# changes); with --ufw only when one of its paths is under /etc/ssh/.
-touches_sshd() {  # <ufw: 0|1> <path>...
+# Whether a change involves sshd: always without --ufw or --pam (role 02's
+# own changes); with one of them only when a path is under /etc/ssh/.
+touches_sshd() {  # <--ufw or --pam given: 0|1> <path>...
   local p
   [ "$1" = 1 ] || return 0
   shift
@@ -193,7 +198,7 @@ touches_sshd() {  # <ufw: 0|1> <path>...
 
 # ------------------------------------------------------------------- arm
 cmd_arm() {
-  local id deadline ip='' ufw=0 p q n t cal st
+  local id deadline ip='' ufw=0 pam=0 plain=0 p q n t cal st
   local -a paths=()
   [ $# -ge 2 ] || usage
   id=$1 deadline=$2
@@ -206,10 +211,13 @@ cmd_arm() {
         valid_ip "$2" || { warn "bad --f2b-ignore address"; exit 2; }
         ip=$2; shift 2 ;;
       --ufw) ufw=1; shift ;;
+      --pam) pam=1; shift ;;
       --) shift; break ;;
       *) warn "unexpected argument before --: $1"; exit 2 ;;
     esac
   done
+  if [ "$ufw" = 1 ] && [ "$pam" = 1 ]; then warn "arm: --ufw and --pam are two kinds of change: give one"; exit 2; fi
+  if [ "$ufw" = 1 ] || [ "$pam" = 1 ]; then plain=1; fi
   [ $# -gt 0 ] || { warn "arm: no paths after --"; exit 2; }
   [ $# -le "$MAX_PATHS" ] || { warn "arm: at most $MAX_PATHS paths"; exit 2; }
   for p in "$@"; do
@@ -233,7 +241,7 @@ cmd_arm() {
     warn "another change ($(pending_id)) is still pending: refusing to arm. See: auto-sec-ssh-guard status"
     exit 7
   fi
-  if touches_sshd "$ufw" "${paths[@]}"; then
+  if touches_sshd "$plain" "${paths[@]}"; then
     sshd_test || { warn "the CURRENT config fails sshd -t: refusing to arm (the undo target must be valid)"; exit 8; }
   fi
 
@@ -261,6 +269,7 @@ cmd_arm() {
   printf '%s\n' "$deadline" > "$RUN.new/deadline"
   [ -z "$ip" ] || printf '%s\n' "$ip" > "$RUN.new/f2b_ignore"
   [ "$ufw" = 0 ] || printf '1\n' > "$RUN.new/ufw"
+  [ "$pam" = 0 ] || printf '1\n' > "$RUN.new/pam"
   if ! { rm -rf -- "$RUN" && mv -- "$RUN.new" "$RUN"; }; then warn "arm: cannot install the snapshot"; exit 1; fi
   rm -f -- "$STATE_DIR/reverted.$id"
   find "$STATE_DIR" -maxdepth 1 -name 'reverted.*' -mtime +7 -delete 2>/dev/null
@@ -347,7 +356,7 @@ drop_f2b_ignore() {  # <boot: 0|1>
 }
 
 do_revert() {  # <id|--boot>; caller holds the lock. Returns 0, 1 or 4.
-  local want=$1 boot=0 ufw=0 id t deadline in_window i n d p before written cur v rc=0
+  local want=$1 boot=0 ufw=0 plain=0 id t deadline in_window i n d p before written cur v rc=0
   local -a notes=() rpaths=()
   [ "$want" = --boot ] && boot=1
   id=$(pending_id)
@@ -373,6 +382,8 @@ do_revert() {  # <id|--boot>; caller holds the lock. Returns 0, 1 or 4.
   (( t <= deadline + GRACE )) && in_window=1
   [ "$boot" = 1 ] && log "boot: undoing pending change $id before sshd and ufw start"
   [ -e "$RUN/ufw" ] && ufw=1
+  # --ufw and --pam: sshd is not part of the change (unless a path is its).
+  if [ -e "$RUN/ufw" ] || [ -e "$RUN/pam" ]; then plain=1; fi
 
   # --ufw: turn ufw off first, then put its files back (ufw's disable
   # rewrites ufw.conf). At boot ufw has not started yet: files only.
@@ -422,8 +433,8 @@ do_revert() {  # <id|--boot>; caller holds the lock. Returns 0, 1 or 4.
   done
 
   if [ "$boot" = 0 ]; then
-    if ! touches_sshd "$ufw" "${rpaths[@]}"; then
-      :  # a ufw-only change: sshd's files were not part of it
+    if ! touches_sshd "$plain" "${rpaths[@]}"; then
+      :  # a ufw-only or PAM-only change: sshd's files were not part of it
     elif sshd_test; then
       if "$SYSTEMCTL" try-reload-or-restart ssh.service; then
         log "sshd reloaded"
@@ -505,6 +516,7 @@ cmd_status() {
     fi
     [ -s "$RUN/f2b_ignore" ] && echo "fail2ban: a revert removes the controller's runtime ignore"
     [ -e "$RUN/ufw" ] && echo "ufw:      a revert turns ufw off first (ufw --force disable)"
+    [ -e "$RUN/pam" ] && echo "pam:      a revert puts the PAM files back (nothing is reloaded)"
   fi
   n=$(cat -- "$RUN/count")
   for ((i = 1; i <= n; i++)); do

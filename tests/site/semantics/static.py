@@ -16,7 +16,10 @@ Checks:
   modules   no apt, ufw or sysctl module anywhere; cron only in role 07
   sysctl    no write module has /etc/sysctl.conf as its destination
   audit     no command runs augenrules, auditctl -R or restarts auditd
-  absent    roles 08 and 09 have no task with state: absent
+  absent    role 09 has no task with state: absent; role 08 only for its
+            own scratch folder ({{ _det_sim_dir }}). Role 08 removes its own
+            files in tasks/remove.yml with a script that checks each
+            file's header line right before the delete
   sudoers   only role 01 writes under /etc/sudoers.d
   enable    systemd tasks with enabled: true only in roles 04-07
 """
@@ -161,7 +164,8 @@ for role, f, t in tasks:
             if "sudoers.d" in dest and not role.startswith("01-"):
                 sudo_bad.append(where)
         if role.startswith(("08-", "09-")) and str(args.get("state", "")) == "absent":
-            absent_bad.append(where)
+            if not (role.startswith("08-") and dest.strip() == "{{ _det_sim_dir }}"):
+                absent_bad.append(where)
         if name in ("systemd", "systemd_service", "service") and str(args.get("enabled", "")).lower() in ("true", "yes", "1", "on"):
             if not role.startswith(("04-", "05-", "06-", "07-")):
                 enable_bad.append(where)

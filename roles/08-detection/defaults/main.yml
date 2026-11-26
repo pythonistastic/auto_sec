@@ -1,12 +1,197 @@
 ---
 # Role 08 (detection) defaults.
 #
-# auto_sec 0.6 does not manage detection. Role 08 installs nothing and
-# writes nothing; it only looks for the audit rules file that auto_sec
-# 0.1-0.5 wrote and warns when it is still there (tasks/legacy.yml). The
-# rewritten detection comes in 0.7. Role 08 has no settings in 0.6.
+# Login alerts: a Telegram message for every login that is not on your
+# quiet list, through any door: the console, SSH, su, sudo and Webmin. The
+# public settings are documented in group_vars/all.yml, which site.yml
+# reads and which beats these defaults. The same values stay here so that
+# the role behaves the same in a playbook without group_vars
+# (tests/detection). CI checks that both files hold the same values.
+#
+# Off on every server, existing or new. Nothing is installed or changed
+# until you set detection_enabled: true.
+detection_enabled: false
+
+# true: both sensors. The login hook is one line in /etc/pam.d/common-session,
+# added with Debian's own pam-auth-update, under the automatic undo.
+# false: journal reader only. No PAM file is touched. Use it where your
+# common PAM files have hand edits (the run then stops with R08-P1 and
+# says so).
+detection_login_hook: true
+
+# Accounts whose logins send no message. They are counted in the daily
+# message. root cannot be listed: a root login is quiet only over SSH with
+# one of the keys below. An account listed here is quiet however it logs
+# in, also with a password: list only accounts you trust that far. (Its
+# login on the console still sends a message.)
+detection_quiet_accounts: []
+
+# SSH keys whose logins send no message, for any account (this is how
+# auto_sec's own runs stay quiet). Each item is a fingerprint as
+# `ssh-keygen -lf key.pub` prints it, or a mapping with a label:
+#   - "SHA256:91kTeUIf2aJCD8UWjmPB35/8mOW3iviwpjZ8Yz+JXR8"
+#   - { fingerprint: "SHA256:kYCVg3P00Hi90avKsg7gku5eBXW1oNQSGxCAndEHFOQ", label: "auto_sec runs" }
+detection_quiet_ssh_keys: []
+
+# When the daily "still alive" message is sent, in the server's own time.
+# Quoted, "HH:MM".
+detection_heartbeat_time: "09:00"
+
+# true: a test message when a run installs or changes detection. To send
+# one on any run, pass -e detection_test_alert=true.
+detection_test_alert: true
+
+# Seconds the automatic undo waits for the login test after the PAM change
+# (120-1800).
+detection_revert_seconds: 300
+
+# One-off switch: pass with -e on one run, never in host_vars, and only
+# with detection_enabled: false. Takes detection out again: the PAM line
+# (with pam-auth-update --remove, under the automatic undo), the units and
+# every file of auto_sec's own. The plan lists each one first.
+detection_remove: false
 
 # --- Role-internal constants. These are not settings: do not override. ---
+
+# Line 1 of every file role 08 writes (line 2 of the two scripts, after
+# their #! line). auto_sec changes or removes a file only while it carries
+# this line.
+_det_header: "# Written by auto_sec (role 08). auto_sec changes this file only while this line is first."
+_det_header_py: "# Written by auto_sec (role 08). auto_sec changes this file only while this line is second."
+# A PAM profile has fields, not comments: its first field is the header.
+_det_header_pam: "X-Written-By: auto_sec (role 08). auto_sec changes this file only while this line is first."
+
+_det_bin: /usr/local/sbin/auto-sec-detect
+_det_hook: /usr/local/sbin/auto-sec-login-hook
+_det_conf_dir: /etc/auto-sec
+_det_conf: /etc/auto-sec/detect.conf
+_det_spool: /var/spool/auto-sec
+_det_queue: /var/spool/auto-sec/events
+_det_state: /var/lib/auto-sec/detect
+_det_unit_dir: /etc/systemd/system
+_det_profile_name: auto-sec-login-alert
+_det_profile: /usr/share/pam-configs/auto-sec-login-alert
+_det_python: /usr/bin/python3
+
+# The files, by a short name: where each one goes, where it comes from
+# (files/ or templates/), its mode, and which header line proves it is
+# auto_sec's. The PAM profile is not here: it goes in under the undo.
+_det_targets:
+  detect: {dest: "{{ _det_bin }}", src: auto-sec-detect, mode: "0700", header: 2}
+  hook: {dest: "{{ _det_hook }}", src: auto-sec-login-hook, mode: "0700", header: 2}
+  conf: {dest: "{{ _det_conf }}", template: detect.conf.j2, mode: "0600", header: 1}
+  watch: {dest: "{{ _det_unit_dir }}/auto-sec-login-watch.service", src: auto-sec-login-watch.service, mode: "0644", header: 1}
+  sender: {dest: "{{ _det_unit_dir }}/auto-sec-alert.service", src: auto-sec-alert.service, mode: "0644", header: 1}
+  path: {dest: "{{ _det_unit_dir }}/auto-sec-alert.path", src: auto-sec-alert.path, mode: "0644", header: 1}
+  alive_timer: {dest: "{{ _det_unit_dir }}/auto-sec-alive.timer", template: auto-sec-alive.timer.j2, mode: "0644", header: 1}
+  alive: {dest: "{{ _det_unit_dir }}/auto-sec-alive.service", src: auto-sec-alive.service, mode: "0644", header: 1}
+  check_timer: {dest: "{{ _det_unit_dir }}/auto-sec-check.timer", src: auto-sec-check.timer, mode: "0644", header: 1}
+  check: {dest: "{{ _det_unit_dir }}/auto-sec-check.service", src: auto-sec-check.service, mode: "0644", header: 1}
+  notify: {dest: "{{ _det_unit_dir }}/auto-sec-notify@.service", src: auto-sec-notify@.service, mode: "0644", header: 1}
+# In journal-reader-only mode the hook is not installed.
+_det_hook_only: [hook]
+# Written in this order; the units come last.
+_det_order: [detect, hook, conf, watch, sender, path, alive_timer, alive, check_timer, check, notify]
+_det_unit_names: [watch, sender, path, alive_timer, alive, check_timer, check, notify]
+# What is installed in this run: without the hook in journal-reader-only mode.
+_det_names: "{{ _det_order | reject('in', ([] if (_det_hook_on | default(true) | bool) else _det_hook_only)) | list }}"
+
+# The folders role 08 makes (root only).
+_det_dirs:
+  - {path: "{{ _det_conf_dir }}", mode: "0700"}
+  - {path: "{{ _det_spool }}", mode: "0700"}
+  - {path: "{{ _det_queue }}", mode: "0700"}
+  - {path: "{{ _det_state }}", mode: "0700"}
+
+# The units that stay up, in the order they are started, and the link that
+# starts each one at boot (a link, not `systemctl enable`: that reloads
+# systemd).
+_det_run:
+  - {unit: auto-sec-alert.service, wants: multi-user.target.wants, what: "the sender"}
+  - {unit: auto-sec-login-watch.service, wants: multi-user.target.wants, what: "the journal reader"}
+  - {unit: auto-sec-alert.path, wants: paths.target.wants, what: "wakes the sender when an event waits"}
+  - {unit: auto-sec-alive.timer, wants: timers.target.wants, what: "the daily message"}
+  - {unit: auto-sec-check.timer, wants: timers.target.wants, what: "the checker, every 5 minutes"}
+# Which units to start again when a file changed (by short name of the file).
+_det_restart_for:
+  detect: [auto-sec-alert.service, auto-sec-login-watch.service]
+  conf: [auto-sec-alert.service, auto-sec-login-watch.service]
+  watch: [auto-sec-login-watch.service]
+  sender: [auto-sec-alert.service]
+  path: [auto-sec-alert.path]
+  alive_timer: [auto-sec-alive.timer]
+  check_timer: [auto-sec-check.timer]
+
+# The one line the PAM profile adds to /etc/pam.d/common-session, exactly
+# as pam-auth-update writes it (type, tab, control, tab, module, options).
+_det_pam_line: "session\toptional\tpam_exec.so quiet seteuid type=open_session /usr/bin/timeout -s KILL 1 /usr/local/sbin/auto-sec-login-hook"
+_det_pam_line_shown: "session optional pam_exec.so quiet seteuid type=open_session /usr/bin/timeout -s KILL 1 /usr/local/sbin/auto-sec-login-hook"
+# The files pam-auth-update writes: the five common PAM files and its own
+# records.
+_det_pam_files:
+  - /etc/pam.d/common-auth
+  - /etc/pam.d/common-account
+  - /etc/pam.d/common-password
+  - /etc/pam.d/common-session
+  - /etc/pam.d/common-session-noninteractive
+  - /var/lib/pam/auth
+  - /var/lib/pam/account
+  - /var/lib/pam/password
+  - /var/lib/pam/session
+  - /var/lib/pam/session-noninteractive
+  - /var/lib/pam/seen
+# What the automatic undo keeps a copy of before the PAM change: those
+# files and the profile.
+_det_guard_paths: "{{ (_det_pam_files | map('regex_replace', '^', _det_pam_root) | list) + [_det_profile] }}"
+# The checksums of those files (without the profile) from before detection
+# was installed: a removal says whether they are byte for byte the same.
+_det_pam_before: /var/lib/auto-sec/detect/pam-before.json
+# While a run restarts or removes detection units, this file (tmpfs, root
+# only) keeps the "the watcher was stopped" message quiet. The run lets it
+# run out 20 seconds after it is done; left behind by a run that died, it
+# counts for 15 minutes.
+_det_planned: /run/auto-sec/detect-planned
+
+# Role 02's undo guard (the same paths as in role 02's defaults).
+_det_guard_bin: /usr/local/sbin/auto-sec-ssh-guard
+_det_guard_pending: /var/lib/auto-sec/ssh-guard/pending
+_det_guard_unit: auto-sec-ssh-guard-boot.service
+
+# Scratch space for the plan and the PAM trial (tmpfs, root only, removed).
+_det_run_dir: /run/auto-sec
+_det_sim_dir: /run/auto-sec/det-sim
+
+_det_user_re: '^[a-z_][a-z0-9_-]{0,31}$'
+_det_fp_re: '^SHA256:[A-Za-z0-9+/]{43}$'
+_det_label_re: '^[A-Za-z0-9][A-Za-z0-9 ._@()-]{0,39}$'
+_det_time_re: '^([01][0-9]|2[0-3]):[0-5][0-9]$'
+_det_bool_words: ["true", "false", "yes", "no", "1", "0", "on", "off"]
+_det_yes_words: ["true", "yes", "1", "on"]
+
+# How role 08 reaches the host's tools. Only the unprivileged lab
+# (tests/detection/semantics) changes these, to point at lab trees and
+# stubs; never set them for a real host.
+_det_file_owner: root
+_det_file_group: root
+_det_pam_tool: /usr/sbin/pam-auth-update
+# Lab: the trial helper reads a lab tree (--sysroot), the real
+# pam-auth-update writes one (--root, with a debconf database of the
+# lab's), and the PAM files are under that tree.
+_det_pam_lab_args: []
+_det_pam_real_args: []
+_det_pam_real_env: {}
+_det_pam_root: ""
+_det_systemctl: systemctl
+_det_webmin_conf: /etc/webmin/miniserv.conf
+_det_elsewhere_dirs: [/lib/systemd/system, /usr/lib/systemd/system, /run/systemd/system]
+# The login test on the server after the PAM change: su without a login
+# shell, so root's profile scripts cannot fail it. PAM runs the same
+# session stack as for `su -`.
+_det_su_argv: [su, root, -s, /bin/sh, -c, "exit 0"]
+# How role 08 runs auto-sec-detect on the host (status, test, goodbye).
+_det_cmd: ["{{ _det_python }}", "-I", "{{ _det_bin }}"]
+
+# --- auto_sec 0.1-0.5's audit rules (tasks/legacy.yml, W08-1) --------------
 
 # Where augenrules reads its rule files.
 _l08_rules_dir: /etc/audit/rules.d
@@ -18,7 +203,7 @@ _l08_rules_dir: /etc/audit/rules.d
 #   0.1.0-0.2.1  hardening.rules, always with the authorized_keys line
 #   0.3.0-0.5    90-autosec.rules, with the line only when the deploy
 #                user's authorized_keys existed
-# Any other content is yours. auto_sec 0.6 never deletes either file.
+# Any other content is yours. auto_sec never deletes either file.
 _l08_legacy_files:
   - name: hardening.rules
     versions: "0.1-0.2"

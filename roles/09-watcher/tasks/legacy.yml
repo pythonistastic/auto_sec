@@ -1,8 +1,9 @@
 ---
 # roles/09-watcher/tasks/legacy.yml
 #
-# Role 09 in auto_sec 0.6: read-only. It installs nothing, writes nothing,
-# starts and stops nothing. Detection returns, rewritten, in 0.7.
+# Role 09: read-only. It installs nothing, writes nothing, starts and stops
+# nothing. It only looks for the detectors auto_sec 0.1-0.5 installed. The
+# login alerts of 0.7 are role 08.
 #
 # site.yml imports this file in pre_tasks (tags always), after role 08's
 # legacy.yml, and includes it again as layer 09 (tag watcher). Only the
@@ -15,22 +16,22 @@
 # /etc/systemd/system, or the 5-minute audit scan in root's crontab (the
 # line Ansible's cron module wrote above it). Those detectors do not work
 # as documented, so the warning asks you to remove them by hand.
-# N09-1: the 0.1-0.5 detector variables that are set do nothing in 0.6.
+# N09-1: the 0.1-0.5 detector variables that are set do nothing.
 #
 # Trust boundary (SECURITY.md): only names and states are read. Root's
 # crontab is searched with grep -Fx for the one fixed line (yes or no), so
 # nothing of it leaves the host. Unit states are compared with fixed words.
 #
 # Facts set on every host:
-#   _plan_09        list  [] (role 09 changes nothing in 0.6)
+#   _plan_09        list  [] (role 09 changes nothing)
 #   _l09_role_runs  bool  the tags select role 09 ("watcher" or "detection")
 #   _l09_found      list  what was found, as shown in W09-1
-#   _l09_report     str   one line for the report (role 10)
+#   _l09_report     str   for the report (role 10); empty when nothing is left
 #
 # The host reads run only when the tags select role 09, like the other
 # role preflights. N09-1 needs no host and runs with every tag.
 
-- name: "Watcher (0.6: not managed): look for auto_sec 0.1-0.5's detectors"
+- name: "Watcher legacy: look for auto_sec 0.1-0.5's detectors"
   when: not (_l09_done | default(false) | bool)
   block:
     - name: "Watcher legacy: start every role 09 fact from a safe value"
@@ -42,15 +43,15 @@
              and ('watcher' not in ansible_skip_tags) and ('detection' not in ansible_skip_tags)
              and ('tagged' not in ansible_skip_tags) and ('all' not in ansible_skip_tags) }}
         _l09_found: []
-        _l09_report: "not managed by auto_sec 0.6"
+        _l09_report: ""
 
-    - name: "Watcher legacy N09-1: detector variables that do nothing in 0.6"
+    - name: "Watcher legacy N09-1: detector variables that do nothing"
       when: _l09_set_vars | length > 0
       ansible.builtin.debug:
         msg: >-
           INFO: {{ _l09_set_vars | join(', ') }} {{ 'is' if (_l09_set_vars | length == 1) else 'are' }}
-          set but {{ 'does' if (_l09_set_vars | length == 1) else 'do' }} nothing in 0.6 (detection
-          returns in 0.7).
+          set but {{ 'does' if (_l09_set_vars | length == 1) else 'do' }} nothing (the detectors of 0.1-0.5 are gone; login alerts are
+          detection_enabled).
       vars:
         _l09_set_vars: "{{ query('varnames', '^(' ~ (_l09_ignored_vars | join('|')) ~ ')$') | sort }}"
 
@@ -122,6 +123,5 @@
     - name: "Watcher legacy: report line, and mark this pass done"
       ansible.builtin.set_fact:
         _l09_report: >-
-          {{ 'not managed by auto_sec 0.6' ~ ('; files of the auto_sec 0.1-0.5 detectors are still there'
-             if (_l09_found | length > 0) else '') }}
+          {{ 'files of the auto_sec 0.1-0.5 detectors are still there' if (_l09_found | length > 0) else '' }}
         _l09_done: true

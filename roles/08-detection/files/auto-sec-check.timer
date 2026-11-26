@@ -1,0 +1,14 @@
+# Written by auto_sec (role 08). auto_sec changes this file only while this line is first.
+[Unit]
+Description=auto_sec login alerts: the checker, every 5 minutes
+OnSuccess=auto-sec-notify@%n.service
+OnFailure=auto-sec-notify@%n.service
+
+[Timer]
+OnBootSec=2min
+OnActiveSec=45s
+OnUnitActiveSec=5min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

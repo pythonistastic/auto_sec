@@ -45,7 +45,7 @@
       {%- set row = {'id': r.id, 'name': r.name, 'state': 'noplan', 'text': 'NO PLAN: its changes are not listed', 'entries': [], 'notes': notes} -%}
       {%- elif items | length == 0 -%}
       {%- set row = {'id': r.id, 'name': r.name, 'state': 'nochange',
-                     'text': 'not managed in 0.6 (no change)' if (r.managed | default(true)) == false else 'no change',
+                     'text': 'not managed (no change)' if (r.managed | default(true)) == false else 'no change',
                      'entries': [], 'notes': notes} -%}
       {%- else -%}
       {%- set row = {'id': r.id, 'name': r.name, 'state': 'items', 'text': '', 'entries': items, 'notes': notes} -%}
@@ -129,6 +129,8 @@
     _plan_cnt_users: "{{ _plan_items | selectattr('do', 'equalto', 'user') | list | length }}"
     _plan_cnt_calls: "{{ _plan_items | selectattr('do', 'equalto', 'network-call') | list | length }}"
     _plan_cnt_fwon: "{{ _plan_items | selectattr('do', 'equalto', 'firewall-on') | list | length }}"
+    _plan_cnt_removed: "{{ _plan_items | selectattr('do', 'equalto', 'remove') | list | length }}"
+    _plan_cnt_stopped: "{{ _plan_items | selectattr('do', 'equalto', 'stop') | list | length }}"
     _plan_cnt_pkgs: "{{ _aptg_pf_missing | default([]) | length }}"
     _plan_l0407: "{{ _plan_rows | selectattr('id', 'in', ['04', '05', '06', '07']) | list }}"
     _plan_t_lines: >-
@@ -159,6 +161,8 @@
       {%- if (_plan_cnt_users | int) > 0 -%}{%- set _ = extra.append(_plan_cnt_users ~ ' account(s)') -%}{%- endif -%}
       {%- if (_plan_cnt_fwon | int) > 0 -%}{%- set _ = extra.append('ufw turned on') -%}{%- endif -%}
       {%- if (_plan_cnt_calls | int) > 0 -%}{%- set _ = extra.append(_plan_cnt_calls ~ ' outside service(s) called') -%}{%- endif -%}
+      {%- if (_plan_cnt_removed | int) > 0 -%}{%- set _ = extra.append(_plan_cnt_removed ~ ' removed') -%}{%- endif -%}
+      {%- if (_plan_cnt_stopped | int) > 0 -%}{%- set _ = extra.append(_plan_cnt_stopped ~ ' unit(s) stopped') -%}{%- endif -%}
       {%- if _plan_noplan | length > 0 -%}{%- set _ = extra.append('NO PLAN for role(s) ' ~ (_plan_noplan | join(', '))) -%}{%- endif -%}
       {%- set _ = out.append('  server: ' ~ _plan_cnt_files ~ ' files, ' ~ _plan_cnt_pkgs ~ ' packages, ' ~ _plan_cnt_services
                               ~ ' services (re)started, ' ~ _plan_cnt_rules ~ ' firewall rules'

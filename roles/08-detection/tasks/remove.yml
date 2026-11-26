@@ -1,0 +1,203 @@
+---
+# roles/08-detection/tasks/remove.yml - take login alerts out again.
+#
+# Only with -e detection_remove=true (and detection_enabled: false).
+# Included by main.yml when the preflight found something of auto_sec's
+# detection on the host and planned its removal. Not in --check.
+#
+# Elsewhere in auto_sec, setting a feature to false removes nothing. Login
+# alerts get a way out of their own, and an explicit one, because:
+#   - they put one line into the common PAM files, which every login
+#     reads. Nobody should have to take that line out by hand;
+#   - they keep a secret on the server (the Telegram token);
+#   - a watcher that is half gone would send "the watcher was stopped"
+#     for ever, or worse, look alive while a sensor is missing;
+#   - taking a watcher out must not happen by a typo or a default: it is
+#     a switch of its own, the plan lists every file, the plan id and your
+#     OK work as for any change, and a last message says that it happened.
+#
+#   X1  the files must be as the plan saw them (M08-1)
+#   X2  one last message: "login alerts are being taken out" (the run goes
+#       on when it cannot be sent, and says so)
+#   X3  the PAM line: pam-auth-update --remove under role 02's automatic
+#       undo, with the login tests (pam.yml)
+#   X4  stop auto_sec's units, delete their boot links
+#   X5  delete auto_sec's files. Each one is deleted only while it still
+#       carries auto_sec's header line (checked again on the host, right
+#       before the delete). Then the queue's and the state's own files,
+#       and the folders that are empty
+#   X6  daemon-reload (the units are gone), and what is left
+# What stays: the automatic undo (role 02's guard) and its boot unit, which
+# roles 02 and 03 use too; and two folders that others may share, when
+# they are empty: /var/lib/auto-sec and
+# /etc/systemd/system/paths.target.wants.
+
+- name: "Detection removal X1: what is there now"
+  ansible.builtin.include_tasks:
+    file: read.yml
+
+- name: "Detection M08-1: the files must be as the plan saw them"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _det_now == _det_plan.now
+    fail_msg: >-
+      [M08-1] A file of auto_sec's login alerts on {{ inventory_hostname }} changed during this run.
+      Nothing was removed. Run again and read the new plan.
+
+- name: "Detection removal: check mode"
+  when: ansible_check_mode
+  ansible.builtin.debug:
+    msg: >-
+      Check mode: the real run takes out {{ (_det_plan.rm_files | map('extract', _det_targets) | map(attribute='dest') | list
+      + ([_det_profile] if (_det_plan.pam | bool) else [])) | join(', ') }} and stops auto_sec's detection units.
+
+- name: "Detection removal: take it out"
+  when: not ansible_check_mode
+  block:
+    - name: "Detection removal X2: an auto_sec run is working on the detection units"
+      ansible.builtin.command:
+        argv: [sh, -c, 'umask 077; mkdir -p -- "${1%/*}" && : > "$1"', sh, "{{ _det_planned }}"]
+      changed_when: false
+
+    - name: "Detection removal X2: one last message"
+      when: (_det_now.detect.own | default(false)) and (_det_now.conf.own | default(false))
+      ansible.builtin.command:
+        argv: "{{ _det_cmd + ['goodbye'] }}"
+      register: _det_rm_bye
+      changed_when: true
+      failed_when: false
+
+    - name: "Detection removal X2: the last message could not be sent"
+      when:
+        - _det_rm_bye is not skipped
+        - (_det_rm_bye.rc | default(1)) != 0
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: the message "login alerts are being taken out" could not be sent from
+          {{ inventory_hostname }}. The removal goes on.
+
+    - name: "Detection removal X3: the login hook out of PAM, under the automatic undo"
+      when: _det_plan.pam | bool
+      ansible.builtin.include_tasks:
+        file: pam.yml
+      vars:
+        _det_pam_do: remove
+
+    - name: "Detection removal X4: stop auto_sec's detection units"
+      ansible.builtin.command:
+        argv: >-
+          {{ [_det_systemctl, 'stop'] + (_det_run | map(attribute='unit') | reverse | list)
+             + ['auto-sec-alive.service', 'auto-sec-check.service'] }}
+      register: _det_rm_stop
+      changed_when: true
+      failed_when: false
+
+    # One script on the host. A file goes only if it is a plain file whose
+    # header line is auto_sec's, checked right here; a link only if it
+    # points at auto_sec's unit. In the two folders only auto_sec's own
+    # names go. A folder goes only when it is empty. Prints what it did.
+    - name: "Detection removal X4-X5: delete auto_sec's links, files and empty folders"
+      ansible.builtin.command:
+        argv: >-
+          {{ ['sh', '-c', _det_rm_sh, 'sh', _det_header, _det_header_py, _det_queue, _det_state]
+             + _det_rm_specs + ['--'] + (_det_dirs | map(attribute='path') | reverse | list) }}
+      register: _det_rm_out
+      changed_when: "'removed ' in _det_rm_out.stdout"
+      vars:
+        _det_rm_specs: >-
+          {%- set out = [] -%}
+          {%- for r in _det_run -%}
+          {%- set _ = out.append('l=' ~ _det_unit_dir ~ '/' ~ r.wants ~ '/' ~ r.unit ~ '=' ~ _det_unit_dir ~ '/' ~ r.unit) -%}
+          {%- endfor -%}
+          {%- for n in _det_order | reverse -%}
+          {%- set _ = out.append(_det_targets[n].header ~ '=' ~ _det_targets[n].dest) -%}
+          {%- endfor -%}
+          {{ out }}
+        _det_rm_sh: |
+          H=$1; HP=$2; Q=$3; S=$4; shift 4
+          while [ $# -gt 0 ] && [ "$1" != -- ]; do
+            k=${1%%=*}; f=${1#*=}; shift
+            case $k in
+              l)
+                want=${f#*=}; f=${f%%=*}
+                if [ -L "$f" ] && [ "$(readlink -- "$f")" = "$want" ]; then rm -f -- "$f" && echo "removed $f"
+                elif [ -e "$f" ] || [ -L "$f" ]; then echo "left $f"; fi ;;
+              1 | 2)
+                if [ -f "$f" ] && [ ! -L "$f" ]; then
+                  if { [ "$k" = 1 ] && [ "$(head -n 1 -- "$f")" = "$H" ]; } || { [ "$k" = 2 ] && [ "$(sed -n 2p -- "$f")" = "$HP" ]; }; then
+                    rm -f -- "$f" && echo "removed $f"
+                  else echo "left $f"; fi
+                elif [ -e "$f" ] || [ -L "$f" ]; then echo "left $f"; fi ;;
+            esac
+          done
+          shift
+          if [ -d "$Q" ] && [ ! -L "$Q" ]; then
+            for f in "$Q"/[hjn].*.ev "$Q"/.tmp.*; do
+              if [ -f "$f" ] && [ ! -L "$f" ]; then rm -f -- "$f"; fi
+            done
+          fi
+          if [ -d "$S" ] && [ ! -L "$S" ]; then
+            for n in state.json state.json.new check.json check.json.new stopped.json stopped.json.new cursor cursor.new \
+                     sender.alive watch.alive pam-before.json pam-before.json.new; do
+              if [ -f "$S/$n" ] && [ ! -L "$S/$n" ]; then rm -f -- "$S/$n"; fi
+            done
+          fi
+          for d in "$@"; do
+            if [ -d "$d" ] && [ ! -L "$d" ]; then
+              if rmdir -- "$d" 2>/dev/null; then echo "removed $d"; else echo "left $d"; fi
+            fi
+          done
+
+    - name: "Detection removal X6: systemd forgets the units"
+      ansible.builtin.command:
+        argv: ["{{ _det_systemctl }}", daemon-reload]
+      changed_when: true
+
+    # A "the watcher was stopped" unit that started after its program was
+    # deleted has failed: forget it too.
+    - name: "Detection removal X6: forget the stop messages of this removal"
+      ansible.builtin.command:
+        argv: ["{{ _det_systemctl }}", reset-failed, "auto-sec-notify@*.service"]
+      changed_when: false
+      failed_when: false
+
+    - name: "Detection removal X6: what is left"
+      ansible.builtin.include_tasks:
+        file: read.yml
+
+    - name: "Detection removal X6: everything of auto_sec's detection must be gone"
+      ansible.builtin.assert:
+        quiet: true
+        that: _det_left | length == 0
+        fail_msg: >-
+          After the removal, these are still on {{ inventory_hostname }}: {{ _det_left | join(', ') }}
+          ({{ _det_rm_out.stdout_lines | default([]) | select('match', '^left ') | map('regex_replace', '[^ -~]', '?')
+          | map('regex_replace', '[{}]', '?') | join('; ') }}). A file that is no longer auto_sec's own, or a
+          folder that holds a file of yours, is left alone. Look at them by hand.
+      vars:
+        _det_left: >-
+          {{ (_det_order | select('in', _det_now | dict2items | rejectattr('value.type', 'equalto', 'absent') | map(attribute='key') | list)
+              | map('extract', _det_targets) | map(attribute='dest') | list)
+             + (_det_run | map(attribute='unit') | select('in', _det_now | dict2items | rejectattr('value.type', 'equalto', 'absent') | map(attribute='key') | list) | list)
+             + ([_det_profile] if (_det_now.profile.type | default('absent')) != 'absent' else [])
+             + ([_det_queue] if (_det_now[_det_queue].type | default('absent')) != 'absent' else []) }}
+
+    - name: "Detection removal: done"
+      ansible.builtin.set_fact:
+        _det_status: {}
+        _det_report: >-
+          taken out by this run (-e detection_remove=true){{ ': ' ~ _det_pam_note if (_det_plan.pam | bool) else '' }}
+
+    - name: "Detection removal: result"
+      ansible.builtin.debug:
+        msg: >-
+          Login alerts are out of {{ inventory_hostname }}.{{ (' PAM: ' ~ _det_pam_note ~ '.') if (_det_plan.pam | bool) else '' }}
+          The automatic undo (auto-sec-ssh-guard) stays: roles 02 and 03 use it too.
+
+  always:
+    - name: "Detection removal: the run is done with the detection units"
+      ansible.builtin.command:
+        argv: [rm, -f, --, "{{ _det_planned }}"]
+      changed_when: false
+      failed_when: false

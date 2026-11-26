@@ -1,0 +1,53 @@
+# Pinned PAM packages for tests/detection/semantics/run.sh.
+#
+# Format (whitespace separated, one file per line):
+#   <set> <pool file name> <sha256> <url> [<fallback url>...]
+# <set> is a distro codename. run.sh looks for the file in its --cache
+# directories first, then tries the URLs in order, and uses a file only if
+# its SHA256 matches. The first URL is the official archive pool; the second
+# is the official snapshot service, which keeps the exact file after the
+# archive drops a superseded version.
+#
+# The packages are only unpacked (dpkg-deb -x and -e) and read or run from
+# the unpack folder, without root. Nothing is installed.
+#   libpam-runtime  pam-auth-update (a Perl script), its debconf templates
+#                   and /usr/share/pam: all five releases
+#   libpam-modules  pam_exec.so: four releases. Ubuntu 26.04's build needs
+#                   glibc 2.43 and cannot load on the Ubuntu 24.04 image the
+#                   suite runs on, so it is not listed.
+#
+# Every SHA256 below is the one in the archive's own index (Packages.xz,
+# whose checksum is in InRelease) of the suite named in the comment. The
+# InRelease signatures of the Ubuntu suites and of Debian's bookworm,
+# bookworm-security and trixie-security were checked with gpgv; for
+# trixie's own InRelease this machine had no key (UNVERIFIED signature:
+# the debian-archive-keyring at hand is from 2023).
+# To bump a version: download the new .deb from the pool, check it the same
+# way, replace the file name, hash and both URLs, then run run.sh.
+
+# libpam-runtime 1.4.0-11ubuntu2.8 (jammy-updates)
+jammy libpam-runtime_1.4.0-11ubuntu2.8_all.deb e260c1c94c92a1b14ae231a02794efeb019e9acc1df03e37d1d4badd063e4fff https://archive.ubuntu.com/ubuntu/pool/main/p/pam/libpam-runtime_1.4.0-11ubuntu2.8_all.deb https://snapshot.ubuntu.com/ubuntu/20261125T120000Z/pool/main/p/pam/libpam-runtime_1.4.0-11ubuntu2.8_all.deb
+
+# libpam-modules 1.4.0-11ubuntu2.8 (jammy-updates)
+jammy libpam-modules_1.4.0-11ubuntu2.8_amd64.deb 5dea19867b356853b5d47d75ddf5e1ee240da12d6e897fadcdaec618a5737b2b https://archive.ubuntu.com/ubuntu/pool/main/p/pam/libpam-modules_1.4.0-11ubuntu2.8_amd64.deb https://snapshot.ubuntu.com/ubuntu/20261125T120000Z/pool/main/p/pam/libpam-modules_1.4.0-11ubuntu2.8_amd64.deb
+
+# libpam-runtime 1.5.3-5ubuntu5.7 (noble-updates)
+noble libpam-runtime_1.5.3-5ubuntu5.7_all.deb 879a23df25b1ba28801c9caf73f1ac36724bdff9834b5a0db7d0ac5ba6f8e191 https://archive.ubuntu.com/ubuntu/pool/main/p/pam/libpam-runtime_1.5.3-5ubuntu5.7_all.deb https://snapshot.ubuntu.com/ubuntu/20261125T120000Z/pool/main/p/pam/libpam-runtime_1.5.3-5ubuntu5.7_all.deb
+
+# libpam-modules 1.5.3-5ubuntu5.7 (noble-updates)
+noble libpam-modules_1.5.3-5ubuntu5.7_amd64.deb c8e86ef52e3a743dc67d90f4c6654f7f529deafa6a523fe9076e809785aeea18 https://archive.ubuntu.com/ubuntu/pool/main/p/pam/libpam-modules_1.5.3-5ubuntu5.7_amd64.deb https://snapshot.ubuntu.com/ubuntu/20261125T120000Z/pool/main/p/pam/libpam-modules_1.5.3-5ubuntu5.7_amd64.deb
+
+# libpam-runtime 1.7.0-5ubuntu3.2 (resolute-updates)
+resolute libpam-runtime_1.7.0-5ubuntu3.2_all.deb f95e8149fd7ae32c887bcd32230fb67bb5c57f6697d65fad3e85f0dd48bc2515 https://archive.ubuntu.com/ubuntu/pool/main/p/pam/libpam-runtime_1.7.0-5ubuntu3.2_all.deb https://snapshot.ubuntu.com/ubuntu/20261125T120000Z/pool/main/p/pam/libpam-runtime_1.7.0-5ubuntu3.2_all.deb
+
+# libpam-runtime 1.5.2-6+deb12u2 (bookworm)
+bookworm libpam-runtime_1.5.2-6+deb12u2_all.deb 7a4f26d54c1e3ee8c68095f9d9013d13dd89a33ff78ef87330d21f21235fc278 https://deb.debian.org/debian/pool/main/p/pam/libpam-runtime_1.5.2-6+deb12u2_all.deb https://snapshot.debian.org/archive/debian/20261125T000000Z/pool/main/p/pam/libpam-runtime_1.5.2-6%2Bdeb12u2_all.deb
+
+# libpam-modules 1.5.2-6+deb12u2 (bookworm)
+bookworm libpam-modules_1.5.2-6+deb12u2_amd64.deb 19fb4838168e68bc15a5606070f14b1162bb34a3899686913f5d661f1707f483 https://deb.debian.org/debian/pool/main/p/pam/libpam-modules_1.5.2-6+deb12u2_amd64.deb https://snapshot.debian.org/archive/debian/20261125T000000Z/pool/main/p/pam/libpam-modules_1.5.2-6%2Bdeb12u2_amd64.deb
+
+# libpam-runtime 1.7.0-5 (trixie)
+trixie libpam-runtime_1.7.0-5_all.deb b02792c9ed6174db695a653b95ef3629fdac3a73ba1eff1754ab161b5711bfbf https://deb.debian.org/debian/pool/main/p/pam/libpam-runtime_1.7.0-5_all.deb https://snapshot.debian.org/archive/debian/20261125T000000Z/pool/main/p/pam/libpam-runtime_1.7.0-5_all.deb
+
+# libpam-modules 1.7.0-5 (trixie)
+trixie libpam-modules_1.7.0-5_amd64.deb 9679ade117f8775ac0471f48a92652ab8e8dcda4e2ff06de75158cded9cfd83c https://deb.debian.org/debian/pool/main/p/pam/libpam-modules_1.7.0-5_amd64.deb https://snapshot.debian.org/archive/debian/20261125T000000Z/pool/main/p/pam/libpam-modules_1.7.0-5_amd64.deb

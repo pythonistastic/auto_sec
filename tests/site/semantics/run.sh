@@ -16,6 +16,10 @@
 #       s10-s13  a bad autosec_approve, autosec_serial, firewall_state or
 #           cve_watch_hour stops at pre-task 2 (no connection)
 #       s14 old detector variables (watcher_mode) do not stop a run
+#       s15-s17  login alerts (role 08): no Telegram token (R08-1),
+#           detection_remove with detection_enabled (R08-2) or root as a
+#           quiet account stops at pre-task 2 (no connection); with a
+#           token the checks pass
 #   p*  the plan summary (tests/site/semantics/plan.yml) with fixture facts
 #       p1  the canary: every line, "no change", no approval needed
 #       p2-p5  same input: same id; a changed note: same id; a changed item
@@ -149,6 +153,18 @@ for PB in "${ANSIBLES[@]}"; do
   [ "$rc" != 0 ] && has "$L" "cve_watch_hour" && ! has "$L" UNREACHABLE; ok "$tag s13: a bad cve_watch_hour stops before any connection" $?
   L=$W/$tag-s14.log; rc=$(site "$L" three.yml -l h1 -e watcher_mode=active -e revshell_enabled=true)
   [ "$rc" != 0 ] && first_connect_task "$L" | grep -q 'R00-3'; ok "$tag s14: old detector variables stop nothing" $?
+  # Login alerts (role 08): its variable checks are part of pre-task 2.
+  L=$W/$tag-s15.log; rc=$(site "$L" three.yml -l h1 -e detection_enabled=true)
+  [ "$rc" != 0 ] && has "$L" "[R08-1]" && ! has "$L" UNREACHABLE; ok "$tag s15: login alerts without a Telegram token: R08-1, no connection" $?
+  L=$W/$tag-s15b.log
+  rc=$(site "$L" three.yml -l h1 -e detection_enabled=true -e telegram_bot_token=12345678:TEST-TOKEN-ONLY-for-the-fake-sink -e telegram_chat_id=-100123)
+  [ "$rc" != 0 ] && ! has "$L" "[R08-" && first_connect_task "$L" | grep -q 'R00-3'
+  ok "$tag s15b: with a token and a chat id the variable checks pass; first connection at R00-3" $?
+  L=$W/$tag-s16.log; rc=$(site "$L" three.yml -l h1 -e detection_enabled=true -e detection_remove=true)
+  [ "$rc" != 0 ] && has "$L" "[R08-2]" && ! has "$L" UNREACHABLE; ok "$tag s16: detection_remove together with detection_enabled: R08-2, no connection" $?
+  L=$W/$tag-s17.log; rc=$(site "$L" three.yml -l h1 -e '{"detection_quiet_accounts": ["root"]}')
+  [ "$rc" != 0 ] && has "$L" "detection_quiet_accounts must not hold root" && ! has "$L" UNREACHABLE
+  ok "$tag s17: root as a quiet account stops before any connection" $?
 
   # --- p: the plan summary ---------------------------------------------------------
   rc=$(plan p1 canary -e @cases/canary.json); F=$W/$tag-p1.json
@@ -158,8 +174,8 @@ for PB in "${ANSIBLES[@]}"; do
   02 ssh:       no change
   03 firewall:  ufw active, kept (no ufw command); fail2ban: keep (no install, no file, no reload)
   04-07:        skipped (not configured)
-  08 detection: not managed in 0.6 (no change)
-  09 watcher:   not managed in 0.6 (no change)
+  08 detection: off (detection_enabled: false)
+  09 watcher:   not managed (no change)
   10 report:    writes reports/security-report-canary.md on this computer; nothing on the server
   11 cve:       skipped (cve_watch_enabled: false)
   packages:     nothing to install

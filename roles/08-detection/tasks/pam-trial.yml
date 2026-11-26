@@ -1,0 +1,72 @@
+---
+# roles/08-detection/tasks/pam-trial.yml - the trial run of the PAM change
+# (read-only).
+#
+# Included by preflight.yml, pam.yml and remove.yml. It copies auto_sec's
+# PAM profile (role constants only) to a scratch folder on the host and
+# runs files/auto-sec-pam-check there: the host's own pam-auth-update, on a
+# copy of the common PAM files, with a debconf database of the trial's
+# own. Nothing under /etc, /var/lib/pam or debconf's database is written,
+# so this also runs in --check. Sets _det_pam (the helper's JSON).
+#
+# Every string in the helper's answer that came from the host is already
+# cut to printable ASCII with braces replaced.
+
+- name: "Detection PAM trial: start from an empty result"
+  ansible.builtin.set_fact:
+    _det_pam: {}
+
+- name: "Detection PAM trial: scratch folders, root only"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ _det_file_owner }}"
+    mode: "0700"
+  loop:
+    - "{{ _det_run_dir }}"
+    - "{{ _det_sim_dir }}"
+  changed_when: false
+  check_mode: false
+  diff: false
+
+- name: "Detection PAM trial: try it on a copy, then clean up"
+  block:
+    - name: "Detection PAM trial: auto_sec's profile, as it would be installed"
+      ansible.builtin.copy:
+        src: "{{ _det_profile_name }}"
+        dest: "{{ _det_sim_dir }}/candidate"
+        owner: "{{ _det_file_owner }}"
+        mode: "0600"
+      changed_when: false
+      check_mode: false
+      diff: false
+
+    # One argv list, no shell: python3 -I -c <helper> <options>. Every
+    # option value is a role constant.
+    - name: "Detection PAM trial: ask the host's own pam-auth-update (on a copy, read-only)"
+      ansible.builtin.command:
+        argv: >-
+          {{ [_det_python, '-I', '-c', lookup('ansible.builtin.file', 'auto-sec-pam-check'),
+              '--work', _det_sim_dir ~ '/pam',
+              '--expect-line', _det_pam_line,
+              '--candidate', _det_sim_dir ~ '/candidate',
+              '--before', _det_pam_before,
+              '--tool', _det_pam_tool]
+             + _det_pam_lab_args }}
+      register: _det_pam_raw
+      changed_when: false
+      failed_when: _det_pam_raw.rc != 0 or not (_det_pam_raw.stdout | default('') is match('^\{'))
+      check_mode: false
+
+    - name: "Detection PAM trial: read the result"
+      ansible.builtin.set_fact:
+        _det_pam: "{{ _det_pam_raw.stdout | from_json }}"
+
+  always:
+    - name: "Detection PAM trial: remove the scratch folder"
+      ansible.builtin.file:
+        path: "{{ _det_sim_dir }}"
+        state: absent
+      changed_when: false
+      check_mode: false
+      diff: false

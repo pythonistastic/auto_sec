@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# legacy: unprivileged tests of roles 08 and 09 in auto_sec 0.6. Those roles
-# install and write nothing in 0.6. They look for what auto_sec 0.1-0.5 left
+# legacy: unprivileged tests of what roles 08 and 09 do about auto_sec 0.1-0.5's
+# detectors. These task files install and write nothing. They look for what 0.1-0.5 left
 # (W08-1, W09-1, N09-1) and stop the run while the old detectors run in
 # active mode (R00-3, before fact gathering). No root, nothing installed:
 #   static  the role files use only read-only tasks (static.py);
@@ -170,7 +170,7 @@ W09="WARNING: auto_sec 0.1-0.5's detectors are on"
 # Role 08: W08-1 for 0.1-0.5's exact files only.
 lab a08-none; run; rc0; expect "$N" "W08-1 lines" "$(count "$W08")" 0
 expect "$N" _plan_08 "$(fact plan_08)" "[]"
-expect "$N" _l08_report "$(fact l08_report)" '"not managed by auto_sec 0.6"'
+expect "$N" _l08_report "$(fact l08_report)" '""'
 
 lab a08-canary; mkdir -p "$L/$RULES"
 cp "$HERE/fixtures/operator-audit.rules" "$L/$RULES/audit.rules"
@@ -197,7 +197,7 @@ has "W08-1 gives the removal command" "sudo rm $L/$RULES/hardening.rules && sudo
 lab a08-both; mkdir -p "$L/$RULES"; cp "$W/render/deploy-true/"*.rules "$L/$RULES/"
 run; rc0; expect "$N" "W08-1 lines (one per file; the layer pass prints nothing)" "$(count "$W08")" 2
 expect "$N" _l08_report "$(fact l08_report)" \
-  "\"not managed by auto_sec 0.6; still there from auto_sec 0.1-0.5: $L/$RULES/hardening.rules, $L/$RULES/90-autosec.rules\""
+  "\"still there from auto_sec 0.1-0.5: $L/$RULES/hardening.rules, $L/$RULES/90-autosec.rules\""
 
 # Yours, not auto_sec's: 0.3's text without the line under the 0.1 name, a
 # changed byte, an added line, CRLF, bytes that are not UTF-8, a file over
@@ -237,7 +237,7 @@ expect "$N" _l09_found "$(fact l09_found)" "[\"$L/opt/watcher\", \"$L/opt/detect
 has "W09-1 points to the README" 'Remove them by hand: README \\"Removing the 0.1-0.5 detection suite\\"'
 expect "$N" "systemctl calls" "$(tr '\n' '|' < "$CALLS")" \
   "systemctl is-active recon-watch.service revshell-scan.service login-watcher.service|systemctl is-active login-watcher.service recon-watch.service revshell-scan.service ransomware-canary.service|"
-expect "$N" _l09_report "$(fact l09_report)" '"not managed by auto_sec 0.6; files of the auto_sec 0.1-0.5 detectors are still there"'
+expect "$N" _l09_report "$(fact l09_report)" '"files of the auto_sec 0.1-0.5 detectors are still there"'
 
 lab b09-cron; mkdir -p "$L/var/spool/cron/crontabs"
 printf '0 3 * * * /usr/local/bin/pg-backup\n#Ansible: audit alert scan\n*/5 * * * * true\n' > "$L/var/spool/cron/crontabs/root"
@@ -248,14 +248,14 @@ printf '#Ansible: audit alert scan2\n# #Ansible: audit alert scan\n#Ansible: aud
 run; rc0; expect "$N" "W09-1 for other crontab lines" "$(count "$W09")" 0
 
 lab b09-vars; run -e watcher_mode=alert -e recon_threshold=3 -e telegram_bot_token=CHANGE_ME
-rc0; has "N09-1 lists the detector variables that are set" "INFO: recon_threshold, watcher_mode are set but do nothing in 0.6"
+rc0; has "N09-1 lists the detector variables that are set" "INFO: recon_threshold, watcher_mode are set but do nothing (the detectors of 0.1-0.5 are gone"
 
 # Tags: the host reads run only when the tags select the role; N09-1 always.
 lab c-tags; mkdir -p "$L/$RULES" "$L/opt/watcher"; cp "$W/render/deploy-true/90-autosec.rules" "$L/$RULES/"
 run --tags ssh -e watcher_mode=alert; rc0
 expect "$N" "--tags ssh: W08-1, W09-1" "$(count "$W08") $(count "$W09")" "0 0"
 expect "$N" "--tags ssh: role 08 and 09 read the host" "$(fact l08_role_runs) $(fact l09_role_runs)" "false false"
-has "--tags ssh: N09-1 still shows" "INFO: watcher_mode is set but does nothing in 0.6"
+has "--tags ssh: N09-1 still shows" "INFO: watcher_mode is set but does nothing (the detectors of 0.1-0.5 are gone"
 run --tags detection; rc0; expect "$N" "--tags detection: W08-1, W09-1" "$(count "$W08") $(count "$W09")" "1 1"
 run --tags watcher; rc0; expect "$N" "--tags watcher: W08-1, W09-1" "$(count "$W08") $(count "$W09")" "0 1"
 run --skip-tags detection; rc0; expect "$N" "--skip-tags detection: W08-1, W09-1" "$(count "$W08") $(count "$W09")" "0 0"

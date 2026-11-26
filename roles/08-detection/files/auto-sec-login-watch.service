@@ -1,0 +1,26 @@
+# Written by auto_sec (role 08). auto_sec changes this file only while this line is first.
+#
+# Sensor B of auto_sec's login alerts: follows the journal and writes one
+# small event file per login into /var/spool/auto-sec/events. It restarts
+# by itself. When it stops or fails, a unit of its own says so
+# (auto-sec-notify@.service), and the checker says so again within 5
+# minutes (auto-sec-check.timer).
+[Unit]
+Description=auto_sec login alerts: journal reader
+After=systemd-journald.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/auto-sec-detect watch
+Restart=always
+RestartSec=5
+ExecStopPost=-/usr/bin/systemctl --no-block start auto-sec-notify@%n.service
+# It reads the journal and writes into its own two folders, nothing else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/spool/auto-sec /var/lib/auto-sec/detect
+
+[Install]
+WantedBy=multi-user.target

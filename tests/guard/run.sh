@@ -501,6 +501,90 @@ gd ufs arm "$(id_for ufs)" "$(dl 600)" --ufw -- "/etc/ssh/auto-sec-guard-test-$T
 expect_rc 8 $? "--ufw with a path under /etc/ssh/ still needs sshd -t"
 expect_false "no timer started" has "$W/ufs/calls" 'systemd-run'
 
+section "--pam (role 08's login hook): only the files go back; no sshd, no ufw"
+new_instance pm
+I=$W/pm
+mkdir -p "$I/etc/pam.d" "$I/etc/pam-configs"
+printf 'session required pam_unix.so\n' > "$I/etc/pam.d/common-session"
+echo "unix" > "$I/etc/seen"
+S=$I/etc/pam.d/common-session
+P=$I/etc/pam-configs/auto-sec-login-alert      # absent before: created by the run
+ID=$(id_for pm)
+echo 1 > "$I/sshd_t_rc"     # sshd's config does not matter to a PAM-only change
+gd pm arm "$ID" "$(dl 600)" --pam -- "$S" "$I/etc/seen" "$P"
+expect_rc 0 $? "arm --pam while sshd -t would fail"
+expect_false "arm --pam ran no sshd -t" has "$I/calls" 'sshd -t'
+gd pm status
+expect_true "status says a revert puts the PAM files back" has "$I/out" '^pam:      a revert puts the PAM files back (nothing is reloaded)'
+echo "Name: profile" > "$P"
+printf 'session required pam_unix.so\nsession optional pam_exec.so hook\n' > "$S"
+printf 'unix\nauto-sec-login-alert\n' > "$I/etc/seen"
+gd pm check "$ID"
+expect_rc 0 $? "check after the PAM change"
+n_calls=$(wc -l < "$I/calls")
+gd pm revert "$ID"
+expect_rc 0 $? "revert"
+expect_eq "session required pam_unix.so" "$(content "$S")" "common-session is the snapshot again"
+expect_eq "unix" "$(content "$I/etc/seen")" "pam-auth-update's record is the snapshot again"
+expect_false "the profile the run created is gone" test -e "$P"
+expect_false "no sshd -t at revert" has "$I/calls" 'sshd -t'
+expect_false "no sshd reload" has "$I/calls" 'try-reload-or-restart'
+expect_false "no ufw call" has "$I/calls" ' ufw '
+expect_eq "systemctl stop auto-sec-ssh-guard-$ID.timer" "$(lines_after "$I/calls" "$n_calls" | cut -d' ' -f2-)" \
+  "the only call of the revert: its own timer is stopped"
+expect_eq idle "$(status_line1 pm)" "status idle"
+
+# The removal: the run takes a line out and deletes the profile last.
+new_instance pmr
+I=$W/pmr
+mkdir -p "$I/etc/pam.d" "$I/etc/pam-configs"
+printf 'session required pam_unix.so\nsession optional pam_exec.so hook\n' > "$I/etc/pam.d/common-session"
+echo "Name: profile" > "$I/etc/pam-configs/auto-sec-login-alert"
+S=$I/etc/pam.d/common-session
+P=$I/etc/pam-configs/auto-sec-login-alert
+ID=$(id_for pmr)
+gd pmr arm "$ID" "$(dl 600)" --pam -- "$S" "$P"
+expect_rc 0 $? "arm --pam (removal)"
+printf 'session required pam_unix.so\n' > "$S"
+gd pmr check "$ID"
+expect_rc 0 $? "check after the line is out"
+rm -f "$P"                  # deleted after the check, as role 08 does
+gd pmr revert "$ID"
+expect_rc 0 $? "revert"
+expect_eq "$(printf 'session required pam_unix.so\nsession optional pam_exec.so hook')" "$(content "$S")" "the line is back"
+expect_eq "Name: profile" "$(content "$P")" "the profile is back"
+
+new_instance pmb
+I=$W/pmb
+mkdir -p "$I/etc/pam.d"
+echo "before" > "$I/etc/pam.d/common-session"
+ID=$(id_for pmb)
+gd pmb arm "$ID" "$(dl 600)" --pam -- "$I/etc/pam.d/common-session"
+expect_rc 0 $? "arm --pam (boot case)"
+echo "after" > "$I/etc/pam.d/common-session"
+stop_timer "$ID"
+n_calls=$(wc -l < "$I/calls")
+gd pmb revert --boot
+expect_rc 0 $? "revert --boot"
+expect_eq "before" "$(content "$I/etc/pam.d/common-session")" "boot: the PAM file is restored before any login"
+expect_eq "" "$(lines_after "$I/calls" "$n_calls")" "boot: no sshd, ufw or systemctl call"
+
+new_instance pmu
+gd pmu arm "$(id_for pmu)" "$(dl 600)" --ufw --pam -- "$W/pmu/etc/a"
+expect_rc 2 $? "--ufw and --pam together are refused"
+expect_eq idle "$(status_line1 pmu)" "nothing pending"
+ln -s /dev/null "$W/pmu/etc/link"
+gd pmu arm "$(id_for pmu)" "$(dl 600)" --pam -- "$W/pmu/etc/link"
+expect_rc 2 $? "a PAM file that is a link is refused"
+expect_false "no timer started" has "$W/pmu/calls" 'systemd-run'
+
+# A path under /etc/ssh/ brings sshd back into the change.
+new_instance pms
+echo 1 > "$W/pms/sshd_t_rc"
+gd pms arm "$(id_for pms)" "$(dl 600)" --pam -- "/etc/ssh/auto-sec-guard-test-$TAGP.conf"
+expect_rc 8 $? "--pam with a path under /etc/ssh/ still needs sshd -t"
+expect_false "no timer started" has "$W/pms/calls" 'systemd-run'
+
 section "arm fails cleanly when the revert timer cannot be started"
 new_instance nr
 echo 1 > "$W/nr/systemd_run_rc"

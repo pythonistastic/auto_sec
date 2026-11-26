@@ -1,0 +1,20 @@
+#!/bin/sh
+# LAB stand-in for role 08's login test after the PAM change, which on a
+# real server is `su root -s /bin/sh -c 'exit 0'`, run by root
+# (tests/detection/semantics/test_role.py sets _det_su_argv to this file).
+#
+# On a real server PAM runs auto_sec's login hook for that su when the
+# hook's line is in /etc/pam.d/common-session. The lab has no PAM login, so
+# this writes the event file the hook writes for it into the lab's queue
+# (su to root, started by root), but only when the line is in the lab's
+# common-session and the hook file is in place. The live suite
+# (tests/detection/live) checks the same with a real login.
+#   $LAB_ROOT   the lab root
+#   $LAB_SU_RC  the exit code (default 0; 1 = the login test fails)
+L=${LAB_ROOT:?}
+if grep -q '/usr/local/sbin/auto-sec-login-hook$' "$L/etc/pam.d/common-session" 2>/dev/null &&
+   [ -x "$L/usr/local/sbin/auto-sec-login-hook" ]; then
+  printf 'v=1\0src=hook\0svc=su\0user=root\0ruser=root\0tty=\0rhost=\0app=%s\0ruid=0\0ses=\0auid=\0end=1\0' "$$" \
+    > "$L/var/spool/auto-sec/events/h.lab-su-$$.ev"
+fi
+exit "${LAB_SU_RC:-0}"

@@ -38,16 +38,21 @@ can do:
   database, fwknop, and nightly client-side-encrypted backups (age) to a
   Backblaze B2 bucket whose key cannot delete.
 - An opt-in daily **CVE watch** of your app's dependencies.
+- Opt-in **login alerts**: a Telegram message when someone logs in (the
+  console, SSH, su, sudo, Webmin), a daily "still alive" message, and a
+  message when the alerts themselves stop (see
+  [Login alerts](#login-alerts-role-08)).
 - A short report, written on your own computer, that states only what the
   run measured.
 
-**Detection is not managed in 0.6.** The detectors of 0.1-0.5 (roles 08
-and 09) did not work as documented: the ransomware canary never alerted
-and the 5-minute audit scan worked only once
+**Login alerts are new in 0.7 and off by default.** They replace nothing
+on your server until you set `detection_enabled: true`. The detectors of
+0.1-0.5 (roles 08 and 09) did not work as documented: the ransomware
+canary never alerted and the 5-minute audit scan worked only once
 ([issue #18](https://github.com/pythonistastic/auto_sec/issues/18)).
-0.6 installs and changes nothing there, and warns if old detectors are
-still on a server. A rewritten, tested detection suite is planned for 0.7.
-See [Detection](#detection-roles-08-and-09).
+auto_sec no longer installs them, and warns if they are still on a
+server. Login alerts are the first part of a rewrite; they only tell you
+about a login, they do not stop one.
 
 ## Before you start (beginners)
 
@@ -163,11 +168,12 @@ picks its default. You can always write the value yourself:
 | `fail2ban_hardening_enabled` | `keep` | `true` | `keep`, `true` |
 | `firewall_state` | `keep` | `enabled` | `keep`, `enabled` |
 | `cve_watch_enabled` | `false` | `false` | `true`, `false` |
+| `detection_enabled` | `false` | `false` | `true`, `false` |
 
-What auto_sec 0.6 never does by itself, on either kind of server:
-changing an existing account, writing kernel settings, running a ufw
-command on an active ufw, restarting services through needrestart, or
-installing a detector.
+What auto_sec never does by itself, on either kind of server: changing
+an existing account, writing kernel settings, running a ufw command on
+an active ufw, restarting services through needrestart, touching a PAM
+file, or installing login alerts.
 
 ## The plan, and your OK
 
@@ -182,8 +188,8 @@ auto_sec 0.6.0 plan for canary (autosec_server: existing)
   02 ssh:       no change
   03 firewall:  ufw active, kept (no ufw command); fail2ban: keep (no install, no file, no reload)
   04-07:        skipped (not configured)
-  08 detection: not managed in 0.6 (no change)
-  09 watcher:   not managed in 0.6 (no change)
+  08 detection: off (detection_enabled: false)
+  09 watcher:   not managed (no change)
   10 report:    writes reports/security-report-canary.md on this computer; nothing on the server
   11 cve:       skipped (cve_watch_enabled: false)
   packages:     nothing to install
@@ -253,9 +259,14 @@ b2_key_id: "..."
 b2_app_key: "..."                # use ansible-vault
 age_public_key: "age1..."
 
-# Alerts (backup status, CVE watch):
+# Alerts (login alerts, backup status, CVE watch):
 telegram_bot_token: "..."
 telegram_chat_id: "..."
+
+# Login alerts (role 08; needs the two lines above):
+detection_enabled: true
+detection_quiet_ssh_keys:          # the key auto_sec's own runs log in with
+  - { fingerprint: "SHA256:...", label: "ci" }
 ```
 
 Optional roles (04 fwknop, 05 app, 06 database, 07 backups) are loaded
@@ -785,8 +796,8 @@ values and the bans it had, and that fail2ban's process is the same.
 | 05 | app-runtime | Node/PM2 or Docker + hardened nginx + TLS (a new web server only) |
 | 06 | database | Localhost only, least privilege (a new database server only) |
 | 07 | backups | Encrypted nightly backups to a no-delete B2 bucket |
-| 08 | detection | **Not managed in 0.6** (#18): warns about 0.1–0.5's audit rules |
-| 09 | watcher | **Not managed in 0.6** (#18): warns about 0.1–0.5's detectors |
+| 08 | detection | Opt-in login alerts (Telegram), with a daily "still alive" message; warns about 0.1–0.5's audit rules |
+| 09 | watcher | Changes nothing: warns about 0.1–0.5's detectors (#18) |
 | 10 | report | A short report on your own computer |
 | 11 | cve-watch | Opt-in daily dependency + OS CVE scan against OSV.dev |
 
@@ -798,6 +809,7 @@ Partial runs with tags:
 ansible-playbook -i inventory site.yml -l myserver --tags ssh
 ansible-playbook -i inventory site.yml -l myserver --tags fail2ban
 ansible-playbook -i inventory site.yml -l myserver --tags backups
+ansible-playbook -i inventory site.yml -l myserver --tags detection
 ansible-playbook -i inventory site.yml -l myserver --tags "firewall,report"
 ```
 
@@ -810,12 +822,209 @@ roles the tags select. A wrong value in any role's variables stops any
 run; a role's checks of the server stop a run only when it includes that
 role.
 
-## Detection (roles 08 and 09)
+## Login alerts (role 08)
 
-**Not managed in 0.6.** auto_sec 0.1–0.5 installed auditd rules, a
-ransomware canary, a 5-minute audit-log scan and three Python detectors
-(reverse-shell, recon-burst and an experimental SSH login watcher). Some
-of them did not work as documented:
+**Off by default**, on existing and new servers. With
+`detection_enabled: true` the server sends you a Telegram message when
+someone logs in. It only tells you. It never ends a session, bans an
+address or locks an account.
+
+```yaml
+detection_enabled: true
+detection_quiet_ssh_keys:      # `ssh-keygen -lf ~/.ssh/id_ed25519.pub` prints the fingerprint
+  - { fingerprint: "SHA256:...", label: "my laptop" }
+```
+
+It needs `telegram_bot_token` and `telegram_chat_id`. Without them the
+run stops before it changes anything (R08-1): alerts that cannot go out
+would be worse than none.
+
+### What sends a message
+
+| Login | A message? |
+|---|---|
+| On the console (`login`: a screen, a serial or KVM console) | Always. Nothing makes it quiet. |
+| SSH as root | Always, except with a key on your quiet list. A root login with a password always sends one. |
+| SSH as another account | Yes, unless its key or the account is on your quiet list. |
+| `su` to root; `sudo -i`, `sudo -s`, `sudo bash` to root | Always. (Not when root itself started it: that is counted in the daily message, not sent.) |
+| `su` or `sudo` to another account | Yes, unless that account is on your quiet list. |
+| Webmin | Root always; another account unless it is on your quiet list. |
+| Another program that opens a login session through PAM | Root always; another account unless it is on your quiet list. The message names the program. |
+
+`detection_quiet_accounts` is a list of account names (never root).
+`detection_quiet_ssh_keys` is a list of key fingerprints; a login with
+one of them is quiet for any account. Put the key that auto_sec's own
+runs log in with there, or every run sends you a message. Quiet logins
+are counted in the daily message.
+
+A message looks like this:
+
+```
+auto_sec login alert: myserver
+root logged in over SSH with a PASSWORD
+from: 203.0.113.5
+time: 2026-11-26 09:14:03 UTC (10:14:03 CET server time)
+seen by: login hook and journal
+```
+
+No message holds a password, the token or a command's arguments. Several
+logins at once come as one message. If Telegram cannot be reached, the
+sender tries again for 10 minutes. After that it keeps one line per
+login and sends those lines with the next message that does go out.
+
+### Two sensors
+
+- **The login hook.** One line in `/etc/pam.d/common-session` runs a
+  small script when a login session opens: the console, SSH, `su`,
+  `sudo -i`. The script writes one small file into a folder only root
+  can read, and exits. It runs no other program and makes no network
+  call. The line is `optional` and has a 1-second limit, so a hook that
+  is missing, broken or hanging cannot block a login. A hanging hook
+  can delay a login by 1 second.
+- **The journal reader.** A service that follows the journal for the
+  lines `sshd`, `login`, `su` and `sudo` write, and Webmin's. It knows
+  how an SSH login was made (a password, or which key), and it sees
+  `sudo -s` and `sudo bash`, which open no login session.
+
+The sender joins both into one message per login. When only one of the
+two saw a login, the message says so.
+
+With `detection_login_hook: false` only the journal reader is installed
+and no PAM file is touched.
+
+### How the PAM line gets there
+
+auto_sec never edits a PAM file itself. It installs a profile
+(`/usr/share/pam-configs/auto-sec-login-alert`) and lets Debian's own
+`pam-auth-update` add the one line. First the preflight tries that on a
+copy, with the server's own `pam-auth-update`, and the run stops before
+any change when:
+
+- the server's pam-auth-update has no `--root` option (R08-P3). It
+  ignores an option it does not know, so the trial would be a real run.
+  auto_sec does not start it then;
+- your common PAM files have hand edits inside pam-auth-update's blocks
+  (R08-P1). pam-auth-update would refuse them, and auto_sec does not
+  force it. The message offers `detection_login_hook: false`;
+- a profile of another package is waiting to be applied (R08-P2);
+- the trial does not add exactly the one line (R08-P4), or a line with
+  the hook's name is already there and auto_sec did not write it
+  (R08-P5);
+- a PAM file of yours reads a user's own environment file
+  (`pam_env.so user_readenv=1`) before the common session lines
+  (R08-P6). The hook runs as root with PAM's environment, so there a
+  user could hand root a variable of their own. Stock Ubuntu and Debian
+  do not do this;
+- the real PAM files changed while the trial ran (R08-P7). The trial
+  writes only its copy, and checks afterwards that this is true.
+
+The real change runs under the same automatic undo as an SSH change.
+It covers the five common PAM files, pam-auth-update's own records and
+the profile. Then two logins are tested: `su` on the server, and a
+brand-new SSH login from your computer. If a test fails or the
+connection is lost, the files go back as they were. In local mode
+(Ansible running on the server itself) only the `su` test runs, and the
+plan says so (N08-8).
+
+pam-auth-update also notes the enabled profiles in debconf's database,
+as it does for every package. The undo does not cover that note. It
+does not need to: pam-auth-update decides from the files (see
+SECURITY.md).
+
+On Ubuntu 22.04, pam-auth-update cannot try a new profile on a copy.
+There the trial of the profile runs later: after the profile file is in
+place, under the undo, and before pam-auth-update runs for real (N08-6).
+
+### Is it alive?
+
+- The run that installs or changes detection sends a **test message**
+  and prints its id. Look for that id in your chat.
+  `-e detection_test_alert=true` sends one on any run.
+- **One message a day** at `detection_heartbeat_time` says that detection
+  is running, with the counts of the last day. If it stops coming,
+  detection is dead or the server cannot reach Telegram.
+- On the server: `sudo auto-sec-detect status`.
+- **Every run** reads that status and says in the plan and in the report
+  either `detection: on, last alive message <time>` or
+  `detection: DEAD since <time>` (W08-2).
+
+### Who watches the watcher
+
+- Each service restarts by itself.
+- When one stops or fails, a small unit of its own sends "the watcher
+  was stopped". Not at shutdown, and not while an auto_sec run restarts
+  it.
+- A checker runs every 5 minutes on a timer of its own. It asks: do the
+  two sensors and the sender run, is the hook's line still in PAM, does
+  the queue move, did the last daily message go out, can messages be
+  sent? When something is wrong it sends its own message, and again
+  every hour until it is fixed.
+- The two services check in turn that the checker's timer still runs.
+- After a boot the checker says that the server started again.
+
+**The limits.** If the server cannot reach Telegram, no message can tell
+you so: only the missing daily message can. Whoever is root on the
+server can switch all of this off, or change it. Login alerts tell you
+about a login you did not expect. They do not stop a careful intruder
+who is already root, and nothing outside the server checks it yet.
+
+### What it puts on the server
+
+| What | Where |
+|---|---|
+| The program (root only) | `/usr/local/sbin/auto-sec-detect` |
+| The login hook (root only; not with `detection_login_hook: false`) | `/usr/local/sbin/auto-sec-login-hook` |
+| The settings, with the Telegram token (0600) | `/etc/auto-sec/detect.conf` |
+| The PAM profile and its one line | `/usr/share/pam-configs/auto-sec-login-alert`, `/etc/pam.d/common-session` |
+| Eight units and five links that start them at boot | `/etc/systemd/system/auto-sec-*` |
+| The queue and the state (root only) | `/var/spool/auto-sec/events`, `/var/lib/auto-sec/detect` |
+| The automatic undo, if it is not there yet | `/usr/local/sbin/auto-sec-ssh-guard` and its boot unit |
+
+The plan lists every one of them before the first is written. Each file
+carries a header line; auto_sec changes or removes a file only while
+that line is there. A file with one of these names that auto_sec did not
+write stops the run (R08-3). From then on the server calls
+`api.telegram.org`, and nothing else.
+
+### Taking it out again
+
+`detection_enabled: false` removes nothing, like every other setting in
+auto_sec. To take login alerts out, set it to `false` and run once with:
+
+```bash
+ansible-playbook -i inventory site.yml -l myserver -e detection_remove=true
+```
+
+It has a switch of its own because login alerts put a line into files
+that every login reads, and keep a secret on the server. Nobody should
+have to take that line out by hand, and a watcher should not disappear
+because of a default.
+
+- The plan lists every file, link and folder that goes, and the plan id
+  and your OK work as for any change.
+- One last message says that login alerts are being taken out.
+- The PAM line goes with `pam-auth-update --remove`, under the automatic
+  undo and with the same login tests. Afterwards the common PAM files
+  are byte for byte what they were before the install. If something
+  else changed them since, the plan says which files.
+- A file is deleted only while it still carries auto_sec's header line.
+- What stays: the automatic undo (roles 02 and 03 use it too), and two
+  folders if they are empty: `/var/lib/auto-sec` and
+  `/etc/systemd/system/paths.target.wants`.
+
+### Not in this release
+
+- Alerts about what someone does after a login (commands, changed
+  files). Planned as the next part.
+- Servers that check each other, so that a silent server is noticed
+  from outside.
+
+## The detectors of auto_sec 0.1–0.5 (roles 08 and 09)
+
+auto_sec 0.1–0.5 installed auditd rules, a ransomware canary, a
+5-minute audit-log scan and three Python detectors (reverse-shell,
+recon-burst and an experimental SSH login watcher). Some of them did not
+work as documented:
 
 - the ransomware canary never alerted (it stopped after the first file
   event);
@@ -826,22 +1035,20 @@ Details are in [issue #18](https://github.com/pythonistastic/auto_sec/issues/18)
 Earlier versions of this README described them as working protection;
 that was not accurate.
 
-What 0.6 does instead:
+Since 0.6, auto_sec:
 
-- it installs, writes, starts and deletes nothing in roles 08 and 09;
-- it no longer deletes `/etc/audit/rules.d/hardening.rules` (0.3–0.5
+- installs none of them, and deletes none of them;
+- no longer deletes `/etc/audit/rules.d/hardening.rules` (0.3–0.5
   deleted it, even when it was yours);
-- it warns when 0.1–0.5's audit rules or detectors are still on a
-  server (W08-1, W09-1), and lists detector variables that do nothing;
-- it stops before it gathers facts if the old detectors run in `active`
+- warns when 0.1–0.5's audit rules or detectors are still on a server
+  (W08-1, W09-1), and lists detector variables that do nothing;
+- stops before it gathers facts if the old detectors run in `active`
   mode (R00-3), because they would end the run's own SSH session.
-
-A rewritten, tested detection suite is planned for 0.7.
 
 ### Removing the 0.1-0.5 detection suite
 
-auto_sec 0.6 does not remove anything for you. On a server where the
-warnings appear, as root:
+auto_sec does not remove the old detectors for you. On a server where
+the warnings appear, as root:
 
 1. Stop and remove the detector services:
 
@@ -1038,9 +1245,27 @@ tests/                   lab tests (no root) and live tests (CI runners only)
   GitHub's Ubuntu 22.04 and 24.04 VMs. On one real server already in
   use, 0.4's SSH step ran, and so did a full 0.6 run, which changed
   nothing there.
-- **Detection is not managed in 0.6** ([#18](https://github.com/pythonistastic/auto_sec/issues/18)).
-  Old 0.1–0.5 detectors in alert mode keep firing on every run until you
-  remove them.
+- **Login alerts (0.7) are new.** They are tested in a lab, without
+  root: the login hook, the real `pam_exec.so` of Ubuntu 22.04 and 24.04
+  and Debian 12 and 13, the real `pam-auth-update` of those four and of
+  Ubuntu 26.04, and the role's own task files with a real sender and the
+  real undo script. Their live tests on GitHub's VMs have **not run
+  yet**, and they have never run on a real server. Ubuntu 26.04's
+  `pam_exec.so` could not be loaded in the lab. Its `timeout` is a new
+  program (uutils): it ends a hanging hook after 1 second too, but not a
+  process the hook started (the hook starts none).
+- Login alerts tell you about a login. They do not stop one. If the
+  server cannot reach Telegram, no message can tell you so, and whoever
+  is root on the server can switch them off.
+- The journal reader reads log lines, and parts of a log line are text
+  that a client chose (a user name, a host name). auto_sec reads only
+  lines whose program the journal itself recorded, matches them
+  strictly, and sends no text it cannot place. A new OpenSSH or sudo
+  release can change a line; then a login is still reported by the
+  login hook, and the message says that the journal reader missed it.
+- Old 0.1–0.5 detectors
+  ([#18](https://github.com/pythonistastic/auto_sec/issues/18)) in alert
+  mode keep firing on every run until you remove them.
 - Turning ufw on (new servers) was checked in a lab, against the ufw
   code of Ubuntu 22.04 and 24.04 and Debian 12 and 13, and on GitHub's
   Ubuntu 24.04 VM; never on a real server yet. ufw applies its own kernel settings at every start,

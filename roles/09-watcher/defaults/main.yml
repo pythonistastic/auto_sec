@@ -1,11 +1,11 @@
 ---
 # Role 09 (watcher) defaults.
 #
-# auto_sec 0.6 does not manage detection. Role 09 installs nothing and
-# writes nothing. It only looks for the detectors that auto_sec 0.1-0.5
-# installed: tasks/legacy_active.yml stops the run when they are in active
-# mode (R00-3), tasks/legacy.yml warns when they are there (W09-1). The
-# rewritten detection comes in 0.7. Role 09 has no settings in 0.6.
+# Role 09 installs nothing and writes nothing. It only looks for the
+# detectors that auto_sec 0.1-0.5 installed: tasks/legacy_active.yml stops
+# the run when they are in active mode (R00-3), tasks/legacy.yml warns when
+# they are there (W09-1). The login alerts of 0.7 are role 08. Role 09 has
+# no settings.
 
 # --- Role-internal constants. These are not settings: do not override. ---
 
@@ -39,7 +39,7 @@ _l09_mode_active_re: '^[[:space:]]*[Mm][Oo][Dd][Ee][[:space:]]*[=:][[:space:]]*a
 # systemctl is-active words for a unit that does not run.
 _l09_stopped_words: [inactive, failed, unknown]
 
-# Variables of the 0.1-0.5 detectors. They do nothing in 0.6 (N09-1).
+# Variables of the 0.1-0.5 detectors. They do nothing (N09-1).
 _l09_ignored_vars:
   - watcher_mode
   - watcher_window_seconds

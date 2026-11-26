@@ -1,0 +1,52 @@
+---
+# LAB ONLY (tests/detection/semantics/test_role.py). Stands in for
+# roles/02-ssh-hardening/tasks/guard.yml, which role 08's pam.yml includes
+# for the automatic undo. The lab puts this folder first in the roles
+# path, so no other task file of role 02 is used.
+#
+# The real file installs the undo script and its boot unit as root under
+# /usr/local/sbin and /etc/systemd/system. The lab has no root: it has
+# already put a private copy of the REAL script
+# (roles/02-ssh-hardening/files/auto-sec-ssh-guard) at _ssh_guard_bin, with
+# its paths block pointing into the lab (the same block tests/guard
+# rewrites) and with systemd-run and systemctl stubs that start no timer.
+# So `install` only checks that the copy is there; check, disarm and
+# revert run that real script, as the real task file does.
+
+- name: "Lab guard: the lab's copy of the undo script is in place"
+  when: _ssh_guard_action == 'install'
+  ansible.builtin.stat:
+    path: "{{ _ssh_guard_bin }}"
+    get_checksum: false
+  register: _lab_guard_st
+  failed_when: not (_lab_guard_st.stat.executable | default(false))
+
+- name: "Lab guard: is the undo still armed by this run?"
+  when: _ssh_guard_action == 'check'
+  ansible.builtin.command:
+    argv: ["{{ _ssh_guard_bin }}", check, "{{ _ssh_guard_id }}"]
+  register: _ssh_guard_check
+  changed_when: false
+  failed_when: _ssh_guard_check.rc != 0
+
+- name: "Lab guard: keep the change (disarm the undo)"
+  when: _ssh_guard_action == 'disarm'
+  ansible.builtin.command:
+    argv: ["{{ _ssh_guard_bin }}", disarm, "{{ _ssh_guard_id }}"]
+  register: _ssh_guard_disarm
+  changed_when: _ssh_guard_disarm.rc == 0
+  failed_when: _ssh_guard_disarm.rc != 0
+
+- name: "Lab guard: put the previous files back now"
+  when: _ssh_guard_action == 'revert'
+  ansible.builtin.command:
+    argv: ["{{ _ssh_guard_bin }}", revert, "{{ _ssh_guard_id }}"]
+  register: _ssh_guard_revert
+  changed_when: true
+  failed_when: false
+
+- name: "Lab guard: remember how the undo went"
+  when: _ssh_guard_action == 'revert'
+  ansible.builtin.set_fact:
+    _ssh_guard_revert_rc: "{{ _ssh_guard_revert.rc | default(-1) }}"
+    _ssh_guard_revert_err: "{{ _ssh_guard_revert.stderr | default('') | regex_replace('[{}]', '?') | trim }}"

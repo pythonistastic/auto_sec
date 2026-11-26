@@ -1,0 +1,15 @@
+# Written by auto_sec (role 08). auto_sec changes this file only while this line is first.
+#
+# Starts the sender when an event file waits and the sender is not
+# running (someone stopped it, or it could not start at boot).
+[Unit]
+Description=auto_sec login alerts: wake the sender when an event waits
+OnSuccess=auto-sec-notify@%n.service
+OnFailure=auto-sec-notify@%n.service
+
+[Path]
+DirectoryNotEmpty=/var/spool/auto-sec/events
+Unit=auto-sec-alert.service
+
+[Install]
+WantedBy=paths.target

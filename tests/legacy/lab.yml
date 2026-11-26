@@ -1,5 +1,5 @@
 ---
-# Roles 08 and 09 of auto_sec 0.6, wired the way site.yml wires them, run
+# The legacy task files of roles 08 and 09, wired the way site.yml wires them, run
 # unprivileged against a lab tree instead of /:
 #   pre_tasks  09-watcher legacy_active (R00-3, before fact gathering),
 #              08-detection legacy and 09-watcher legacy (tags always)
@@ -10,7 +10,7 @@
 # to <lab_out> as JSON (only when the play gets that far):
 #   ansible-playbook -i localhost, lab.yml -e lab_root=<dir> -e lab_out=<file>
 #     [--tags ...] [--check]
-- name: Roles 08 and 09 (auto_sec 0.6) against a lab tree
+- name: Roles 08 and 09 (the 0.1-0.5 checks) against a lab tree
   hosts: localhost
   connection: local
   gather_facts: false
@@ -41,14 +41,14 @@
       tags: [always]
 
   tasks:
-    - name: "Layer 08: detection (not managed in 0.6)"
+    - name: "Layer 08: a second pass of the legacy check (must do nothing)"
       ansible.builtin.include_role:
         name: 08-detection
         tasks_from: legacy
         apply: { tags: ["detection"] }
       tags: ["detection"]
 
-    - name: "Layer 09: watcher (not managed in 0.6)"
+    - name: "Layer 09: watcher (the detectors of 0.1-0.5: warnings only)"
       ansible.builtin.include_role:
         name: 09-watcher
         tasks_from: legacy

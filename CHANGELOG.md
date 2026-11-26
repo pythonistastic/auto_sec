@@ -10,7 +10,132 @@ changes. auto_sec is a personal research project, not a production service — s
 
 ## [Unreleased]
 
-_Nothing yet._
+**Login alerts, the first part of the detection rewrite.** Opt-in per
+server (`detection_enabled: true`), off on `existing` and on `new`. The
+server tells you on Telegram when someone logs in, proves once a day that
+it is still alive, and says when the alerts themselves stop. It only
+tells you; it ends no session and bans nobody.
+
+### Added
+
+- **Login alerts (role 08, `detection_enabled: true`).** A Telegram
+  message for every login that is not on your quiet list: the console,
+  SSH, `su`, `sudo -i`, `sudo -s`, `sudo bash` and Webmin.
+  - Two sensors. The **login hook**: one `optional` line in
+    `/etc/pam.d/common-session` that runs a small script. The script
+    writes one small file into a root-only queue and exits. It has a
+    1-second limit, so it cannot block a login. The **journal reader**:
+    a service that reads the lines `sshd`, `login`, `su` and `sudo`
+    write, and Webmin's. It adds the SSH method and key fingerprint, and
+    sees `sudo -s` and `sudo bash`.
+  - The **sender** joins both into one message per login, bundles
+    bursts, retries for 10 minutes, obeys Telegram's "too many requests"
+    answer, and then keeps one line per unsent login for the next message.
+    No message holds a password, the token or a command's arguments.
+  - The quiet list: `detection_quiet_accounts` and
+    `detection_quiet_ssh_keys` (fingerprints). Never quiet: a console
+    login, a root SSH login with a password or another key, root through
+    `su`, `sudo`, Webmin or any other program. `su` and `sudo` started by
+    root are counted, not sent.
+  - `detection_login_hook: false`: journal reader only, no PAM file is
+    touched.
+- **Proof of life.** A test message at install and with
+  `-e detection_test_alert=true`; the run prints its id. A daily "still
+  alive" message with counts (`detection_heartbeat_time`). `sudo
+  auto-sec-detect status` on the server. Every run reads that status and
+  says `detection: on, last alive message <time>` or `detection: DEAD
+  since <time>` (W08-2) in the plan and the report.
+- **The watcher's own health.** Every detection service restarts by
+  itself. A unit of its own sends "the watcher was stopped" when one
+  stops or fails. A checker on a 5-minute timer of its own sends a
+  message when a sensor or the sender is down, the hook's line is gone
+  from PAM, the queue is stuck, the daily message did not go out or
+  messages cannot be sent, and repeats it every hour. The services check
+  in turn that the checker's timer runs.
+- **The PAM change is made by Debian's own `pam-auth-update`**, never by
+  editing a PAM file. The preflight tries it on a copy first (helper
+  `auto-sec-pam-check`). The real change runs under the automatic undo
+  (the undo guard's new `--pam` mode), with a login test afterwards: `su`
+  on the server and a brand-new SSH login.
+- **Refusals before any change:** no Telegram token or chat id (R08-1);
+  a file with one of auto_sec's names that auto_sec did not write
+  (R08-3); python3 or systemd's tools missing (R08-4); a daemon-reload
+  would load unit edits of yours (R08-5); the login test needs Ansible's
+  ssh connection (R08-6); an earlier undo is pending (R08-7); hand edits
+  in the common PAM files (R08-P1, which offers the journal reader
+  only); a PAM profile of another package is waiting (R08-P2);
+  pam-auth-update, pam_exec or timeout missing, or a pam-auth-update
+  without a `--root` option, which would run the trial on the real
+  files (R08-P3); the trial does not add exactly the one line (R08-P4);
+  a foreign line with the hook's name (R08-P5); a PAM file that reads a
+  user's own environment file before the common session lines, which
+  would reach the hook as root (R08-P6); the real PAM files changed
+  while the trial ran (R08-P7). Mid-run guards M08-1 to M08-6, notes
+  N08-1 to N08-8.
+- **A way out: `-e detection_remove=true`** (with `detection_enabled:
+  false`). The plan lists every file, link and folder that goes. The PAM
+  line goes with `pam-auth-update --remove`, under the undo, and the
+  common PAM files are then byte for byte what they were before the
+  install (the plan says so when something else changed them since).
+  `detection_enabled: false` alone removes nothing.
+- The plan words `remove` and `stop`, counted on their own in the totals
+  line ("16 removed, 5 unit(s) stopped").
+- The wizard asks "Turn on login alerts?" (default No), only when
+  Telegram is set up, and offers to keep your own key quiet.
+- CI jobs `detection-semantics` and `detection-live`; `--pam` cases in
+  the guard's unit tests.
+
+### Changed
+
+- The plan's line for role 08 is now `off (detection_enabled: false)`,
+  and role 09's `not managed (no change)`. The report's section 4 has a
+  "Login alerts" line that states what the run read.
+- The undo guard (`auto-sec-ssh-guard`) knows `--pam`: a revert puts the
+  PAM files back and reloads nothing. `--ufw` and `--pam` cannot be
+  combined.
+
+### Upgrading
+
+- Nothing changes until you set `detection_enabled: true`. The run that
+  installs login alerts needs `telegram_bot_token` and
+  `telegram_chat_id`.
+- Put the fingerprint of the key your auto_sec runs log in with into
+  `detection_quiet_ssh_keys` (`ssh-keygen -lf key.pub`), or every run
+  sends you a message (N08-5).
+- Start with `-e autosec_plan_only=true` and read the plan: it shows the
+  one PAM line.
+- The detectors of 0.1–0.5 are still not removed by auto_sec. See README
+  "Removing the 0.1-0.5 detection suite".
+
+### Known limitations
+
+- If the server cannot reach Telegram, no message can tell you so: only
+  the missing daily message can. Whoever is root on the server can
+  switch login alerts off.
+- Where it was tested: in the lab, without root (`detection-semantics`):
+  the hook; the real `pam_exec.so` of Ubuntu 22.04 and 24.04 and Debian
+  12 and 13; the real `pam-auth-update` of those and of Ubuntu 26.04;
+  the journal reader on log lines of those releases; the sender against
+  a fake Telegram; and the role's task files against lab trees, with a
+  real sender and the real undo script, on ansible-core 2.16 and the
+  current one. NOT RUN YET: the live job `detection-live` and the new
+  `--pam` guard cases on GitHub's runners. Never run on a real server.
+- Ubuntu 26.04: its `pam_exec.so` could not be loaded in the lab (it
+  needs a newer C library than the lab has), so the hook's line is
+  untested with it. Its `timeout` is a new program (uutils). In the lab
+  it ended a hanging hook after 1 second as well, but it does not end a
+  process the hook started (the hook starts none).
+- Ubuntu 22.04's `pam-auth-update` cannot try a new profile on a copy.
+  There the trial of the profile runs at apply time, under the undo
+  (N08-6).
+- Of the log lines the journal reader matches, the SSH lines were
+  captured from real OpenSSH 8.9, 9.2 and 9.6 in the lab. The lines of
+  `login`, `su`, `sudo` and Webmin were written from the format strings
+  in each release's own program, not captured. `sudo-rs` (Ubuntu 26.04's
+  default sudo) writes another line; it is matched from its source, not
+  from a run.
+- Not in this release: alerts about what someone does after a login, and
+  servers that check each other.
 
 ## [0.6.1] - 2026-11-22
 

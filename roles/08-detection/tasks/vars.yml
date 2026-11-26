@@ -1,0 +1,218 @@
+---
+# roles/08-detection/tasks/vars.yml - role 08's variable checks. No host access.
+#
+# site.yml imports this file in pre_tasks (pre-task 2, tags always), before
+# the first connection, so a wrong value stops every run, whatever the
+# tags, before anything is read or changed.
+#
+#   R08-1  detection_enabled: true needs telegram_bot_token and
+#          telegram_chat_id. Without them no alert could go out, and nobody
+#          would be told (auto_sec 0.5 stayed silent there).
+#   R08-2  detection_remove (a one-off -e switch) only together with
+#          detection_enabled: false
+#   and the shape of every detection_* value.
+#
+# Sets, on every host:
+#   _det_enabled         bool  detection_enabled
+#   _det_remove          bool  detection_remove
+#   _det_hook_wanted     bool  detection_login_hook (false: journal reader only)
+#   _det_quiet_accounts  list  account names
+#   _det_quiet_fps       list  SSH key fingerprints ("SHA256:...")
+#   _det_quiet_labels    list  "<label> SHA256:...<last 8>" for the plan
+#   _det_test_forced     bool  -e detection_test_alert=true was passed
+#   _det_test_install    bool  a test message when detection is installed or changed
+#   _det_ci_api          str   auto_sec's own CI only: the fake Telegram's address
+
+- name: "Detection vars: the on/off switches are true or false"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (detection_enabled | default(false) | string | lower) in _det_bool_words
+      - (detection_login_hook | default(true) | string | lower) in _det_bool_words
+      - (detection_test_alert | default(true) | string | lower) in _det_bool_words
+      - (detection_remove | default(false) | string | lower) in _det_bool_words
+    fail_msg: >-
+      detection_enabled ({{ detection_enabled | default(false) | string | truncate(20) }}),
+      detection_login_hook ({{ detection_login_hook | default(true) | string | truncate(20) }}),
+      detection_test_alert ({{ detection_test_alert | default(true) | string | truncate(20) }}) and
+      detection_remove ({{ detection_remove | default(false) | string | truncate(20) }}) must each be
+      true or false. Nothing has been changed.
+
+# The values reach /etc/auto-sec/detect.conf (an INI file) and a systemd
+# timer, so each one has a strict shape. root is refused as a quiet
+# account: a root login is quiet only over SSH, with a key you list.
+- name: "Detection vars: check every value"
+  ansible.builtin.set_fact:
+    _det_var_errors: >-
+      {%- set errs = [] -%}
+      {%- set qa = detection_quiet_accounts | default([]) -%}
+      {%- set qk = detection_quiet_ssh_keys | default([]) -%}
+      {%- if qa is string or qa is mapping or qa is not sequence -%}
+      {%- set _ = errs.append('detection_quiet_accounts must be a list of account names, for example [auditor, cve-patcher]') -%}
+      {%- else -%}
+      {%- for a in qa -%}
+      {%- if a is not string or a is not match(_det_user_re) or a is search('[\r\n]') -%}
+      {%- set _ = errs.append('detection_quiet_accounts item ' ~ loop.index ~ ' is not an account name') -%}
+      {%- elif a == 'root' -%}
+      {%- set _ = errs.append('detection_quiet_accounts must not hold root (a root login is quiet only over SSH with a key in detection_quiet_ssh_keys)') -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- if qa | length > 64 -%}{%- set _ = errs.append('detection_quiet_accounts holds more than 64 names') -%}{%- endif -%}
+      {%- endif -%}
+      {%- if qk is string or qk is mapping or qk is not sequence -%}
+      {%- set _ = errs.append('detection_quiet_ssh_keys must be a list of fingerprints, for example ["SHA256:..."]') -%}
+      {%- else -%}
+      {%- for k in qk -%}
+      {%- set fp = (k.fingerprint | default('')) if k is mapping else k -%}
+      {%- set label = (k.label | default('no label')) if k is mapping else 'no label' -%}
+      {%- if fp is not string or fp is not match(_det_fp_re) or fp is search('[\r\n]') -%}
+      {%- set _ = errs.append('detection_quiet_ssh_keys item ' ~ loop.index ~ ' is not a fingerprint like SHA256:<43 characters> (see: ssh-keygen -lf key.pub)') -%}
+      {%- endif -%}
+      {%- if label is not string or label is not match(_det_label_re) or label is search('[\r\n]') -%}
+      {%- set _ = errs.append('detection_quiet_ssh_keys item ' ~ loop.index ~ ': the label may hold letters, digits, spaces and . _ @ ( ) -, at most 40') -%}
+      {%- endif -%}
+      {%- if k is mapping and (k.keys() | map('string') | reject('in', ['fingerprint', 'label']) | list | length > 0) -%}
+      {%- set _ = errs.append('detection_quiet_ssh_keys item ' ~ loop.index ~ ' has keys other than fingerprint and label') -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- if qk | length > 64 -%}{%- set _ = errs.append('detection_quiet_ssh_keys holds more than 64 keys') -%}{%- endif -%}
+      {%- endif -%}
+      {%- set ht = detection_heartbeat_time | default('09:00') -%}
+      {%- if ht is not string or ht is not match(_det_time_re) or ht is search('[\r\n]') -%}
+      {%- set _ = errs.append('detection_heartbeat_time must be a quoted time like "09:00"') -%}
+      {%- endif -%}
+      {%- set rs = detection_revert_seconds | default(300) | string -%}
+      {%- if rs is not match('^[0-9]{3,4}$') or (rs | int) < 120 or (rs | int) > 1800 -%}
+      {%- set _ = errs.append('detection_revert_seconds must be a whole number from 120 to 1800') -%}
+      {%- endif -%}
+      {{ errs }}
+
+- name: "Detection vars: the detection_* values are valid"
+  ansible.builtin.assert:
+    quiet: true
+    that: _det_var_errors | length == 0
+    fail_msg: "{{ _det_var_errors | join('; ') | regex_replace('[{}]', '?') }}. Nothing has been changed."
+
+# detection_test_alert is true by default (a test message at install). To
+# tell "-e detection_test_alert=true" (send one now) from that default,
+# this task sets its own value for the name: only an extra var (-e) beats
+# a task variable, so any other value here came from the command line.
+- name: "Detection vars: was a test message asked for on the command line?"
+  ansible.builtin.set_fact:
+    _det_test_cli: "{{ (detection_test_alert | string) != 'autosec-not-from-the-command-line' }}"
+  vars:
+    detection_test_alert: autosec-not-from-the-command-line
+
+- name: "Detection vars: the checked values"
+  ansible.builtin.set_fact:
+    _det_enabled: "{{ (detection_enabled | default(false) | string | lower) in _det_yes_words }}"
+    _det_remove: "{{ (detection_remove | default(false) | string | lower) in _det_yes_words }}"
+    _det_hook_wanted: "{{ (detection_login_hook | default(true) | string | lower) in _det_yes_words }}"
+    _det_quiet_accounts: "{{ detection_quiet_accounts | default([]) | map('string') | unique | list }}"
+    _det_quiet_fps: >-
+      {%- set out = [] -%}
+      {%- for k in detection_quiet_ssh_keys | default([]) -%}
+      {%- set fp = (k.fingerprint | default('')) if k is mapping else k -%}
+      {%- if fp not in out -%}{%- set _ = out.append(fp | string) -%}{%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+    _det_quiet_labels: >-
+      {%- set out = [] -%}
+      {%- for k in detection_quiet_ssh_keys | default([]) -%}
+      {%- set fp = ((k.fingerprint | default('')) if k is mapping else k) | string -%}
+      {%- set label = ((k.label | default('no label')) if k is mapping else 'no label') | string -%}
+      {%- set _ = out.append(label ~ ' (' ~ fp[:11] ~ '...' ~ fp[-6:] ~ ')') -%}
+      {%- endfor -%}
+      {{ out }}
+    _det_test_forced: >-
+      {{ (_det_test_cli | bool) and (detection_test_alert | default(true) | string | lower) in _det_yes_words }}
+    _det_test_install: "{{ (detection_test_alert | default(true) | string | lower) in _det_yes_words }}"
+    _det_ci_api: ""
+    # Start values of what the preflight sets, so every later task finds them.
+    _det_role_runs: false
+    _det_installed: false
+    _det_cfg: false
+    _det_apply: false
+    _det_do_remove: false
+    _det_plan: {}
+    _det_status: {}
+    _det_notes: []
+    _det_hook_on: "{{ (detection_login_hook | default(true) | string | lower) in _det_yes_words }}"
+    _det_report: "{{ 'not checked in this run' if (detection_enabled | default(false) | string | lower) in _det_yes_words else 'off (detection_enabled: false)' }}"
+
+- name: "Detection R08-2: detection_remove only with detection_enabled: false"
+  ansible.builtin.assert:
+    quiet: true
+    that: not ((_det_enabled | bool) and (_det_remove | bool))
+    fail_msg: >-
+      [R08-2] detection_remove and detection_enabled are both true for {{ inventory_hostname }}. To take
+      login alerts out, set detection_enabled: false in host_vars and run once with
+      -e detection_remove=true. To keep them, drop -e detection_remove. Nothing has been changed.
+
+- name: "Detection R08-1: login alerts need a Telegram bot token and a chat id"
+  when: _det_enabled | bool
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - telegram_bot_token is defined
+      - telegram_chat_id is defined
+      - (telegram_bot_token | string) is match('^[0-9]{5,}:[A-Za-z0-9_-]{20,}$')
+      - (telegram_chat_id | string) is match('^-?[0-9]{1,32}$')
+    fail_msg: >-
+      [R08-1] detection_enabled is true for {{ inventory_hostname }}, but
+      {{ 'telegram_bot_token' if not ((telegram_bot_token | default('') | string) is match('^[0-9]{5,}:[A-Za-z0-9_-]{20,}$')) else 'telegram_chat_id' }}
+      is not set (or still CHANGE_ME). Without both, no alert could be sent and nobody would be told.
+      Set telegram_bot_token and telegram_chat_id (the wizard asks for them and sends a test), or set
+      detection_enabled: false. Nothing has been changed.
+
+# CI only (tests/detection/live): messages go to a fake Telegram on the
+# runner itself, never to the real one. Honoured only for a host with
+# autosec_ci: true, on a GitHub Actions controller that also sets
+# AUTOSEC_CI_DETECT=fake-telegram, and only for a loopback address.
+# Anywhere else it stops the run.
+- name: "Detection vars: autosec_ci_detect_api is a CI-only test switch"
+  when: autosec_ci_detect_api is defined
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - autosec_ci | default(false) | bool
+      - lookup('ansible.builtin.env', 'GITHUB_ACTIONS') == 'true'
+      - lookup('ansible.builtin.env', 'AUTOSEC_CI_DETECT') == 'fake-telegram'
+      - autosec_ci_detect_api is string
+      - autosec_ci_detect_api is match('^http://127\.0\.0\.1:[0-9]{2,5}$')
+    fail_msg: >-
+      autosec_ci_detect_api is set. It is a test switch for auto_sec's own CI that sends alerts to a
+      sink on the test machine instead of Telegram, and it works only there. Remove it. Nothing has
+      been changed.
+
+# CI only (tests/detection/live): the login test after the PAM change
+# counts as failed, so the automatic undo runs on a real runner. Honoured
+# only with autosec_ci: true on a GitHub Actions controller that also sets
+# AUTOSEC_CI_INJECT_FAILURE=pam.
+- name: "Detection vars: autosec_ci_inject_pam_fail is a CI-only test switch"
+  when: autosec_ci_inject_pam_fail is defined
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - autosec_ci | default(false) | bool
+      - lookup('ansible.builtin.env', 'GITHUB_ACTIONS') == 'true'
+      - lookup('ansible.builtin.env', 'AUTOSEC_CI_INJECT_FAILURE') == 'pam'
+    fail_msg: >-
+      autosec_ci_inject_pam_fail is set. It is a test switch for auto_sec's own CI that makes the
+      login test after the PAM change fail on purpose, and it works only there. Remove it. Nothing
+      has been changed.
+
+- name: "Detection vars: CI-only fake Telegram address"
+  when: autosec_ci_detect_api is defined
+  ansible.builtin.set_fact:
+    _det_ci_api: "{{ autosec_ci_detect_api }}"
+
+# Names of later stages of 0.7. They do nothing in this release.
+- name: "Detection N08-7: settings this release does not have yet"
+  when: _det_later | length > 0
+  ansible.builtin.debug:
+    msg: >-
+      [N08-7] INFO: {{ _det_later | join(', ') }} {{ 'is' if (_det_later | length == 1) else 'are' }} set,
+      but this release has no such feature yet: nothing is installed or removed for it.
+  vars:
+    _det_later: "{{ query('ansible.builtin.varnames', '^(detection_recon|detection_remove_legacy)$') | sort }}"

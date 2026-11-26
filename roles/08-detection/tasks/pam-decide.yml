@@ -1,0 +1,177 @@
+---
+# roles/08-detection/tasks/pam-decide.yml - refuse, note, or plan the PAM
+# change (R08-P1 to R08-P7, N08-6).
+#
+# Included right after pam-trial.yml with:
+#   _det_stage  preflight | apply
+#   _det_pam_do enable | remove
+# Reads _det_pam (host data; the helper has filtered every string). Sets:
+#   _det_pam_change  bool  this run changes the common PAM files
+#   _det_pam_blind   bool  the trial could not try the new profile yet
+#                          (Ubuntu 22.04); pam.yml tries again once the
+#                          profile is in place, under the automatic undo
+#   _det_pam_note    str   for the plan's notes
+#
+# auto_sec never forces pam-auth-update and never edits a common PAM file
+# itself: where pam-auth-update would refuse, auto_sec refuses too.
+
+- name: "Detection PAM decide: where the run stands"
+  ansible.builtin.set_fact:
+    # A removal on a server that never got the login hook has no PAM step.
+    _det_pam_needed: >-
+      {{ _det_pam_do == 'enable' or (_det_pam.hook_lines | default([]) | length > 0)
+         or (_det_pam.profile | default('absent')) != 'absent' }}
+    _det_pam_nothing: >-
+      {{ 'Nothing has been changed.' if _det_stage == 'preflight'
+         else 'The common PAM files have not been changed. Steps before this one may have changed other things.' }}
+    _det_pam_way_out: >-
+      {{ "Set detection_login_hook: false to run the journal reader only (no PAM file is touched; logins are then seen in the journal, and the console still alerts)."
+         if _det_pam_do == 'enable' else
+         "Take the line that names /usr/local/sbin/auto-sec-login-hook out of /etc/pam.d/common-session by hand (check a new login in a second session before you close the first), then run the removal again." }}
+
+# The trial writes only its copies. The helper compares the server's own
+# files before its first trial and after its last one. This comes first:
+# no other answer of the trial counts when that went wrong.
+- name: "Detection PAM decide R08-P7: the trial must not have changed the server's own PAM files"
+  ansible.builtin.assert:
+    quiet: true
+    that: _det_pam.host_changed | default([]) | length == 0
+    fail_msg: >-
+      [R08-P7] While auto_sec tried its PAM change on a copy, the real files on {{ inventory_hostname }}
+      changed: {{ _det_pam.host_changed | default([]) | join(', ') }}. The trial is not supposed to write
+      them. Either something else changed them at that moment (a package install runs pam-auth-update
+      too), or this server's pam-auth-update wrote outside the copy. auto_sec stops here, before its
+      own PAM change. Check that a new login works, in a second session, before you close this one.
+      Then run again.
+
+# pam-auth-update ignores an option it does not know: one without --root
+# would run the trial on the real files. The helper starts nothing then.
+- name: "Detection PAM decide R08-P3: pam-auth-update (with its --root option), pam_exec and timeout must be there"
+  when: _det_pam_needed | bool
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _det_pam.usable | default(false)
+      - (_det_pam_do != 'enable') or (_det_pam.pam_exec | default(false))
+      - (_det_pam_do != 'enable') or (_det_pam.timeout | default(false))
+      - _det_pam.problems | default([]) | length == 0
+    fail_msg: >-
+      [R08-P3] auto_sec cannot {{ 'add its login hook to' if _det_pam_do == 'enable' else 'take its login hook out of' }}
+      PAM on {{ inventory_hostname }} with pam-auth-update:
+      {{ ((['pam-auth-update (libpam-runtime) is not there'] if not (_det_pam.tool | default(false)) else [])
+          + (['pam_exec.so is not installed'] if (_det_pam_do == 'enable' and (_det_pam.usable | default(false)) and not (_det_pam.pam_exec | default(false))) else [])
+          + (['/usr/bin/timeout is not there'] if (_det_pam_do == 'enable' and (_det_pam.usable | default(false)) and not (_det_pam.timeout | default(false))) else [])
+          + (_det_pam.problems | default([]))) | join('; ') or 'its record of the package templates is missing' }}.
+      {{ _det_pam_way_out }} {{ _det_pam_nothing }}
+
+- name: "Detection PAM decide R08-P1: the common PAM files have hand edits"
+  when: _det_pam_needed | bool
+  ansible.builtin.assert:
+    quiet: true
+    that: not (_det_pam.refused | default(true))
+    fail_msg: >-
+      [R08-P1] The common PAM files on {{ inventory_hostname }} have hand edits: pam-auth-update says
+      "Local modifications to /etc/pam.d/common-*, not updating." (a line inside its own blocks is
+      not one it wrote). auto_sec does not force it and edits no PAM file itself.
+      {{ _det_pam_way_out }} {{ _det_pam_nothing }}
+
+- name: "Detection PAM decide R08-P5: a line with auto_sec's hook that auto_sec did not write"
+  when: _det_pam_do == 'enable'
+  ansible.builtin.assert:
+    quiet: true
+    that: _det_pam.hook_lines_other | default([]) | length == 0
+    fail_msg: >-
+      [R08-P5] A PAM line on {{ inventory_hostname }} names auto_sec's login hook, but not the way
+      auto_sec writes it: {{ _det_pam.hook_lines_other | default([]) | map('join', ': ') | join(' | ') }}.
+      Remove that line yourself (check a new login in a second session), then run again.
+      {{ _det_pam_nothing }}
+
+# pam_exec gives PAM's environment to the program it runs, and the login
+# hook runs as root. On a stock Debian or Ubuntu nothing a user chose is in
+# that environment when the common session lines run. Where a PAM file
+# reads a user's own ~/.pam_environment earlier, that user could hand root
+# a variable such as LD_PRELOAD through any pam_exec line.
+- name: "Detection PAM decide R08-P6: no PAM service may read a user's own environment file before the hook runs"
+  when: _det_pam_do == 'enable'
+  ansible.builtin.assert:
+    quiet: true
+    that: _det_pam.user_env_early | default([]) | length == 0
+    fail_msg: >-
+      [R08-P6] On {{ inventory_hostname }}, PAM reads a user's own environment file
+      (pam_env.so user_readenv=1) before the common session lines, in:
+      {{ _det_pam.user_env_early | default([]) | map('join', ' (') | map('regex_replace', '$', ' lines)') | join(', ') }}.
+      PAM would give those variables to auto_sec's login hook, which runs as root, so a user could
+      make root load a file of theirs (LD_PRELOAD). auto_sec does not add its hook on such a server.
+      Take user_readenv=1 out of that file (Linux-PAM calls it deprecated), or move that line below
+      the line "@include common-session", then run again.
+      {{ _det_pam_way_out }} {{ _det_pam_nothing }}
+
+- name: "Detection PAM decide R08-P2: pam-auth-update has changes of its own waiting"
+  when: _det_pam_needed | bool
+  ansible.builtin.assert:
+    quiet: true
+    that: _det_pam.pending | default(['?']) | length == 0
+    fail_msg: >-
+      [R08-P2] pam-auth-update on {{ inventory_hostname }} would change {{ _det_pam.pending | default([]) | join(', ') }}
+      even without auto_sec: a PAM profile of another package was added, changed or removed and is
+      not applied yet. auto_sec's run would apply that change too, under its own name. Run
+      `sudo pam-auth-update --package` yourself, check a new login in a second session, then run
+      again. {{ _det_pam_way_out }} {{ _det_pam_nothing }}
+
+- name: "Detection PAM decide R08-P4: the trial must add exactly auto_sec's one line"
+  when:
+    - _det_pam_do == 'enable'
+    - not (_det_pam.enable.blind | default(false))
+  ansible.builtin.assert:
+    quiet: true
+    that: _det_pam.enable.ok | default(false)
+    fail_msg: >-
+      [R08-P4] On a copy of {{ inventory_hostname }}'s PAM files, pam-auth-update with auto_sec's
+      profile did not give exactly one new line in /etc/pam.d/common-session: added
+      {{ _det_pam.enable.session_added | default([]) }}, removed {{ _det_pam.enable.session_removed | default([]) }},
+      other files {{ _det_pam.enable.unexpected | default([]) }}, it said
+      {{ _det_pam.enable.said | default([]) }}. auto_sec does not make a PAM change it cannot
+      foresee. {{ _det_pam_way_out }} {{ _det_pam_nothing }}
+
+- name: "Detection PAM decide R08-P4: the trial must take out exactly auto_sec's one line"
+  when:
+    - _det_pam_do == 'remove'
+    - (_det_pam.hook_lines | default([]) | length > 0) or (_det_pam.profile | default('absent')) != 'absent'
+  ansible.builtin.assert:
+    quiet: true
+    that: _det_pam.remove.ok | default(false)
+    fail_msg: >-
+      [R08-P4] On a copy of {{ inventory_hostname }}'s PAM files, pam-auth-update --remove did not
+      take out exactly auto_sec's line: added {{ _det_pam.remove.session_added | default([]) }}, removed
+      {{ _det_pam.remove.session_removed | default([]) }}, other files {{ _det_pam.remove.unexpected | default([]) }},
+      it said {{ _det_pam.remove.said | default([]) }}. {{ _det_pam_way_out }} {{ _det_pam_nothing }}
+
+- name: "Detection PAM decide: plan"
+  ansible.builtin.set_fact:
+    _det_pam_blind: "{{ _det_pam_do == 'enable' and (_det_pam.enable.blind | default(false)) }}"
+    _det_pam_change: >-
+      {{ (not (_det_pam.enable.noop | default(false))) if _det_pam_do == 'enable' else (_det_pam_needed | bool) }}
+    _det_pam_note: >-
+      {%- if _det_pam_do == 'enable' and (_det_pam.enable.noop | default(false)) -%}
+      the login hook's line is already in /etc/pam.d/common-session
+      {%- elif _det_pam_do == 'enable' and (_det_pam.enable.blind | default(false)) -%}
+      this server's pam-auth-update cannot try a new profile on a copy (Ubuntu 22.04 reads the profiles before its --root option): the trial runs again right after the profile is in place, under the automatic undo, before any PAM file changes
+      {%- elif _det_pam_do == 'enable' -%}
+      tried on a copy with this server's own pam-auth-update: exactly this one line is added{{ ", and auto_sec's older line goes" if (_det_pam.enable.session_removed | default([]) | length > 0) else '' }}; cron, plain sudo and services do not read this file
+      {%- elif _det_pam.remove.noop | default(true) -%}
+      no line of auto_sec's is in the common PAM files
+      {%- else -%}
+      tried on a copy: exactly auto_sec's line goes; after that the common PAM files are {{ {'yes': 'byte for byte as they were before detection was installed', 'no': 'NOT as they were before detection was installed (' ~ (_det_pam.remove.differs | default([]) | join(', ')) ~ ' changed since, by something else)', 'unknown': "without auto_sec's line (no record from the install to compare with)"}[_det_pam.remove.as_before | default('unknown')] }}
+      {%- endif -%}
+
+- name: "Detection PAM decide N08-6: the trial of the new profile waits (Ubuntu 22.04)"
+  when:
+    - _det_pam_blind | bool
+    - _det_stage == 'preflight'
+  ansible.builtin.debug:
+    msg: >-
+      [N08-6] NOTE: pam-auth-update on {{ inventory_hostname }} reads its profiles before its --root
+      option (Ubuntu 22.04), so auto_sec cannot try its new profile on a copy yet. The hand-edit
+      check and the "nothing else is waiting" check did run. The trial of the profile itself
+      runs right after the profile file is in place, under the automatic undo and before
+      pam-auth-update is run for real.

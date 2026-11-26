@@ -1,10 +1,12 @@
-"""Static checks of roles 08 and 09 in auto_sec 0.6 (keep-only).
+"""Static checks of what roles 08 and 09 do about auto_sec 0.1-0.5 (keep-only).
 
 Usage: python3 static.py <repo root>
 Prints one PASS/FAIL line per check; exit 1 when one fails.
 
-Roles 08 and 09 must install, write, start and delete nothing. So:
-  - the roles hold only defaults/main.yml and tasks/*.yml (no handlers,
+Role 09, and tasks/legacy.yml of role 08, must install, write, start and
+delete nothing. (The rest of role 08 is the login alerts of 0.7, which
+tests/detection covers.) So:
+  - role 09 holds only defaults/main.yml and tasks/*.yml (no handlers,
     templates, files, vars or meta);
   - every task uses a read-only module: set_fact, debug, assert, stat,
     slurp, or command with an argv list whose program is grep or
@@ -19,6 +21,8 @@ import yaml
 
 ROOT = sys.argv[1]
 ROLES = {"08-detection": "_plan_08", "09-watcher": "_plan_09"}
+# Read-only as a whole. Of the other role only tasks/legacy.yml is checked.
+KEEP_ONLY = {"09-watcher"}
 ALLOWED = {
     "ansible.builtin.set_fact", "ansible.builtin.debug", "ansible.builtin.assert",
     "ansible.builtin.stat", "ansible.builtin.slurp", "ansible.builtin.command",
@@ -54,12 +58,16 @@ for role, plan in ROLES.items():
                    for d, _, fs in os.walk(rdir) for f in fs)
     extra = [f for f in files if f != "defaults/main.yml" and not
              (f.startswith("tasks/") and f.endswith(".yml") and f.count("/") == 1)]
-    report(not extra, "%s holds only defaults/main.yml and tasks/*.yml%s"
-           % (role, (": also " + ", ".join(extra)) if extra else ""))
-    report("tasks/main.yml" not in files,
-           "%s has no tasks/main.yml (site.yml includes tasks_from: legacy)" % role)
+    whole = role in KEEP_ONLY
+    if whole:
+        report(not extra, "%s holds only defaults/main.yml and tasks/*.yml%s"
+               % (role, (": also " + ", ".join(extra)) if extra else ""))
+        report("tasks/main.yml" not in files,
+               "%s has no tasks/main.yml (site.yml includes tasks_from: legacy)" % role)
     for f in files:
         if not f.startswith("tasks/"):
+            continue
+        if not whole and f != "tasks/legacy.yml":
             continue
         doc = yaml.safe_load(open(os.path.join(rdir, f))) or []
         bad = []

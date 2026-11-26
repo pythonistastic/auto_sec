@@ -1,0 +1,18 @@
+# Written by auto_sec (role 08). auto_sec changes this file only while this line is first.
+# Permissions 0600, root only: this file holds the Telegram bot token.
+[detect]
+host_label = {{ inventory_hostname | regex_replace('[^A-Za-z0-9._-]', '_') }}
+telegram_bot_token = {{ telegram_bot_token }}
+telegram_chat_id = {{ telegram_chat_id }}
+# Logins of these accounts send no message (root is never quiet here).
+quiet_accounts = {{ _det_quiet_accounts | join(' ') }}
+# SSH logins with these keys send no message.
+quiet_ssh_keys = {{ _det_quiet_fps | join(' ') }}
+# The daily "still alive" message, server time (the timer has the same).
+alive_time = {{ detection_heartbeat_time }}
+# false: journal reader only, no login hook in PAM.
+login_hook = {{ 'true' if (_det_hook_on | bool) else 'false' }}
+{% if _det_ci_api | default('') | length > 0 %}
+# auto_sec's own CI only: messages go to a sink on this machine.
+api_base = {{ _det_ci_api }}
+{% endif %}

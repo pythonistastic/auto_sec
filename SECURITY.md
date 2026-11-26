@@ -303,6 +303,142 @@ a strict pattern check or a filter (printable ASCII, braces replaced by `?`).
   a file for you, written only on the controller (`reports/`, 0600), never on the server
   and never read by auto_sec again.
 
+### What login alerts read and write (role 08, 0.7)
+
+There are two sides: what a run reads, and what the installed program does on the server
+afterwards. With `detection_enabled: false` a run reads only the first item below (are
+files of auto_sec's login alerts on this server?) and, if they are, the second (their
+status). Everything else is read only with `detection_enabled: true` or
+`-e detection_remove=true`.
+
+**What a run reads.** All of it is **only compared, shown, or used to refuse a run**.
+None of it becomes a variable value, a file's content or part of a command. There is no
+exception here.
+
+- **auto_sec's own files.** One shell command on the host looks at each path role 08
+  would write: absent, a file (its SHA-256, and a yes or no: does it carry auto_sec's
+  header line), a folder (mode and owner), a link (does it point at auto_sec's unit, yes
+  or no), or something else. It also lists unit files with auto_sec's names in other
+  unit folders. `/etc/auto-sec/detect.conf` holds the Telegram token: only its SHA-256
+  and the yes or no about its first line come back, never a line of it. The checksums
+  are compared with the files this run would write, and again right before the write
+  (M08-1). Paths are shown after a filter.
+- **The status of detection.** When the program and its settings are auto_sec's own
+  files, the run asks the installed `auto-sec-detect status --json`. Of the answer it
+  takes two fixed words (`on`, `dead`; `hook+journal`, `journal`), a yes or no, a number,
+  and one line of text. The line is shown in the plan's notes and the report after the
+  usual filter (printable ASCII, braces replaced by `?`, 300 characters). That program
+  runs as root on the server, and whoever is root there can change it; its answer is
+  treated like any other host data.
+- **The trial of the PAM change.** A helper (`roles/08-detection/files/auto-sec-pam-check`,
+  Python standard library, sent with every run and started as `python3 -I -c`) copies the
+  five common PAM files, pam-auth-update's records (`/var/lib/pam/*`) and the profiles
+  (`/usr/share/pam-configs/*`) into a scratch folder (`/run/auto-sec/det-sim`, tmpfs,
+  root only, removed again). There it runs the host's own `pam-auth-update --root <copy>`
+  with a debconf database of the trial's own, so nothing under `/etc`, `/var/lib/pam` or
+  debconf's database is written. Two guards hold that promise. pam-auth-update ignores an
+  option it does not know, so one without `--root` would run the "trial" on the real
+  files: the helper first reads the tool for that option and starts nothing when it is
+  missing (R08-P3). And it takes the checksums of the real files before the first trial
+  and after the last one; a difference stops the run (R08-P7). What comes back: yes/no
+  answers, fixed words, SHA-256 values, file names from a fixed list, and a few lines of
+  PAM files and of pam-auth-update's output. Those lines are filtered and appear only in
+  refusal messages
+  (R08-P4, R08-P5). The checksums are compared with the files after the real change
+  (M08-3). The helper also reads the files in `/etc/pam.d` to answer one question (R08-P6,
+  "PAM's environment" below); only the names of the services it found come back,
+  filtered.
+- **debconf's database, at the real change only.** `pam-auth-update` keeps its answer
+  (the list of enabled profiles) in debconf's database, as it does for every package. So
+  the real change adds auto_sec's profile to that list, and the removal takes it out
+  again. The automatic undo puts files back, not this note: after an undo the note does
+  not match the files until pam-auth-update runs again. pam-auth-update decides from the
+  PAM files and its records in `/var/lib/pam`. It falls back on the note only when it
+  cannot match those two (hand edits) and someone runs it with `--force`; auto_sec never
+  does.
+- **The PAM files' checksums from before the install.** They are written on the host
+  (`/var/lib/auto-sec/detect/pam-before.json`, root only) and never come back. At a
+  removal the helper compares them on the host; one of three fixed words and file names
+  from the fixed list come back.
+- **Unit states** of auto_sec's own units (compared with `active`), and the names of
+  units with unloaded edits (R08-5; shown after a pattern check).
+- **Webmin.** When `/etc/webmin/miniserv.conf` exists, a `sed` on the host takes two
+  values out of it, each only if it matches a strict pattern (`syslog=0|1`,
+  `pam=<name>`). They decide the wording of a note (N08-4). No other line of the file is
+  read into the run.
+- **The test message.** `auto-sec-detect test` prints an id (shown only if it is eight
+  hex digits), yes or no, and an error word (letters, digits and spaces only).
+
+**What the run writes on the server** is in the plan before the first file is written.
+Every value in those files comes from your variables (checked for shape: account names,
+fingerprints, a time) or from role constants.
+
+**Where the token lives.** `/etc/auto-sec/detect.conf`, mode 0600, owner root, and
+nowhere else on the server for good. One more place holds it for a moment: every run
+with `detection_enabled: true`, also plan only and `--check`, writes the settings file
+once into a scratch folder on the server (`/run/auto-sec/det-sim`, tmpfs, root only), to
+compare its checksum with the file that is there, and removes it again right after (a
+run that loses its connection at that moment leaves it there until the next run or a
+reboot). So the token reaches a server as soon as a run plans login alerts for it, before
+your OK for the change. The tasks that write it have `no_log`. The sender builds the Telegram
+address from it in memory; it is in no command line, no log line and no message. A
+failed send logs only an error word. Removal deletes the file.
+
+**The login hook** (`/usr/local/sbin/auto-sec-login-hook`, run by PAM as root when a
+login session opens).
+
+- It writes one file, `h.<random id>.ev`, into `/var/spool/auto-sec/events` (0700 root):
+  the PAM service, the account, the asking account, the terminal and the remote host as
+  PAM gives them; the process id and real user id of the program that opened the
+  session; the audit session id and login uid. It reads five small files under `/proc`
+  for that. No password, no environment, no command.
+- It runs no other program and opens no network connection. It cannot fail a login: the
+  PAM line is `optional`, has a 1-second limit, and the script exits 0 whatever happens.
+- The values are not checked by the hook. Each ends with a NUL byte, so a value with
+  quotes or newlines cannot change the format. The sender checks every value.
+- Only root can write into the queue. A program that an ordinary account runs through
+  PAM runs the hook as that account, which cannot write there. So an ordinary account
+  cannot forge a hook event.
+- **PAM's environment.** `pam_exec` starts the hook with PAM's environment, and for a
+  real login the hook runs as root (the line has `seteuid`, so that `su` can write into
+  the root-only queue). So nothing a user chose may be in that environment. On stock
+  Ubuntu 22.04, 24.04 and 26.04 and Debian 12 and 13 nothing is: in each release's own
+  `login`, `su` and `sudo-i` files, `pam_env` reads only system files before the common
+  session lines, and `sshd` reads a user's `~/.pam_environment` (where the release still
+  does, `user_readenv=1`) only after them. The trial helper reads the files in
+  `/etc/pam.d` for exactly this, and the run refuses to add the hook when a service
+  reads a user's own environment file earlier (R08-P6), in the preflight and again right
+  before the change. It is checked at every run with the hook, not between runs: a PAM
+  file changed that way later is found by the next run, not by the checker.
+
+**The journal reader, and how log text is trusted.** Log lines are untrusted text: a
+client chooses parts of them (an account name, a host name, a command line).
+
+- The reader asks the journal only for lines whose **program path** (`_EXE`) is one of a
+  fixed list (`sshd`, `sshd-session`, `login`, `su`, `sudo`). journald sets that field
+  itself; the sender of a line cannot. A line that only claims to be from sshd (through
+  `logger`, for example) is not read. For `sshd` and `login` the line must also come from
+  a root process, so a copy of sshd that an ordinary account starts is not read. Webmin's
+  line is read by its name (`webmin`, `usermin`) and only from a root process.
+- Each line must match one strict pattern from start to end. Every value is cut to
+  printable characters and a fixed length before it is stored or sent.
+- sudo's line holds the working folder and the command, which the user chose. A line
+  with more than one ` ; USER=` or ` ; COMMAND=` cannot be read safely: the message then
+  says exactly that, and names no target account. Of a command only the program's name
+  is used, and only to decide "is it a shell". Arguments are never stored or sent.
+- An event from the journal and an event from the hook belong to one login when they
+  carry the same process id, which comes from journald and from `/proc`, not from the
+  line's text.
+- No value from a log line or from PAM is ever run, used as a path, or put into a
+  command. Values end up in exactly one place: the text of a Telegram message to your
+  own chat.
+
+**What an attacker with an ordinary account can do:** make noise (a real login is a real
+alert) and nothing more that we know of. **What root on the server can do:** everything,
+including switching the alerts off; the "watcher stopped" message and the checker make
+that visible only if the attacker does not also block them. Login alerts are not a
+defence against root.
+
 A new use of host data as an argument, a value or file content needs the same kind of
 written exception here, and a review. Treat anything else that crosses this line as a
 high-severity bug.

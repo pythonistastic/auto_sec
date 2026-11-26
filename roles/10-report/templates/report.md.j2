@@ -175,7 +175,19 @@ Anything else says "not checked by auto_sec".
 
 ## 4. Detection and response
 
-- Detection: not managed by auto_sec 0.6
+{#- Login alerts: role 08's line. Its preflight asked the server's own
+    auto-sec-detect for its status during this run (filtered: printable
+    ASCII, no braces), and role 08 main asked again after an install. No
+    fact at all (preflight skipped): "not checked". The two lines about
+    auto_sec 0.1-0.5 show only when something of it is still there. -#}
+- Login alerts (read during this run): {{ _det_report | default('not checked in this run', true) }}
+{% if _l08_report | default('') | string | length > 0 %}
+- Audit rules of auto_sec 0.1-0.5: {{ _l08_report }}
+{% endif %}
+{% if _l09_report | default('') | string | length > 0 %}
+- Detectors of auto_sec 0.1-0.5: {{ _l09_report }}. They do not work as documented
+{% endif %}
+- Other detection (file changes, processes, network): not checked by auto_sec
 
 ## 5. Firewall state at time of report
 

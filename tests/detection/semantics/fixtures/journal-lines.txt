@@ -1,0 +1,101 @@
+# Journal lines for the journal reader (sensor B), tests/detection/semantics.
+#
+# One JSON object per line; lines that start with # are comments.
+#   sets    the releases this line stands for: jammy (Ubuntu 22.04), noble
+#           (24.04), resolute (26.04), bookworm (Debian 12), trixie (13)
+#   origin  captured: logged by that release's own program in the lab, with
+#                     the account and the address replaced by example values
+#           format:   built from the message format in that release's own
+#                     binary (read with `strings` from the pinned .deb), with
+#                     example values
+#   rec     the journal record, as `journalctl -o json` gives it (only the
+#           fields the reader asks for)
+#   want    the fields the reader must take from it, or null: no event
+#
+# Where the formats come from (packages of 26 November 2026):
+#   sshd   "%s %s%s%s for %s%.100s from %.200s port %d ssh2%s%s" with
+#          "Accepted", and for the key "%s %s%s%s" / "%s %s ID %s (serial
+#          %llu) CA %s %s%s%s": /usr/sbin/sshd of openssh-server 8.9p1
+#          (jammy), 9.2p1 (bookworm), 9.6p1 (noble); /usr/lib/openssh/
+#          sshd-session of 10.0p1 (trixie) and 10.2p1 (resolute). The
+#          publickey lines of jammy, bookworm and noble were captured: each
+#          release's sshd ran without root on 127.0.0.1 and took a login
+#          with a throwaway key.
+#   login  shadow's /usr/bin/login (jammy, bookworm, noble): "ROOT LOGIN %s"
+#          with " on '%.100s'" or " on '%.100s' from '%.200s'". util-linux's
+#          (trixie, resolute): "ROOT LOGIN ON %s", "LOGIN ON %s BY %s".
+#   su     util-linux, all five: "%s(to %s) %s on %s", with "FAILED SU ".
+#   sudo   sudoers.so, all five: "TTY=%s ; ", "PWD=%s ; ", "USER=%s ; ",
+#          "COMMAND=%s". sudo-rs 0.2.13 (resolute): "{} : {} PWD={} ;
+#          USER={} ; COMMAND={}" with "TTY={} ;".
+#   pam    pam_unix.so, all five: "session opened for user %s(uid=%s) by
+#          %s(uid=%lu)". The login line of noble was captured on Ubuntu 24.04.
+#          pam_exec.so: "%s failed: exit code %d", "%s failed: caught signal %d%s".
+#   Webmin miniserv.pl 2.303: syslog("info", "Successful login as $authuser
+#          from $loghost"), identifier = the `pam` value of miniserv.conf
+#          (webmin, usermin).
+# NOT RUN YET on a real server of each release: the live jobs
+# (tests/detection/live) capture the real lines on Ubuntu 22.04 and 24.04.
+
+# --- sshd: a password ---
+{"sets": ["jammy", "bookworm", "noble"], "origin": "format", "rec": {"_EXE": "/usr/sbin/sshd", "SYSLOG_IDENTIFIER": "sshd", "_UID": "0", "_PID": "4101", "__REALTIME_TIMESTAMP": "1795000000000000", "MESSAGE": "Accepted password for root from 203.0.113.5 port 40022 ssh2"}, "want": {"kind": "accepted", "svc": "sshd", "method": "password", "user": "root", "rhost": "203.0.113.5", "port": "40022", "fp": "", "app": "4101", "ts": "1795000000"}}
+{"sets": ["trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/lib/openssh/sshd-session", "SYSLOG_IDENTIFIER": "sshd-session", "_UID": "0", "_PID": "4102", "__REALTIME_TIMESTAMP": "1795000001000000", "MESSAGE": "Accepted password for root from 2001:db8::5 port 40023 ssh2"}, "want": {"kind": "accepted", "method": "password", "user": "root", "rhost": "2001:db8::5", "fp": ""}}
+# --- sshd: a key (the shape captured from each release's own sshd) ---
+{"sets": ["jammy"], "origin": "captured", "rec": {"_EXE": "/usr/sbin/sshd", "SYSLOG_IDENTIFIER": "sshd", "_UID": "0", "_PID": "4110", "__REALTIME_TIMESTAMP": "1795000002000000", "MESSAGE": "Accepted publickey for root from 198.51.100.7 port 40134 ssh2: ED25519 SHA256:91kTeUIf2aJCD8UWjmPB35/8mOW3iviwpjZ8Yz+JXR8"}, "want": {"kind": "accepted", "method": "publickey", "user": "root", "rhost": "198.51.100.7", "keytype": "ED25519", "fp": "SHA256:91kTeUIf2aJCD8UWjmPB35/8mOW3iviwpjZ8Yz+JXR8"}}
+{"sets": ["bookworm"], "origin": "captured", "rec": {"_EXE": "/usr/sbin/sshd", "SYSLOG_IDENTIFIER": "sshd", "_UID": "0", "_PID": "4111", "__REALTIME_TIMESTAMP": "1795000003000000", "MESSAGE": "Accepted publickey for deploy from 198.51.100.7 port 41628 ssh2: RSA SHA256:kYCVg3P00Hi90avKsg7gku5eBXW1oNQSGxCAndEHFOQ"}, "want": {"kind": "accepted", "method": "publickey", "user": "deploy", "keytype": "RSA", "fp": "SHA256:kYCVg3P00Hi90avKsg7gku5eBXW1oNQSGxCAndEHFOQ"}}
+{"sets": ["noble"], "origin": "captured", "rec": {"_EXE": "/usr/sbin/sshd", "SYSLOG_IDENTIFIER": "sshd", "_UID": "0", "_PID": "4112", "__REALTIME_TIMESTAMP": "1795000004000000", "MESSAGE": "Accepted publickey for root from 198.51.100.7 port 59706 ssh2: ED25519 SHA256:91kTeUIf2aJCD8UWjmPB35/8mOW3iviwpjZ8Yz+JXR8"}, "want": {"kind": "accepted", "method": "publickey", "user": "root", "keytype": "ED25519", "fp": "SHA256:91kTeUIf2aJCD8UWjmPB35/8mOW3iviwpjZ8Yz+JXR8"}}
+{"sets": ["trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/lib/openssh/sshd-session", "SYSLOG_IDENTIFIER": "sshd-session", "_UID": "0", "_PID": "4113", "__REALTIME_TIMESTAMP": "1795000005000000", "MESSAGE": "Accepted publickey for root from 198.51.100.7 port 51000 ssh2: ED25519 SHA256:91kTeUIf2aJCD8UWjmPB35/8mOW3iviwpjZ8Yz+JXR8"}, "want": {"kind": "accepted", "method": "publickey", "user": "root", "fp": "SHA256:91kTeUIf2aJCD8UWjmPB35/8mOW3iviwpjZ8Yz+JXR8"}}
+# a certificate: the fingerprint of the key comes first, the rest is kept out
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/sbin/sshd", "SYSLOG_IDENTIFIER": "sshd", "_UID": "0", "_PID": "4114", "__REALTIME_TIMESTAMP": "1795000006000000", "MESSAGE": "Accepted publickey for root from 198.51.100.7 port 51001 ssh2: ED25519-CERT SHA256:91kTeUIf2aJCD8UWjmPB35/8mOW3iviwpjZ8Yz+JXR8 ID lab-key (serial 7) CA ED25519 SHA256:kYCVg3P00Hi90avKsg7gku5eBXW1oNQSGxCAndEHFOQ"}, "want": {"kind": "accepted", "method": "publickey", "keytype": "ED25519-CERT", "fp": "SHA256:91kTeUIf2aJCD8UWjmPB35/8mOW3iviwpjZ8Yz+JXR8"}}
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/sbin/sshd", "SYSLOG_IDENTIFIER": "sshd", "_UID": "0", "_PID": "4115", "__REALTIME_TIMESTAMP": "1795000007000000", "MESSAGE": "Accepted keyboard-interactive/pam for root from 203.0.113.5 port 40030 ssh2"}, "want": {"kind": "accepted", "method": "keyboard-interactive/pam", "user": "root", "fp": ""}}
+# not a login
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/sbin/sshd", "SYSLOG_IDENTIFIER": "sshd", "_UID": "0", "_PID": "4116", "__REALTIME_TIMESTAMP": "1795000008000000", "MESSAGE": "Failed password for invalid user Accepted password for root from 203.0.113.5 port 1 ssh2 from 203.0.113.9 port 40031 ssh2"}, "want": null}
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/sbin/sshd", "SYSLOG_IDENTIFIER": "sshd", "_UID": "0", "_PID": "4117", "__REALTIME_TIMESTAMP": "1795000009000000", "MESSAGE": "Accepted password for root from 203.0.113.5 port 40022 ssh2\nAccepted publickey for root from 198.51.100.7 port 2 ssh2: ED25519 SHA256:91kTeUIf2aJCD8UWjmPB35/8mOW3iviwpjZ8Yz+JXR8"}, "want": null}
+# the same words from another program (logger), or without a program path: not read
+{"sets": ["noble"], "origin": "format", "rec": {"_EXE": "/usr/bin/logger", "SYSLOG_IDENTIFIER": "sshd", "_UID": "1000", "_PID": "4118", "__REALTIME_TIMESTAMP": "1795000010000000", "MESSAGE": "Accepted publickey for root from 198.51.100.7 port 59706 ssh2: ED25519 SHA256:91kTeUIf2aJCD8UWjmPB35/8mOW3iviwpjZ8Yz+JXR8"}, "want": null}
+{"sets": ["noble"], "origin": "format", "rec": {"SYSLOG_IDENTIFIER": "sshd", "_UID": "0", "_PID": "4119", "__REALTIME_TIMESTAMP": "1795000011000000", "MESSAGE": "Accepted password for root from 203.0.113.5 port 40022 ssh2"}, "want": null}
+# a copy of sshd that an ordinary account started on a high port (the lab ran sshd that way to capture the lines above): not a door into the server
+{"sets": ["jammy", "bookworm", "noble"], "origin": "format", "rec": {"_EXE": "/usr/sbin/sshd", "SYSLOG_IDENTIFIER": "sshd", "_UID": "1000", "_PID": "4120", "__REALTIME_TIMESTAMP": "1795000012000000", "MESSAGE": "Accepted publickey for deploy from 127.0.0.1 port 40140 ssh2: ED25519 SHA256:91kTeUIf2aJCD8UWjmPB35/8mOW3iviwpjZ8Yz+JXR8"}, "want": null}
+{"sets": ["jammy", "bookworm", "noble"], "origin": "format", "rec": {"_EXE": "/usr/sbin/sshd", "SYSLOG_IDENTIFIER": "sshd", "_UID": "1000", "_PID": "4120", "__REALTIME_TIMESTAMP": "1795000012000000", "MESSAGE": "pam_unix(sshd:session): session opened for user deploy(uid=1000) by (uid=1000)"}, "want": null}
+# --- pam_unix, as each program logs it ---
+{"sets": ["jammy", "bookworm", "noble"], "origin": "format", "rec": {"_EXE": "/usr/sbin/sshd", "SYSLOG_IDENTIFIER": "sshd", "_UID": "0", "_PID": "4110", "__REALTIME_TIMESTAMP": "1795000012000000", "MESSAGE": "pam_unix(sshd:session): session opened for user root(uid=0) by (uid=0)"}, "want": {"kind": "pam_open", "svc": "sshd", "user": "root", "ruser": "", "byuid": "0"}}
+{"sets": ["noble"], "origin": "captured", "rec": {"_EXE": "/usr/bin/login", "SYSLOG_IDENTIFIER": "login", "_UID": "0", "_PID": "270", "__REALTIME_TIMESTAMP": "1795000013000000", "MESSAGE": "pam_unix(login:session): session opened for user deploy(uid=1000) by deploy(uid=0)"}, "want": {"kind": "pam_open", "svc": "login", "user": "deploy", "byuid": "0"}}
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/login", "SYSLOG_IDENTIFIER": "login", "_UID": "0", "_PID": "271", "__REALTIME_TIMESTAMP": "1795000014000000", "MESSAGE": "pam_unix(login:session): session opened for user root(uid=0) by LOGIN(uid=0)"}, "want": {"kind": "pam_open", "svc": "login", "user": "root", "ruser": "LOGIN", "byuid": "0"}}
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/su", "SYSLOG_IDENTIFIER": "su", "_UID": "1000", "_PID": "5200", "__REALTIME_TIMESTAMP": "1795000015000000", "MESSAGE": "pam_unix(su:session): session opened for user root(uid=0) by deploy(uid=1000)"}, "want": {"kind": "pam_open", "svc": "su", "user": "root", "ruser": "deploy", "byuid": "1000"}}
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/su", "SYSLOG_IDENTIFIER": "su", "_UID": "0", "_PID": "5201", "__REALTIME_TIMESTAMP": "1795000016000000", "MESSAGE": "pam_unix(su-l:session): session opened for user postgres(uid=114) by deploy(uid=0)"}, "want": {"kind": "pam_open", "svc": "su-l", "user": "postgres", "byuid": "0"}}
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/sudo", "SYSLOG_IDENTIFIER": "sudo", "_UID": "0", "_PID": "5300", "__REALTIME_TIMESTAMP": "1795000017000000", "MESSAGE": "pam_unix(sudo-i:session): session opened for user root(uid=0) by deploy(uid=1000)"}, "want": {"kind": "pam_open", "svc": "sudo-i", "user": "root", "byuid": "1000"}}
+# plain sudo opens a session for every command: not a login
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/sudo", "SYSLOG_IDENTIFIER": "sudo", "_UID": "0", "_PID": "5301", "__REALTIME_TIMESTAMP": "1795000018000000", "MESSAGE": "pam_unix(sudo:session): session opened for user root(uid=0) by deploy(uid=1000)"}, "want": null}
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/su", "SYSLOG_IDENTIFIER": "su", "_UID": "1000", "_PID": "5202", "__REALTIME_TIMESTAMP": "1795000019000000", "MESSAGE": "pam_unix(su:auth): authentication failure; logname=deploy uid=1000 euid=0 tty=/dev/pts/0 ruser=deploy rhost=  user=root"}, "want": null}
+# --- the console ---
+{"sets": ["jammy", "bookworm", "noble"], "origin": "format", "rec": {"_EXE": "/usr/bin/login", "SYSLOG_IDENTIFIER": "login", "_UID": "0", "_PID": "280", "__REALTIME_TIMESTAMP": "1795000020000000", "MESSAGE": "ROOT LOGIN  on '/dev/ttyS0'"}, "want": {"kind": "login_line", "svc": "login", "user": "root", "tty": "/dev/ttyS0", "rhost": ""}}
+{"sets": ["jammy", "bookworm", "noble"], "origin": "format", "rec": {"_EXE": "/usr/bin/login", "SYSLOG_IDENTIFIER": "login", "_UID": "0", "_PID": "281", "__REALTIME_TIMESTAMP": "1795000021000000", "MESSAGE": "ROOT LOGIN  on '/dev/tty1'"}, "want": {"kind": "login_line", "user": "root", "tty": "/dev/tty1"}}
+{"sets": ["trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/login", "SYSLOG_IDENTIFIER": "login", "_UID": "0", "_PID": "282", "__REALTIME_TIMESTAMP": "1795000022000000", "MESSAGE": "ROOT LOGIN ON ttyS0"}, "want": {"kind": "login_line", "user": "root", "tty": "ttyS0"}}
+{"sets": ["trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/login", "SYSLOG_IDENTIFIER": "login", "_UID": "0", "_PID": "283", "__REALTIME_TIMESTAMP": "1795000023000000", "MESSAGE": "LOGIN ON tty1 BY deploy"}, "want": {"kind": "login_line", "user": "deploy", "tty": "tty1"}}
+{"sets": ["jammy", "bookworm", "noble"], "origin": "format", "rec": {"_EXE": "/usr/bin/login", "SYSLOG_IDENTIFIER": "login", "_UID": "0", "_PID": "284", "__REALTIME_TIMESTAMP": "1795000024000000", "MESSAGE": "FAILED LOGIN (1) on '/dev/tty1' FOR 'root', Authentication failure"}, "want": null}
+# --- su ---
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/su", "SYSLOG_IDENTIFIER": "su", "_UID": "1000", "_PID": "5200", "__REALTIME_TIMESTAMP": "1795000025000000", "MESSAGE": "(to root) deploy on pts/0"}, "want": {"kind": "su_line", "svc": "su", "user": "root", "ruser": "deploy", "tty": "pts/0"}}
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/su", "SYSLOG_IDENTIFIER": "su", "_UID": "1000", "_PID": "5203", "__REALTIME_TIMESTAMP": "1795000026000000", "MESSAGE": "FAILED SU (to root) deploy on pts/0"}, "want": null}
+# --- sudo: only a shell counts ---
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/sudo", "SYSLOG_IDENTIFIER": "sudo", "_UID": "0", "_PID": "5310", "__REALTIME_TIMESTAMP": "1795000027000000", "MESSAGE": "  deploy : TTY=pts/0 ; PWD=/home/deploy ; USER=root ; COMMAND=/bin/bash"}, "want": {"kind": "sudo_cmd", "svc": "sudo", "ruser": "deploy", "user": "root", "tty": "pts/0", "cmd": "/bin/bash"}}
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/sudo", "SYSLOG_IDENTIFIER": "sudo", "_UID": "0", "_PID": "5311", "__REALTIME_TIMESTAMP": "1795000028000000", "MESSAGE": "  deploy : TTY=pts/0 ; PWD=/home/deploy ; USER=root ; COMMAND=/usr/bin/su -"}, "want": {"kind": "sudo_cmd", "ruser": "deploy", "user": "root", "cmd": "/usr/bin/su"}}
+{"sets": ["resolute"], "origin": "format", "rec": {"_EXE": "/usr/lib/cargo/bin/sudo", "SYSLOG_IDENTIFIER": "sudo", "_UID": "0", "_PID": "5312", "__REALTIME_TIMESTAMP": "1795000029000000", "MESSAGE": "deploy : TTY=pts/0 ; PWD=/home/deploy ; USER=root ; COMMAND=/usr/bin/bash"}, "want": {"kind": "sudo_cmd", "ruser": "deploy", "user": "root", "cmd": "/usr/bin/bash"}}
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/sudo", "SYSLOG_IDENTIFIER": "sudo", "_UID": "0", "_PID": "5313", "__REALTIME_TIMESTAMP": "1795000030000000", "MESSAGE": "  deploy : TTY=pts/0 ; PWD=/home/deploy ; USER=root ; COMMAND=/usr/bin/apt update"}, "want": null}
+# an Ansible task with become: a shell that runs one command
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/sudo", "SYSLOG_IDENTIFIER": "sudo", "_UID": "0", "_PID": "5314", "__REALTIME_TIMESTAMP": "1795000031000000", "MESSAGE": "  deploy : PWD=/home/deploy ; USER=root ; COMMAND=/bin/sh -c 'echo BECOME-SUCCESS-abcdefgh ; /usr/bin/python3 /home/deploy/.ansible/tmp/x/AnsiballZ_command.py'"}, "want": null}
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/sudo", "SYSLOG_IDENTIFIER": "sudo", "_UID": "0", "_PID": "5315", "__REALTIME_TIMESTAMP": "1795000032000000", "MESSAGE": "  deploy : TTY=pts/0 ; PWD=/home/deploy ; USER=root ; COMMAND=/bin/bash /opt/backup/run.sh"}, "want": null}
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/sudo", "SYSLOG_IDENTIFIER": "sudo", "_UID": "0", "_PID": "5316", "__REALTIME_TIMESTAMP": "1795000033000000", "MESSAGE": "  deploy : command not allowed ; TTY=pts/0 ; PWD=/home/deploy ; USER=root ; COMMAND=/bin/bash"}, "want": null}
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/sudo", "SYSLOG_IDENTIFIER": "sudo", "_UID": "0", "_PID": "5317", "__REALTIME_TIMESTAMP": "1795000034000000", "MESSAGE": "  deploy : 3 incorrect password attempts ; TTY=pts/0 ; PWD=/home/deploy ; USER=root ; COMMAND=/bin/bash"}, "want": null}
+# a folder name made to look like the rest of the line: reported, never read as "nobody"
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/sudo", "SYSLOG_IDENTIFIER": "sudo", "_UID": "0", "_PID": "5318", "__REALTIME_TIMESTAMP": "1795000035000000", "MESSAGE": "  deploy : TTY=pts/0 ; PWD=/tmp/x ; USER=nobody ; COMMAND=/bin/true ; USER=root ; COMMAND=/bin/bash"}, "want": {"kind": "sudo_cmd", "ruser": "deploy", "user": "root", "odd": "1"}}
+# --- Webmin and Usermin ---
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/perl", "SYSLOG_IDENTIFIER": "webmin", "_UID": "0", "_PID": "6400", "__REALTIME_TIMESTAMP": "1795000036000000", "MESSAGE": "Successful login as root from 198.51.100.7"}, "want": {"kind": "web_login", "svc": "webmin", "user": "root", "rhost": "198.51.100.7"}}
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/perl", "SYSLOG_IDENTIFIER": "usermin", "_UID": "0", "_PID": "6401", "__REALTIME_TIMESTAMP": "1795000037000000", "MESSAGE": "Successful login as deploy from 198.51.100.7"}, "want": {"kind": "web_login", "svc": "usermin", "user": "deploy"}}
+{"sets": ["jammy", "bookworm", "noble", "trixie", "resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/perl", "SYSLOG_IDENTIFIER": "webmin", "_UID": "0", "_PID": "6402", "__REALTIME_TIMESTAMP": "1795000038000000", "MESSAGE": "Invalid login as root from 198.51.100.7"}, "want": null}
+# the same words from an ordinary account: not read
+{"sets": ["noble"], "origin": "format", "rec": {"_EXE": "/usr/bin/logger", "SYSLOG_IDENTIFIER": "webmin", "_UID": "1000", "_PID": "6403", "__REALTIME_TIMESTAMP": "1795000039000000", "MESSAGE": "Successful login as root from 198.51.100.7"}, "want": null}
+# --- the login hook was cut off or failed (pam_exec says so in the journal) ---
+{"sets": ["jammy", "bookworm", "noble", "trixie"], "origin": "format", "rec": {"_EXE": "/usr/sbin/sshd", "SYSLOG_IDENTIFIER": "sshd", "_UID": "0", "_PID": "4120", "__REALTIME_TIMESTAMP": "1795000040000000", "MESSAGE": "pam_exec(sshd:session): /usr/bin/timeout failed: caught signal 9"}, "want": {"kind": "hook_fail", "svc": "sshd", "why": "caught signal 9"}}
+{"sets": ["resolute"], "origin": "format", "rec": {"_EXE": "/usr/bin/su", "SYSLOG_IDENTIFIER": "su", "_UID": "1000", "_PID": "5204", "__REALTIME_TIMESTAMP": "1795000041000000", "MESSAGE": "pam_exec(su:session): /usr/bin/timeout failed: exit code 124"}, "want": {"kind": "hook_fail", "svc": "su", "why": "exit code 124"}}
+# a message that is not text (journalctl gives a list of bytes)
+{"sets": ["noble"], "origin": "format", "rec": {"_EXE": "/usr/sbin/sshd", "SYSLOG_IDENTIFIER": "sshd", "_UID": "0", "_PID": "4121", "__REALTIME_TIMESTAMP": "1795000042000000", "MESSAGE": [65, 99, 99, 101, 112, 116, 101, 100, 255, 254]}, "want": null}

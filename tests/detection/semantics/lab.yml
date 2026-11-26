@@ -1,0 +1,84 @@
+---
+# LAB ONLY (tests/detection/semantics/run.sh). Role 08 as site.yml wires it,
+# run unprivileged against a lab tree instead of /:
+#   pre_tasks  08-detection vars (R08-1, R08-2, value shapes), legacy,
+#              preflight (reads, the PAM trial, refusals, plan lines), then
+#              the run plan (00-plan: plan id, approval, plan only)
+#   tasks      the layer 08 include, as in site.yml
+# run.sh passes every path of the role (-e @vars.json) into the lab tree,
+# a systemctl stub (first in PATH and as _det_systemctl), a pam-auth-update
+# of a pinned libpam-runtime .deb, and the facts role 02's preflight would
+# have set. The PAM step runs here too (test_role.py, groups a8 to a10):
+# the release's real pam-auth-update changes the lab tree, under a private
+# copy of the real undo script (stubs/roles/02-ssh-hardening stands in for
+# role 02's task file, which needs root), and stubs/su is the login test.
+# No real login goes through PAM here: the live suite does that. Facts go
+# to <lab_out> as JSON.
+- name: Role 08 (login alerts) against a lab tree
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  pre_tasks:
+    - name: "Pre-task 2: login alert variable checks"
+      ansible.builtin.import_role:
+        name: 08-detection
+        tasks_from: vars
+      tags: [always]
+
+    - name: "Lab: what role 02's preflight would have set"
+      ansible.builtin.set_fact:
+        _ssh_local_mode: "{{ lab_local_mode | default(true) | bool }}"
+        _ssh_enabled: false
+        _ssh_role_runs: false
+        _ssh_needs_write: false
+        _ssh_before: {admin: {}, root: {}}
+      tags: [always]
+
+    - name: "Pre-task 6: auto_sec 0.1-0.5's audit rules"
+      ansible.builtin.import_role:
+        name: 08-detection
+        tasks_from: legacy
+      tags: [always]
+
+    - name: "Pre-task 6: login alerts (read-only)"
+      ansible.builtin.import_role:
+        name: 08-detection
+        tasks_from: preflight
+      tags: [always]
+
+    - name: "Lab: write the facts of the preflight"
+      tags: [always]
+      check_mode: false
+      ansible.builtin.copy:
+        dest: "{{ lab_out }}"
+        mode: "0600"
+        content: >-
+          {{ {'plan_08': _plan_08, 'notes': _plan_08_notes, 'apply': _det_apply | bool, 'do_remove': _det_do_remove | bool,
+              'installed': _det_installed | bool, 'cfg': _det_cfg | bool, 'report': _det_report, 'role_runs': _det_role_runs | bool,
+              'plan': _det_plan | dict2items | rejectattr('key', 'equalto', 'now') | items2dict,
+              'status': _det_status} | to_nice_json }}
+
+    - name: "Pre-task 8: the plan"
+      ansible.builtin.import_role:
+        name: 00-plan
+        tasks_from: summary
+      tags: [always]
+
+  tasks:
+    - name: "Layer 08: login alerts (off unless detection_enabled: true)"
+      ansible.builtin.include_role:
+        name: 08-detection
+        apply: { tags: ["detection"] }
+      tags: ["detection"]
+      when: (_det_apply | default(false) | bool) or (_det_do_remove | default(false) | bool)
+
+  post_tasks:
+    - name: "Lab: write the facts after the run"
+      tags: [always]
+      check_mode: false
+      ansible.builtin.copy:
+        dest: "{{ lab_out }}.after"
+        mode: "0600"
+        content: "{{ {'report': _det_report, 'status': _det_status, 'plan_id': _plan_id | default('')} | to_nice_json }}"

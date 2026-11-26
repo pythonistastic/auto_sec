@@ -6,14 +6,21 @@ or broaden OS support are welcome.
 
 ## Good first contributions
 
-- **Detection ideas for 0.7.** The 0.1–0.5 detectors did not work as
-  documented ([#18](https://github.com/pythonistastic/auto_sec/issues/18)),
-  so 0.6 ships none. Ideas, test cases and evasion notes for the rewrite
-  are welcome as issues: eBPF-based syscall monitoring, outbound-connection
-  anomalies, `/etc/ld.so.preload` tampering, SUID-binary changes,
+- **Detection ideas.** The 0.1–0.5 detectors did not work as documented
+  ([#18](https://github.com/pythonistastic/auto_sec/issues/18)). 0.7's
+  login alerts (role 08) are the first part of a rewrite. Ideas, test
+  cases and evasion notes for the next parts are welcome as issues: what
+  an intruder runs after a login, outbound-connection anomalies,
+  `/etc/ld.so.preload` tampering, SUID-binary changes,
   cron/systemd-timer persistence.
-- **Run a live job.** 0.6's live test jobs in CI are written but have not
-  run yet. A run on a fork, with its logs, helps a lot.
+- **Real log lines.** The journal reader matches the lines `sshd`,
+  `login`, `su`, `sudo` and Webmin write. Many of its test lines were
+  built from each release's format strings, not captured
+  (`tests/detection/semantics/fixtures/journal-lines.txt` says which). A
+  captured line from Debian 12 or 13, Ubuntu 26.04 or Webmin, with the
+  account and address replaced, helps.
+- **Run a live job.** The live job of login alerts (`detection-live`) is
+  new. A run on a fork, with its logs, helps a lot.
 - **Distro support.** Currently targets Ubuntu 22.04/24.04. Debian 12
   and 13 are tested in CI only. RHEL/Alma/Rocky ports (dnf, firewalld
   instead of ufw, SELinux) are welcome as parallel task files.
@@ -72,9 +79,20 @@ or broaden OS support are welcome.
   missing packages only, without recommendations, and never one whose
   install upgrades or removes another. The base-semantics tests check
   all of this.
+- **PAM changes go through `pam-auth-update`, under the guard.** Role 08
+  never edits a file under `/etc/pam.d`. It installs one profile and
+  lets pam-auth-update add or remove its one `optional` line, after a
+  trial on a copy (`auto-sec-pam-check`), under the undo guard's `--pam`
+  mode and with a login test. Never use `--force`, never add a line
+  that can fail or delay a login (`required`, no time limit), and never
+  let the login hook start another program or wait for anything.
+- **Login alerts only tell.** Nothing in role 08 ends a session, bans an
+  address or locks an account. No message holds a secret or a command's
+  arguments. The tests never call the real Telegram: they use
+  `tests/detection/fake_telegram.py` on 127.0.0.1.
 - **Public variables live in `group_vars/all.yml`.** Roles 00-plan, 01,
-  03 and 11 keep the same values in their `defaults/main.yml`, so their
-  tests run without group_vars. CI fails when the two differ.
+  03, 08 and 11 keep the same values in their `defaults/main.yml`, so
+  their tests run without group_vars. CI fails when the two differ.
 - **Host data is not input.** Values read from a managed host may be
   compared, shown, or used to refuse a run. They never become variables,
   file content or command arguments without a written exception in
@@ -89,9 +107,11 @@ ansible-lint
 # default severity, same files as CI (bash, for **):
 shopt -s globstar
 shellcheck -x scripts/*.sh tests/**/*.sh tests/guard/stubs/* tests/legacy/stubs/* \
+  tests/detection/semantics/stubs/systemctl tests/detection/semantics/stubs/su \
   roles/02-ssh-hardening/files/auto-sec-ssh-guard \
   roles/01-base/files/autosec-apt-sim roles/01-base/files/autosec-sudo-scan \
   roles/01-base/files/autosec-rootpw-scan
+shellcheck -s sh roles/08-detection/files/auto-sec-login-hook
 # the run-wide checks and the plan, without root (current ansible-core):
 bash tests/site/semantics/run.sh
 ```
@@ -104,7 +124,9 @@ If you touch SSH (role 02, the guard script, roles 03 or 04, or the
 preflight in `site.yml`), also run the two SSH test suites below. If you
 touch fail2ban (role 03) or the update, hostname and timezone settings
 (role 01), run their lab tests (see
-[The fail2ban and update tests](#the-fail2ban-and-update-tests)).
+[The fail2ban and update tests](#the-fail2ban-and-update-tests)). If you
+touch login alerts (role 08) or the guard script, run
+[the login alert tests](#the-login-alert-tests).
 
 ### The SSH tests in CI
 
@@ -122,7 +144,8 @@ touch fail2ban (role 03) or the update, hostname and timezone settings
   the role: the refusals themselves are tested by the live role tests.
 - **Guard unit tests** (`tests/guard/`). The undo script
   `auto-sec-ssh-guard`: the deadline, the lock, `arm`, `check`,
-  `disarm`, `revert`, and boot mode.
+  `disarm`, `revert`, boot mode, and its `--ufw` (role 03) and `--pam`
+  (role 08) modes.
 - **Live role tests** (`tests/role02-live/`). The real role, run against
   the runner's own sshd on GitHub's Ubuntu 22.04 and 24.04 VMs,
   including the trial run's refusals (case p).
@@ -198,8 +221,51 @@ The update suite also needs `python3-apt`, `python3-distro-info` and
 unattended-upgrades checks print SKIP. `--cache DIR` reuses downloaded
 packages.
 
-`tests/redteam.sh` belongs to the 0.1–0.5 detectors, which 0.6 no
-longer installs. It stays as a starting point for the 0.7 rewrite.
+`tests/redteam.sh` belongs to the 0.1–0.5 detectors, which auto_sec no
+longer installs. It stays as a starting point for the next parts of the
+rewrite.
+
+### The login alert tests
+
+- **Lab** (`tests/detection/semantics/`, CI job `detection-semantics`).
+  No root, nothing installed, never the real Telegram. Four parts:
+  - `h`, the login hook (`test_hook.py`): the event file it writes; exit
+    0 at once when the queue is missing, read-only or full; quotes and
+    newlines in PAM's values; no other program is run.
+  - `p`, PAM (`test_pam.py`): the real `pam_exec.so` of Ubuntu 22.04 and
+    24.04 and Debian 12 and 13, loaded through `pam_start_confdir()`
+    with the profile's own line (a hook that is missing, fails or hangs
+    never fails a session); and each release's own `pam-auth-update`
+    (those four and Ubuntu 26.04) through the trial helper: hand edits,
+    a waiting profile, the real run equals the trial, removal byte for
+    byte.
+  - `u`, `auto-sec-detect` (`test_detect.py`): the journal reader on
+    the lines in `fixtures/journal-lines.txt`, the sender against the
+    fake Telegram, the quiet rules, retries, bursts, the checker.
+  - `a`, role 08's task files (`test_role.py`, `lab.yml`) on each
+    `--ansible`: refusals, the plan, an install into a lab tree with a
+    real sender, the PAM change with the release's real pam-auth-update
+    under a copy of the real guard script, the undo, removal.
+- **Live** (`tests/detection/live/`, CI job `detection-live`). The real
+  role on GitHub's Ubuntu 22.04 and 24.04 VMs, with a fake Telegram on
+  the runner: real logins (keys, passwords, `su`, `sudo -i`, a console
+  login on a new terminal), a hook that hangs, a stopped sender, an
+  injected failure, removal. GitHub runners only.
+
+```bash
+bash tests/detection/semantics/run.sh --ansible "$(command -v ansible-playbook)"
+bash tests/detection/semantics/run.sh --only "h u"     # the quick parts, about a minute
+```
+
+It downloads pinned `libpam-runtime` and `libpam-modules` packages
+(SHA256-checked) and unpacks them with `dpkg-deb`. It needs `perl` with
+debconf's module (every Debian and Ubuntu has it) and `python3`. WSL
+(Ubuntu 24.04) works. The whole suite takes about 15 minutes per
+ansible-core there.
+
+To add a log line for the journal reader, add one JSON line to
+`fixtures/journal-lines.txt` with what the reader must take from it
+(`want`), or `null` when it must not be read.
 
 ### The full-run tests
 

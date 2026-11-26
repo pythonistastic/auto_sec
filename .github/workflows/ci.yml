@@ -40,7 +40,7 @@ jobs:
                    tests/ufw/semantics/ansible-lab.yml tests/report/semantics/play.yml tests/cve/semantics/play.yml \
                    tests/legacy/lab.yml tests/legacy/render.yml tests/site/semantics/plan.yml \
                    tests/site/semantics/defaults.yml tests/site/semantics/plan02.yml \
-                   tests/full-legacy-live/install-old.yml; do
+                   tests/full-legacy-live/install-old.yml tests/detection/semantics/lab.yml; do
             ansible-playbook -i localhost, "$p" --syntax-check
           done
       - name: Lint
@@ -103,19 +103,19 @@ jobs:
           fi
           exit "$bad"
 
-      # The public role 00, 01, 03 and 11 variables are documented in
+      # The public role 00, 01, 03, 08 and 11 variables are documented in
       # group_vars/all.yml, which site.yml reads and which wins. The role
       # defaults keep the same values for the tests that run the roles
       # without group_vars. They must never drift apart (0.4's
       # `timezone: "UTC"` in group_vars silently beat the role's keep).
-      - name: "group_vars/all.yml and the role 00/01/03/11 defaults hold the same values"
+      - name: "group_vars/all.yml and the role 00/01/03/08/11 defaults hold the same values"
         shell: python
         run: |
           import sys
           import yaml
           g = yaml.safe_load(open("group_vars/all.yml"))
           bad = 0
-          for role in ("00-plan", "01-base", "03-firewall", "11-cve-watch"):
+          for role in ("00-plan", "01-base", "03-firewall", "08-detection", "11-cve-watch"):
               path = "roles/%s/defaults/main.yml" % role
               d = yaml.safe_load(open(path))
               for k, v in d.items():
@@ -166,7 +166,7 @@ jobs:
                    tests/ufw/semantics/ansible-lab.yml tests/report/semantics/play.yml tests/cve/semantics/play.yml \
                    tests/legacy/lab.yml tests/legacy/render.yml tests/site/semantics/plan.yml \
                    tests/site/semantics/defaults.yml tests/site/semantics/plan02.yml \
-                   tests/full-legacy-live/install-old.yml; do
+                   tests/full-legacy-live/install-old.yml tests/detection/semantics/lab.yml; do
             ansible-playbook -i localhost, "$p" --syntax-check
           done
 
@@ -181,11 +181,14 @@ jobs:
       - name: Compile-check the CVE scanner
         run: python -m py_compile roles/11-cve-watch/files/cve_watch.py
 
-      # Role 03 runs these helpers on the managed host with its python3:
-      # Ubuntu 22.04 has Python 3.10, so newer syntax must not creep in.
-      - name: Compile-check role 03's helpers (Python 3.10 syntax)
+      # Roles 03 and 08 run these programs on the managed host with its
+      # python3: Ubuntu 22.04 has Python 3.10, so newer syntax must not
+      # creep in. (auto-sec-detect is role 08's login alerts, auto-sec-pam-check
+      # its trial of the PAM change.)
+      - name: Compile-check the programs of roles 03 and 08 (Python 3.10 syntax)
         run: |
-          for f in roles/03-firewall/files/auto-sec-f2b-check roles/03-firewall/files/auto-sec-ufw-turnon; do
+          for f in roles/03-firewall/files/auto-sec-f2b-check roles/03-firewall/files/auto-sec-ufw-turnon \
+                   roles/08-detection/files/auto-sec-detect roles/08-detection/files/auto-sec-pam-check; do
             python - "$f" <<'PY'
           import ast
           import sys
@@ -227,20 +230,24 @@ jobs:
       - uses: actions/checkout@v4
       # Default severity, every shell file: scripts, all test suites (and the
       # test stub commands), the SSH undo guard, which is installed as a
-      # root-run script, and role 01's apt trial-run, sudo scan and root
-      # password scan scripts, which run as root on the managed host (sh -c).
-      - name: ShellCheck scripts, tests, the SSH guard and role 01's scripts
+      # root-run script, role 01's apt trial-run, sudo scan and root
+      # password scan scripts, which run as root on the managed host (sh -c),
+      # and role 08's login hook, which PAM runs at every login (/bin/sh).
+      - name: ShellCheck scripts, tests, the SSH guard, role 01's scripts and role 08's login hook
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
           shopt -s globstar nullglob
           shellcheck -x scripts/*.sh tests/**/*.sh tests/guard/stubs/* tests/legacy/stubs/* \
+            tests/detection/semantics/stubs/systemctl tests/detection/semantics/stubs/su \
             roles/02-ssh-hardening/files/auto-sec-ssh-guard \
             roles/01-base/files/autosec-apt-sim roles/01-base/files/autosec-sudo-scan \
             roles/01-base/files/autosec-rootpw-scan
+          shellcheck -s sh roles/08-detection/files/auto-sec-login-hook
           bash -n roles/02-ssh-hardening/files/auto-sec-ssh-guard
           sh -n roles/01-base/files/autosec-apt-sim
           sh -n roles/01-base/files/autosec-sudo-scan
           sh -n roles/01-base/files/autosec-rootpw-scan
+          sh -n roles/08-detection/files/auto-sec-login-hook
 
       # The .sh.j2 templates become root-run scripts (cron, systemd). They
       # were never linted before, which is how unquoted interpolation reached
@@ -292,7 +299,8 @@ jobs:
 
   # Unit tests of the SSH undo guard with the runner's real systemd: real
   # transient timers, an absolute deadline across a daemon-reload, flock,
-  # hash-checked revert. 22.04 also covers systemd 249.
+  # hash-checked revert. 22.04 also covers systemd 249. 0.7 adds the --pam
+  # mode that role 08 uses for its login hook (NOT RUN YET on a runner).
   guard:
     strategy:
       fail-fast: false
@@ -789,4 +797,91 @@ jobs:
         with:
           name: legacy-live
           path: ${{ runner.temp }}/full-legacy-live/logs
+          if-no-files-found: ignore
+
+  # --- 0.7.0 -------------------------------------------------------------------
+
+  # Role 08 (login alerts) without root: the login hook (what it writes;
+  # exit 0 at once when the queue is missing, read-only or full); the real
+  # pam_exec.so and pam-auth-update of SHA256-pinned .debs (Ubuntu 22.04,
+  # 24.04, 26.04, Debian 12, 13), unpacked with dpkg-deb, never installed;
+  # the journal reader on real log lines; the sender against a fake
+  # Telegram on 127.0.0.1 (quiet rules, retries, bursts, 429); the checker;
+  # and the role's own task files against lab trees on the current
+  # ansible-core and on 2.16, with the real undo guard script and a real
+  # sender. The real Telegram is never called. A SKIP line fails the job.
+  detection-semantics:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core (current and 2.16) and shellcheck
+        run: |
+          pip install ansible-core
+          python -m venv "$RUNNER_TEMP/ac216"
+          "$RUNNER_TEMP/ac216/bin/pip" install -q "ansible-core>=2.16,<2.17"
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Cache the pinned PAM packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/auto-sec-detection-semantics
+          key: detection-debs-${{ hashFiles('tests/detection/semantics/debs.txt') }}
+      - name: Login alert lab tests
+        shell: bash
+        run: |
+          bash tests/detection/semantics/run.sh --cache ~/.cache/auto-sec-detection-semantics \
+            --ansible "$(command -v ansible-playbook)" \
+            --ansible "$RUNNER_TEMP/ac216/bin/ansible-playbook" | tee "$RUNNER_TEMP/detection-semantics.log"
+          if grep -q '^SKIP' "$RUNNER_TEMP/detection-semantics.log"; then
+            echo "::error::a check was skipped (a tool is missing on the runner)"
+            exit 1
+          fi
+
+  # Role 08 for real on the runner itself (root@127.0.0.1, site.yml --tags
+  # detection), every message to a fake Telegram on the runner: the install
+  # under the undo; logins with the message or the silence each must give
+  # (quiet key, another key, passwords, su, sudo -i, sudo -s, a console
+  # login on a new terminal); a hook that hangs costs a login about 1
+  # second; a stopped sender (stop message, status DEAD, the checker's
+  # message); an injected failure of the login test puts the PAM files
+  # back; removal leaves the common PAM files byte for byte as before.
+  # 22.04: pam-auth-update cannot try a new profile on a copy (N08-6).
+  # NOT RUN YET on GitHub's runners.
+  detection-live:
+    name: detection-live (${{ matrix.os }}, ${{ matrix.ansible_core }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            ansible_core: ansible-core
+          - os: ubuntu-24.04
+            ansible_core: ansible-core
+          - os: ubuntu-24.04
+            ansible_core: ansible-core>=2.16,<2.17
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core and the pinned collections
+        env:
+          ANSIBLE_CORE_SPEC: ${{ matrix.ansible_core }}
+        run: |
+          pip install "$ANSIBLE_CORE_SPEC"
+          ansible --version
+          for i in 1 2 3; do ansible-galaxy collection install -r requirements.yml && break; [ "$i" = 3 ] && exit 1; sleep 15; done
+      - name: Live login alert tests against this runner
+        run: bash tests/detection/live/run.sh
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: detection-live-${{ matrix.os }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/detection-live/logs
           if-no-files-found: ignore

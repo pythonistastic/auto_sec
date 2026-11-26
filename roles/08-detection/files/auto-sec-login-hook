@@ -1,0 +1,99 @@
+#!/bin/sh
+# Written by auto_sec (role 08). auto_sec changes this file only while this line is second.
+#
+# auto-sec-login-hook - the login hook (sensor A of auto_sec's login alerts).
+#
+# PAM runs it when a login session opens, through the one line of the
+# profile /usr/share/pam-configs/auto-sec-login-alert, which pam-auth-update
+# puts into /etc/pam.d/common-session:
+#   session optional pam_exec.so quiet seteuid type=open_session
+#           /usr/bin/timeout -s KILL 1 /usr/local/sbin/auto-sec-login-hook
+# That file is read by login (the console), sshd, su and `sudo -i`. cron,
+# plain sudo and services read common-session-noninteractive and do not
+# run this hook.
+#
+# It writes ONE small file into the root-only queue and exits 0. Nothing
+# else: no network, no lock, no other program (shell builtins only). The
+# sender (auto-sec-alert.service) picks the file up and sends the message.
+#
+# It must never block or slow a login:
+#   - pam_exec waits for its command, so this script does nothing that can
+#     wait: it reads five small files under /proc and writes one file;
+#   - "optional": whatever happens here, the login goes on;
+#   - `timeout -s KILL 1` ends it after one second if it hangs anyway;
+#   - a missing, full or read-only queue only loses this event: exit 0.
+#     The journal reader (sensor B) still sees the login.
+#
+# The file is <queue>/h.<random id>.ev. Fields are "name=value", each ended
+# by a NUL byte, so a value with quotes or newlines cannot break the
+# format. "end=1" comes last: a file without it is incomplete. The file's
+# own time is the time of the login.
+#   v      format version (1)
+#   src    hook
+#   svc    PAM service: sshd, login, su, su-l, sudo-i, ...
+#   user   the account that logs in
+#   ruser  the account that asked (su, sudo)
+#   tty    terminal
+#   rhost  remote host (SSH)
+#   app    process id of the program that opened the session (sshd, login,
+#          su, sudo): the sender joins this event with that program's log
+#          lines by this number
+#   ruid   real user id of that program (su: who ran it)
+#   ses    audit session id (4294967295: none)
+#   auid   audit login uid (4294967295: none)
+# The values come from PAM and are not checked here. The sender checks
+# and filters every one of them before it uses it.
+
+[ "${PAM_TYPE-}" = open_session ] || exit 0
+
+# --- path (tests rewrite this line) ---
+Q=/var/spool/auto-sec/events
+# --- end path ---
+
+umask 077
+set -f -C
+
+id=
+ses=
+auid=
+st=
+ruid=
+app=$PPID
+
+read -r id < /proc/sys/kernel/random/uuid || id=
+case $id in
+  '' | *[!0-9a-f-]*) id=$$-$PPID ;;
+esac
+read -r ses < /proc/self/sessionid || :
+read -r auid < /proc/self/loginuid || :
+
+# The parent is `timeout`; its parent is the program that opened the
+# session. /proc/<pid>/stat is "<pid> (<name>) <state> <parent pid> ...".
+if read -r st < "/proc/$PPID/stat"; then
+  name=${st#*\(}
+  name=${name%\)*}
+  if [ "$name" = timeout ]; then
+    st=${st##*\) }
+    # shellcheck disable=SC2086 # split into fields on purpose (set -f is on)
+    set -- $st
+    app=${2:-$PPID}
+  fi
+fi
+
+# The real user id of that program: for su it is the account that ran su
+# (0 when root ran it). /proc/<pid>/status has a line "Uid: <real> ...".
+if [ -r "/proc/$app/status" ]; then
+  while read -r key value _; do
+    if [ "$key" = Uid: ]; then
+      ruid=$value
+      break
+    fi
+  done < "/proc/$app/status"
+fi
+
+{
+  printf 'v=1\0src=hook\0svc=%s\0user=%s\0ruser=%s\0tty=%s\0rhost=%s\0app=%s\0ruid=%s\0ses=%s\0auid=%s\0end=1\0' \
+    "${PAM_SERVICE-}" "${PAM_USER-}" "${PAM_RUSER-}" "${PAM_TTY-}" "${PAM_RHOST-}" \
+    "$app" "$ruid" "$ses" "$auid" > "$Q/h.$id.ev"
+} 2>/dev/null
+exit 0

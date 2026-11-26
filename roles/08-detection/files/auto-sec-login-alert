@@ -1,0 +1,8 @@
+X-Written-By: auto_sec (role 08). auto_sec changes this file only while this line is first.
+Name: auto_sec login alerts (a small file per login; it cannot block a login)
+Default: no
+Priority: 0
+Session-Type: Additional
+Session-Interactive-Only: yes
+Session:
+	optional	pam_exec.so quiet seteuid type=open_session /usr/bin/timeout -s KILL 1 /usr/local/sbin/auto-sec-login-hook

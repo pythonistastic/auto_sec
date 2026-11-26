@@ -1,0 +1,19 @@
+# Written by auto_sec (role 08). auto_sec changes this file only while this line is first.
+#
+# Says that a detection unit stopped or failed. A unit of its own, so the
+# message does not depend on the unit that stopped. Started by the two
+# services (ExecStopPost) and by the path and timer units (OnSuccess,
+# OnFailure). Silent while an auto_sec run restarts the units, and at
+# shutdown.
+[Unit]
+Description=auto_sec login alerts: say that %i stopped
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/auto-sec-detect stopped %i
+TimeoutStartSec=90
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/auto-sec/detect

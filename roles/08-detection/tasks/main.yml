@@ -1,0 +1,280 @@
+---
+# roles/08-detection/tasks/main.yml - role 08's apply phase (tag: detection).
+#
+# Login alerts, only with detection_enabled: true. It follows what the
+# preflight (tasks/preflight.yml, imported by site.yml pre_tasks) planned,
+# and checks the host again before it writes (M08-1). -e detection_remove=true
+# takes everything out again (remove.yml).
+#
+#   D1  the files must be as the plan saw them (M08-1)
+#   D2  folders, the program, the settings (0600: they hold the Telegram
+#       token), the units; a daemon-reload only when a unit file that was
+#       already there changes
+#   D3  the links that start the units at boot (no `systemctl enable`),
+#       then start or restart each unit the plan named
+#   D4  the PAM change (pam.yml), under role 02's automatic undo
+#   D5  proof: the sender and the journal reader answer; the login test's
+#       own event arrived from the login hook; a test message goes out and
+#       the run prints its id (M08-5 when it cannot be sent)
+#   D6  the status line for the plan's next run and for the report
+# Nothing is written, started or sent in --check.
+#
+# While this run restarts detection units, a mark under /run/auto-sec keeps
+# the "the watcher was stopped" message quiet. It runs out 20 seconds after
+# the role is done.
+
+- name: "Detection: the preflight must have run in this play"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - _det_role_runs is defined
+      - _det_plan is defined
+      - _det_role_runs | default(false) | bool
+    fail_msg: >-
+      Role 08 needs its preflight, and the role must be tagged "detection". site.yml runs the
+      preflight in pre_tasks (import_role name=08-detection tasks_from=preflight, tags always). Do
+      the same in any other playbook that uses role 08. Nothing has been changed.
+
+- name: "Detection: take login alerts out (-e detection_remove=true)"
+  when: _det_do_remove | default(false) | bool
+  ansible.builtin.include_tasks:
+    file: remove.yml
+
+- name: "Detection: install or change login alerts"
+  when: _det_apply | default(false) | bool
+  block:
+    # --- D1 ---------------------------------------------------------------
+    - name: "Detection D1: what is there now"
+      ansible.builtin.include_tasks:
+        file: read.yml
+
+    - name: "Detection M08-1: the files must be as the plan saw them"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _det_now == _det_plan.now
+          - _det_elsewhere | length == 0
+        fail_msg: >-
+          [M08-1] A file of auto_sec's login alerts on {{ inventory_hostname }} changed during this run.
+          Nothing was written by role 08. Run again and read the new plan.
+
+    - name: "Detection D1: check mode"
+      when: ansible_check_mode
+      ansible.builtin.debug:
+        msg: >-
+          Check mode: the real run writes {{ _det_plan.write | map('extract', _det_targets) | map(attribute='dest') | join(', ') or 'no file' }};
+          starts or restarts {{ _det_plan.units | dict2items | map(attribute='key') | join(', ') or 'no unit' }}{{
+          '; adds its one line to /etc/pam.d/common-session under the automatic undo' if (_det_plan.pam | bool) else '' }}{{
+          '; sends a test message' if (_det_plan.test | bool) else '' }}.
+
+    # Nothing below is written, started or sent in --check: the message
+    # above says what the real run does.
+    - name: "Detection D2-D6: write, start, prove"
+      when: not ansible_check_mode
+      block:
+        # --- D2 ---------------------------------------------------------------
+        - name: "Detection D2: an auto_sec run is working on the detection units"
+          when: (_det_plan.units | length > 0) or (_det_plan.reload | bool)
+          ansible.builtin.command:
+            argv: [sh, -c, 'umask 077; mkdir -p -- "${1%/*}" && : > "$1"', sh, "{{ _det_planned }}"]
+          changed_when: false
+
+        - name: "Detection D2: folders, root only"
+          when: item.path in _det_plan.dirs
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: directory
+            owner: "{{ _det_file_owner }}"
+            group: "{{ _det_file_group }}"
+            mode: "{{ item.mode }}"
+          loop: "{{ _det_dirs }}"
+          loop_control:
+            label: "{{ item.path }}"
+
+        - name: "Detection D2: the settings (they hold the Telegram token)"
+          when: "'conf' in _det_plan.write"
+          ansible.builtin.template:
+            src: "{{ _det_targets.conf.template }}"
+            dest: "{{ _det_targets.conf.dest }}"
+            owner: "{{ _det_file_owner }}"
+            group: "{{ _det_file_group }}"
+            mode: "{{ _det_targets.conf.mode }}"
+          # Renders the Telegram token: keep it out of --diff and -vvv output.
+          no_log: true
+
+        - name: "Detection D2: the program, the login hook and the units"
+          when:
+            - item in _det_plan.write
+            - _det_targets[item].src is defined
+          ansible.builtin.copy:
+            src: "{{ _det_targets[item].src }}"
+            dest: "{{ _det_targets[item].dest }}"
+            owner: "{{ _det_file_owner }}"
+            group: "{{ _det_file_group }}"
+            mode: "{{ _det_targets[item].mode }}"
+          loop: "{{ _det_order }}"
+
+        - name: "Detection D2: the daily message's timer"
+          when: "'alive_timer' in _det_plan.write"
+          ansible.builtin.template:
+            src: "{{ _det_targets.alive_timer.template }}"
+            dest: "{{ _det_targets.alive_timer.dest }}"
+            owner: "{{ _det_file_owner }}"
+            group: "{{ _det_file_group }}"
+            mode: "{{ _det_targets.alive_timer.mode }}"
+
+        - name: "Detection D2: load the changed unit files (they were there before)"
+          when: _det_plan.reload | bool
+          ansible.builtin.command:
+            argv: ["{{ _det_systemctl }}", daemon-reload]
+          changed_when: true
+
+        # --- D3 ---------------------------------------------------------------
+        - name: "Detection D3: the folders of the links"
+          when: _det_plan.links | length > 0
+          ansible.builtin.file:
+            path: "{{ _det_unit_dir }}/{{ item }}"
+            state: directory
+            owner: "{{ _det_file_owner }}"
+            group: "{{ _det_file_group }}"
+            mode: "0755"
+          loop: "{{ _det_run | selectattr('unit', 'in', _det_plan.links) | map(attribute='wants') | unique | list }}"
+
+        # A link, not `systemctl enable`: that would reload systemd.
+        - name: "Detection D3: start each unit at boot (a link)"
+          when: item.unit in _det_plan.links
+          ansible.builtin.file:
+            src: "{{ _det_unit_dir }}/{{ item.unit }}"
+            dest: "{{ _det_unit_dir }}/{{ item.wants }}/{{ item.unit }}"
+            state: link
+            owner: "{{ _det_file_owner }}"
+            group: "{{ _det_file_group }}"
+          loop: "{{ _det_run }}"
+          loop_control:
+            label: "{{ item.unit }}"
+
+        - name: "Detection D3: start or restart the units"
+          when: (_det_plan.units[item.unit] | default('')) | length > 0
+          ansible.builtin.command:
+            argv: ["{{ _det_systemctl }}", "{{ _det_plan.units[item.unit] }}", "{{ item.unit }}"]
+          loop: "{{ _det_run }}"
+          loop_control:
+            label: "{{ item.unit }}: {{ _det_plan.units[item.unit] | default('as it is') }}"
+          changed_when: true
+
+        # --- D4 ---------------------------------------------------------------
+        - name: "Detection D4: when did the login tests start? (the server's clock)"
+          ansible.builtin.command:
+            argv: [date, +%s]
+          register: _det_t0
+          changed_when: false
+
+        - name: "Detection D4: the login hook in PAM, under the automatic undo"
+          when: _det_plan.pam | bool
+          ansible.builtin.include_tasks:
+            file: pam.yml
+          vars:
+            _det_pam_do: enable
+
+        # --- D5 ---------------------------------------------------------------
+        - name: "Detection D5: the sender and the journal reader answer"
+          ansible.builtin.command:
+            argv: "{{ _det_cmd + ['status', '--json'] }}"
+          register: _det_post
+          changed_when: false
+          failed_when: false
+          until: >-
+            (_det_post.rc | default(1)) == 0 and (_det_post.stdout | default('')) is match('^\{')
+            and ((_det_post.stdout | from_json).verdict | default('')) == 'on'
+            and (not (_det_plan.pam | bool) or ((_det_post.stdout | from_json).last_hook | default(0) | int) >= (_det_t0.stdout | default('0') | int))
+          retries: 15
+          delay: 2
+
+        - name: "Detection D5: detection must be on after the install"
+          ansible.builtin.assert:
+            quiet: true
+            that:
+              - _det_post_j.verdict | default('') == 'on'
+            fail_msg: >-
+              Login alerts on {{ inventory_hostname }} do not answer as running after this run:
+              {{ _det_post_j.line | default('no status') | string | regex_replace('[^ -~]', '?') | regex_replace('[{}]', '?') | truncate(300) }}.
+              On the server: sudo auto-sec-detect status; journalctl -u auto-sec-alert -u auto-sec-login-watch -n 30
+          vars:
+            _det_post_j: "{{ (_det_post.stdout | from_json) if ((_det_post.stdout | default('')) is match('^\\{')) else {} }}"
+
+        - name: "Detection D5: the login test's own event came from the login hook"
+          when: _det_plan.pam | bool
+          ansible.builtin.assert:
+            quiet: true
+            that: ((_det_post.stdout | from_json).last_hook | default(0) | int) >= (_det_t0.stdout | default('0') | int)
+            fail_msg: >-
+              The login hook is in PAM on {{ inventory_hostname }} and logins work, but no event of this run's
+              own login test reached the sender within 30 s. The journal reader still sees logins. On the
+              server: sudo auto-sec-detect status; ls -la {{ _det_queue }}
+            success_msg: "The login test's own event reached the sender: the login hook works."
+
+        - name: "Detection D5: send a test message"
+          when: _det_plan.test | bool
+          ansible.builtin.command:
+            argv: "{{ _det_cmd + ['test'] }}"
+          register: _det_test_run
+          changed_when: true
+          failed_when: false
+
+        - name: "Detection M08-5: the test message must go out"
+          when: _det_plan.test | bool
+          ansible.builtin.assert:
+            quiet: true
+            that:
+              - (_det_test_run.rc | default(1)) == 0
+              - _det_test_j.ok | default(false)
+              - (_det_test_j.id | default('')) is match('^[0-9a-f]{8}$')
+            fail_msg: >-
+              [M08-5] Login alerts are installed on {{ inventory_hostname }}, but the test message could not
+              be sent ({{ _det_test_j.error | default('no answer') | string | regex_replace('[^A-Za-z0-9 ]', '?') | truncate(40) }}).
+              {{ {'HTTP 401': 'Telegram does not know this bot token.',
+                  'HTTP 400': 'Telegram does not know this chat id (open the bot in Telegram and press START).',
+                  'HTTP 403': 'The bot may not write to this chat (open the bot in Telegram and press START).'}[_det_test_j.error | default('')]
+                 | default('Can the server reach api.telegram.org on port 443?') }}
+              Until this works, no alert reaches you. Fix it and run again: the run sends a new test message.
+          vars:
+            _det_test_j: "{{ (_det_test_run.stdout | from_json) if ((_det_test_run.stdout | default('')) is match('^\\{')) else {} }}"
+
+        - name: "Detection D5: check Telegram for this test message"
+          when: _det_plan.test | bool
+          ansible.builtin.debug:
+            msg: >-
+              Check Telegram for auto_sec test {{ (_det_test_run.stdout | from_json).id }}: a message with
+              this id from {{ inventory_hostname }} must be in your chat now.{{ ' (TEST MODE: it went to the sink on the server, not to Telegram.)'
+              if ((_det_test_run.stdout | from_json).test_mode | default(false)) else '' }}
+
+        # --- D6 ---------------------------------------------------------------
+        - name: "Detection D6: the status after this run"
+          ansible.builtin.set_fact:
+            _det_status:
+              verdict: "{{ _det_post_j.verdict if (_det_post_j.verdict | default('')) in ['on', 'dead'] else 'unread' }}"
+              line: "{{ _det_post_j.line | default('') | string | regex_replace('[^ -~]', '?') | regex_replace('[{}]', '?') | truncate(300) }}"
+              mode: "{{ _det_post_j.mode if (_det_post_j.mode | default('')) in ['hook+journal', 'journal'] else '' }}"
+              test_mode: "{{ _det_post_j.test_mode | default(false) | bool }}"
+            _det_report: >-
+              {{ (_det_post_j.line | default('installed in this run') | string | regex_replace('[^ -~]', '?') | regex_replace('[{}]', '?') | truncate(300))
+                 ~ ' (' ~ ('login hook and journal reader' if (_det_post_j.mode | default('')) == 'hook+journal' else 'journal reader only') ~ ')'
+                 ~ ('; a test message went out in this run' if (_det_plan.test | bool) else '') }}
+          vars:
+            _det_post_j: "{{ (_det_post.stdout | from_json) if ((_det_post.stdout | default('')) is match('^\\{')) else {} }}"
+
+        - name: "Detection D6: result"
+          ansible.builtin.debug:
+            msg: "{{ _det_status.line }}"
+
+  # The mark counts for 15 minutes from its file time. A unit that this run
+  # restarted says "stopped" through a unit of its own, a moment later:
+  # removing the mark at once could be too early. So its file time is set
+  # back, and it runs out by itself 20 seconds from now.
+  always:
+    - name: "Detection: the run is done with the detection units (the mark runs out in 20 s)"
+      when: not ansible_check_mode
+      ansible.builtin.command:
+        argv: [sh, -c, 'if [ -e "$1" ]; then touch -d "880 seconds ago" -- "$1"; fi', sh, "{{ _det_planned }}"]
+      changed_when: false
+      failed_when: false

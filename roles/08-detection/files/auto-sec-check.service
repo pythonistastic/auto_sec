@@ -1,0 +1,20 @@
+# Written by auto_sec (role 08). auto_sec changes this file only while this line is first.
+#
+# The independent checker. It asks: do the two sensors and the sender run,
+# is the login hook still in PAM, does the queue move, did the last daily
+# message go out, can messages be sent? When something is wrong it sends
+# a message of its own, and again every hour until it is fixed. The sender
+# and the journal reader check in turn that this timer still runs.
+[Unit]
+Description=auto_sec login alerts: the checker
+OnFailure=auto-sec-notify@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/auto-sec-detect check
+TimeoutStartSec=120
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/auto-sec/detect

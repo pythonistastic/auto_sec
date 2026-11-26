@@ -1,0 +1,13 @@
+# Written by auto_sec (role 08). auto_sec changes this file only while this line is first.
+#
+# Asks the sender for the daily "still alive" message. The message goes
+# through the same queue and sender as an alert, so it proves the whole
+# path. If it stops coming, detection is dead.
+[Unit]
+Description=auto_sec login alerts: the daily "still alive" message
+OnFailure=auto-sec-notify@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/auto-sec-detect alive
+TimeoutStartSec=60

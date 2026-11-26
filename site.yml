@@ -307,6 +307,14 @@
         tasks_from: vars
       tags: [always]
 
+    # Login alerts (role 08): the detection_* values, and R08-1: with
+    # detection_enabled: true the Telegram token and chat id must be set.
+    - name: "Preflight: login alert variable checks"
+      ansible.builtin.import_role:
+        name: 08-detection
+        tasks_from: vars
+      tags: [always]
+
     # --- 3. auto_sec 0.1-0.5's detectors (R00-3), BEFORE fact gathering --
     # In active mode they end SSH sessions that look like reconnaissance,
     # and fact gathering alone looks like that. A stat, a grep and
@@ -374,14 +382,22 @@
         tasks_from: preflight
       tags: [always]
 
-    # Roles 08 and 09 change nothing in 0.6: warnings about what 0.1-0.5
-    # left on the server.
+    # Role 08: a warning about the audit rules 0.1-0.5 left on the server,
+    # then login alerts (off unless detection_enabled: true): what is
+    # installed, its status, and the trial of the PAM change on a copy.
     - name: "Preflight: auto_sec 0.1-0.5's audit rules (read-only)"
       ansible.builtin.import_role:
         name: 08-detection
         tasks_from: legacy
       tags: [always]
 
+    - name: "Preflight: login alerts (read-only)"
+      ansible.builtin.import_role:
+        name: 08-detection
+        tasks_from: preflight
+      tags: [always]
+
+    # Role 09 changes nothing: a warning about the detectors 0.1-0.5 left.
     - name: "Preflight: auto_sec 0.1-0.5's detectors (read-only)"
       ansible.builtin.import_role:
         name: 09-watcher
@@ -506,17 +522,19 @@
       tags: ["backups"]
       when: _layer_07 | bool
 
-    # Roles 08 and 09 are not managed in 0.6 (issue #18): only the warnings
-    # of pre_tasks, which already ran. These includes do nothing then.
-    - name: "Layer 08: detection (not managed in 0.6)"
+    # Role 08: login alerts. It does something only with
+    # detection_enabled: true (or -e detection_remove=true), and only what
+    # its preflight planned.
+    - name: "Layer 08: login alerts (off unless detection_enabled: true)"
       ansible.builtin.include_role:
         name: 08-detection
-        tasks_from: legacy
         apply: { tags: ["detection"] }
       tags: ["detection"]
-      when: not (_l08_done | default(false) | bool)
+      when: (_det_apply | default(false) | bool) or (_det_do_remove | default(false) | bool)
 
-    - name: "Layer 09: watcher (not managed in 0.6)"
+    # Role 09 changes nothing: only the warning of pre_tasks, which already
+    # ran. This include does nothing then.
+    - name: "Layer 09: watcher (the detectors of 0.1-0.5: warnings only)"
       ansible.builtin.include_role:
         name: 09-watcher
         tasks_from: legacy

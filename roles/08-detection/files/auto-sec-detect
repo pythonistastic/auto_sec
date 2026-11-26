@@ -1,0 +1,1386 @@
+#!/usr/bin/python3 -I
+# Written by auto_sec (role 08). auto_sec changes this file only while this line is second.
+"""auto-sec-detect - auto_sec's login alerts: journal reader, sender, proof of life.
+
+Installed by role 08 as /usr/local/sbin/auto-sec-detect (root, 0700), only
+with detection_enabled: true. Python standard library only. Alert only:
+it never ends a session, bans an address or locks an account.
+
+Two sensors write small event files into the root-only queue
+/var/spool/auto-sec/events:
+  A  the login hook (/usr/local/sbin/auto-sec-login-hook, run by PAM)
+  B  `auto-sec-detect watch`, which follows the journal
+
+Commands (each one is a systemd unit of its own):
+  watch          sensor B (auto-sec-login-watch.service). It reads only
+                 lines whose program path the journal itself recorded
+                 (_EXE: sshd, login, su, sudo), plus Webmin's, and only
+                 lines that match a strict pattern.
+  send           the sender (auto-sec-alert.service). Joins the two
+                 sensors' events for one login, applies the quiet list,
+                 bundles bursts and sends one Telegram message.
+  alive          asks the sender for the daily "still alive" message
+                 (auto-sec-alive.timer).
+  check          the independent checker (auto-sec-check.timer, every 5
+                 minutes). Sends its own message when something is wrong,
+                 and again every hour until it is fixed.
+  stopped UNIT   says that a detection unit stopped or failed
+                 (auto-sec-notify@.service).
+  test           sends a test message now and prints its id.
+  goodbye        says that an auto_sec run takes login alerts out.
+  status [--json]   what runs, the last event and message, the queue.
+
+Never quiet: a console login, a root SSH login without a quiet key, a
+root login through su, sudo, Webmin or a door auto_sec does not know.
+
+Limits, said plainly: if Telegram cannot be reached, nothing here can
+tell you. Whoever is root on this server can stop every one of these
+units, or change this file. This program guards against a login nobody
+was told about, not against a careful intruder who already is root.
+
+Trust: event files can only be written by root (the queue is 0700). The
+values inside still come from PAM and from log text that a client can
+partly shape (a user name, a reverse DNS name), so every value is cut
+to printable characters and a fixed length before it is used or sent. No
+value is ever run, and no message holds the token, a password or a
+command's arguments.
+
+--root DIR is for the tests only (tests/detection): every path is then
+taken under DIR, and systemctl/journalctl from DIR/stub.
+"""
+import configparser
+import json
+import os
+import re
+import select
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+ROOT = ""
+
+CONF = "/etc/auto-sec/detect.conf"
+QUEUE = "/var/spool/auto-sec/events"
+STATE = "/var/lib/auto-sec/detect"
+PLANNED = "/run/auto-sec/detect-planned"
+PAM_SESSION = "/etc/pam.d/common-session"
+PROFILE = "/usr/share/pam-configs/auto-sec-login-alert"
+HOOK = "/usr/local/sbin/auto-sec-login-hook"
+BOOT_ID = "/proc/sys/kernel/random/boot_id"
+RANDOM_ID = "/proc/sys/kernel/random/uuid"
+PROFILE_HEADER = "X-Written-By: auto_sec (role 08). auto_sec changes this file only while this line is first."
+PAM_LINE = ("session\toptional\tpam_exec.so quiet seteuid type=open_session "
+            "/usr/bin/timeout -s KILL 1 /usr/local/sbin/auto-sec-login-hook")
+
+API = "https://api.telegram.org"
+HTTP_TIMEOUT = 10          # seconds, every outside call
+SEND_GAP = 1.1             # Telegram: about one message per second per chat
+GIVE_UP = 600              # retry a message for 10 minutes, then keep its lines
+ALERTS_MAX = 200           # alerts that wait at once; the oldest beyond that become one line each
+WAIT_SSH = 2.0             # wait for sshd's own line (key or password)
+WAIT_OTHER = 1.0
+MSG_MAX = 3500             # Telegram takes 4096 characters
+REPEAT = 3600              # a problem is said again every hour
+CHECK_GRACE = 600          # a service asks about the checker only after its first 10 minutes
+ALIVE_LINE = "auto_sec alive: "
+
+WATCH = "auto-sec-login-watch.service"
+SENDER = "auto-sec-alert.service"
+PATHUNIT = "auto-sec-alert.path"
+ALIVE_TIMER = "auto-sec-alive.timer"
+CHECK_TIMER = "auto-sec-check.timer"
+
+# The programs whose lines sensor B reads, by the path the journal
+# recorded for the process (_EXE: set by journald, not by the client).
+EXE_DOOR = {
+    "/usr/sbin/sshd": "sshd",
+    "/usr/lib/openssh/sshd-session": "sshd",
+    "/usr/libexec/openssh/sshd-session": "sshd",
+    "/usr/bin/login": "login",
+    "/bin/login": "login",
+    "/usr/bin/su": "su",
+    "/bin/su": "su",
+    "/usr/lib/cargo/bin/su": "su",
+    "/usr/bin/sudo": "sudo",
+    "/usr/bin/sudo.ws": "sudo",
+    "/usr/lib/cargo/bin/sudo": "sudo",
+}
+WEB_IDENTS = ("webmin", "usermin")
+JOURNAL_FIELDS = "MESSAGE,_EXE,_PID,_UID,SYSLOG_IDENTIFIER,__REALTIME_TIMESTAMP"
+
+FAMILY = {"sshd": "sshd", "login": "login", "remote": "login", "su": "su", "su-l": "su",
+          "sudo": "sudo", "sudo-i": "sudo", "webmin": "webmin", "usermin": "usermin"}
+SHELLS = ("sh", "bash", "dash", "zsh", "ksh", "mksh", "fish", "tcsh", "csh", "ash", "rbash")
+
+EVENT_NAME = re.compile(r"^[hjn]\.[0-9A-Za-z-]{4,80}\.ev$")
+EVENT_MAX = 16384
+EVENT_KEYS = ("v", "src", "kind", "svc", "user", "ruser", "tty", "rhost", "port", "method", "keytype",
+              "fp", "app", "ses", "auid", "ruid", "byuid", "ts", "cmd", "odd", "unit", "why", "end")
+
+RE_ACCEPTED = re.compile(
+    r"Accepted ([a-z][a-z0-9/-]{1,40}) for (\S{1,100}) from (\S{1,200}) port ([0-9]{1,5}) ssh2"
+    r"(?:: (\S{1,40}) ((?:SHA256|MD5):\S{8,100})(?:[ ,].{0,400})?)?")
+RE_PAM_OPEN = re.compile(
+    r"pam_unix\(([A-Za-z0-9_.-]{1,32}):session\): session opened for user (\S{1,100}?)(?:\(uid=([0-9]{1,10})\))?"
+    r" by (\S{0,100}?)\(uid=([0-9]{1,10})\)")
+RE_HOOK_FAIL = re.compile(
+    r"pam_exec\(([A-Za-z0-9_.-]{1,32}):session\): \S*(?:timeout|auto-sec-login-hook) failed: "
+    r"(exit code [0-9]{1,3}|caught signal [0-9]{1,3}.{0,20})")
+RE_ROOT_LOGIN = re.compile(r"ROOT LOGIN\s+(?:on|ON) '?([^' ]{1,100})'?(?: (?:from|FROM) '?([^' ]{1,200})'?)?")
+RE_LOGIN_ON = re.compile(r"LOGIN ON (\S{1,100}) BY (\S{1,100})(?: FROM (\S{1,200}))?")
+RE_LOGGED_IN = re.compile(r"'(\S{1,100})' logged in\s+on '([^' ]{1,100})'(?: from '([^' ]{1,200})')?")
+RE_SU = re.compile(r"\(to (\S{1,100})\) (\S{1,100}) on (\S{1,100})")
+RE_WEB = re.compile(r"Successful login as (\S{1,100}) from (\S{1,200})")
+RE_SUDO_HEAD = re.compile(r"\s*(\S{1,100}) : +(?:TTY=(\S{1,100}) ; )?(?:CHROOT=\S{0,200} ; )?PWD=")
+
+
+def P(path):
+    return ROOT + path if ROOT else path
+
+
+def tool(name):
+    if ROOT:
+        return ROOT + "/stub/" + name
+    return "/usr/bin/" + name
+
+
+def log(text):
+    print("auto-sec-detect: " + text, file=sys.stderr, flush=True)
+
+
+def safe(value, limit=120):
+    """A value from PAM or a log line, made fit to show: printable ASCII only."""
+    text = "".join(c if 32 < ord(c) < 127 or c == " " else "?" for c in str(value))
+    return text.strip()[:limit]
+
+
+def stamp(t):
+    if not t:
+        return "never"
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(t))
+
+
+def both_times(t):
+    return "%s (%s server time)" % (stamp(t), time.strftime("%H:%M:%S %Z", time.localtime(t)))
+
+
+def new_id():
+    try:
+        with open(P(RANDOM_ID), encoding="ascii") as fh:
+            got = fh.read(64).strip()
+        if re.fullmatch(r"[0-9a-f-]{8,64}", got):
+            return got
+    except OSError:
+        pass
+    return os.urandom(16).hex()
+
+
+# --------------------------------------------------------------------- config
+def load_conf():
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    try:
+        with open(P(CONF), encoding="utf-8") as fh:
+            cp.read_file(fh)
+    except (OSError, configparser.Error, UnicodeError):
+        return None
+
+    def get(key):
+        return cp.get("detect", key, fallback="").strip()
+
+    conf = {
+        "host": safe(get("host_label") or "server", 80),
+        "token": get("telegram_bot_token"),
+        "chat": get("telegram_chat_id"),
+        "quiet_accounts": set(get("quiet_accounts").split()),
+        "quiet_keys": set(get("quiet_ssh_keys").split()),
+        "alive_time": get("alive_time") or "09:00",
+        "login_hook": get("login_hook").lower() != "false",
+        "api": API,
+        "test_mode": False,
+        "bad": [],
+    }
+    conf["quiet_accounts"].discard("root")
+    if not re.fullmatch(r"[0-9]{5,}:[A-Za-z0-9_-]{20,}", conf["token"]):
+        conf["bad"].append("no usable Telegram bot token")
+    if not re.fullmatch(r"-?[0-9]{1,32}", conf["chat"]):
+        conf["bad"].append("no usable Telegram chat id")
+    # auto_sec's own CI only: messages go to a sink on this machine. Nothing
+    # but a loopback address is accepted, and status says so loudly.
+    api = get("api_base")
+    if api:
+        if re.fullmatch(r"http://127\.0\.0\.1:[0-9]{2,5}", api):
+            conf["api"] = api
+            conf["test_mode"] = True
+        else:
+            conf["bad"].append("api_base is not a loopback address")
+    return conf
+
+
+# ------------------------------------------------------------------- Telegram
+def tg_send(conf, text):
+    """One message. Returns (True, message id) or (False, {"error", "retry"}).
+
+    Never prints or returns the URL: it holds the token.
+    """
+    if conf is None or conf["bad"]:
+        return False, {"error": "not configured", "retry": 0}
+    body = json.dumps({"chat_id": conf["chat"], "text": text[:4000],
+                       "disable_web_page_preview": True}).encode()
+    try:
+        # Inside the try: an error of urllib's that names the address would
+        # otherwise end in a traceback in the journal, with the token in it.
+        req = urllib.request.Request(conf["api"] + "/bot" + conf["token"] + "/sendMessage", data=body,
+                                     headers={"Content-Type": "application/json", "User-Agent": "auto_sec-detect"})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
+            data = json.loads(resp.read(65536).decode("utf-8", "replace"))
+        if isinstance(data, dict) and data.get("ok") is True:
+            res = data.get("result")
+            return True, (res.get("message_id") if isinstance(res, dict) else None)
+        return False, {"error": "Telegram said no", "retry": 0}
+    except urllib.error.HTTPError as exc:
+        retry = 0
+        try:
+            data = json.loads(exc.read(65536).decode("utf-8", "replace"))
+            retry = int(data.get("parameters", {}).get("retry_after", 0))
+        except (ValueError, AttributeError, TypeError, OSError):
+            retry = 0
+        if exc.code == 429 and retry <= 0:
+            retry = 5
+        return False, {"error": "HTTP %d" % exc.code, "retry": max(0, min(retry, 900))}
+    except Exception as exc:  # noqa: BLE001 - a failed send must never stop the caller
+        return False, {"error": type(exc).__name__, "retry": 0}
+
+
+def send_now(conf, text, tries=2):
+    """For the checker, the stop message and the test: send at once."""
+    info = {"error": "not tried"}
+    for i in range(tries):
+        ok, info = tg_send(conf, text)
+        if ok:
+            return True, info
+        if i + 1 < tries:
+            time.sleep(min(max(info.get("retry", 0), 2), 20))
+    return False, info
+
+
+# --------------------------------------------------------------------- events
+def parse_event(path):
+    """Returns (fields, complete, mtime), or (None, False, 0) if unreadable."""
+    try:
+        st = os.lstat(path)
+        if not os.path.isfile(path) or os.path.islink(path):
+            return None, False, 0
+        with open(path, "rb") as fh:
+            data = fh.read(EVENT_MAX + 1)
+    except OSError:
+        return None, False, 0
+    fields = {}
+    for part in data[:EVENT_MAX].split(b"\0"):
+        if b"=" not in part:
+            continue
+        key, val = part.split(b"=", 1)
+        key = key.decode("ascii", "replace")
+        if key in EVENT_KEYS and key not in fields:
+            fields[key] = val.decode("utf-8", "replace")[:1024]
+    complete = len(data) <= EVENT_MAX and data.endswith(b"end=1\0") and fields.get("v") == "1"
+    return fields, complete, st.st_mtime
+
+
+def write_event(prefix, fields):
+    """Sensor B and the notices: write to a temporary name, then rename."""
+    ident = new_id()
+    tmp = os.path.join(P(QUEUE), ".tmp." + ident)
+    blob = b"v=1\0" + b"".join(
+        ("%s=%s" % (k, str(v).replace("\0", "?"))).encode("utf-8", "replace") + b"\0"
+        for k, v in fields.items() if k in EVENT_KEYS and k not in ("v", "end")) + b"end=1\0"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(blob)
+        os.replace(tmp, os.path.join(P(QUEUE), "%s.%s.ev" % (prefix, ident)))
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def to_int(value):
+    return int(value) if isinstance(value, str) and re.fullmatch(r"[0-9]{1,10}", value) else None
+
+
+# ------------------------------------------------------------ sensor B: lines
+def parse_sudo(msg):
+    """sudo's own line, for a command that ran. Only a shell counts.
+
+    "alice : TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/bin/bash"
+    PWD and COMMAND are text the user chose, so a line with more than one
+    " ; USER=" or " ; COMMAND=" cannot be read safely: it is reported.
+    """
+    m = RE_SUDO_HEAD.match(msg)
+    if not m:
+        return None
+    ev = {"kind": "sudo_cmd", "svc": "sudo", "ruser": m.group(1), "tty": m.group(2) or ""}
+    if msg.count(" ; USER=") != 1 or msg.count(" ; COMMAND=") != 1 or msg.count("PWD=") != 1:
+        ev.update({"user": "root", "cmd": "", "odd": "1"})
+        return ev
+    um = re.search(r" ; USER=(\S{1,100}) ; ", msg)
+    if not um:
+        ev.update({"user": "root", "cmd": "", "odd": "1"})
+        return ev
+    argv = msg.split(" ; COMMAND=", 1)[1].split(" ")
+    base = argv[0].rsplit("/", 1)[-1]
+    rest = [a for a in argv[1:] if a]
+    if base in SHELLS:
+        # a shell with nothing to run: only options, and no -c
+        is_shell = all(a.startswith("-") and not a.startswith("--command")
+                       and not (not a.startswith("--") and "c" in a[1:]) for a in rest)
+    elif base in ("su", "sudo", "sudo.ws", "login"):
+        is_shell = not any(a in ("-c", "--command", "--session-command") or a.startswith("--command=") for a in rest)
+    else:
+        is_shell = False
+    if not is_shell:
+        return None
+    ev.update({"user": um.group(1), "cmd": argv[0]})
+    return ev
+
+
+def classify_line(door, msg):
+    """One journal line of a program auto_sec reads -> event fields, or None."""
+    if not isinstance(msg, str) or len(msg) > 4000:
+        return None
+    m = RE_HOOK_FAIL.fullmatch(msg)
+    if m:
+        return {"kind": "hook_fail", "svc": m.group(1), "why": m.group(2)}
+    if door in ("sshd", "login", "su", "sudo"):
+        m = RE_PAM_OPEN.fullmatch(msg)
+        if m:
+            if m.group(1) == "sudo":
+                return None     # every sudo command opens one: not a login
+            return {"kind": "pam_open", "svc": m.group(1), "user": m.group(2), "ruser": m.group(4),
+                    "byuid": m.group(5)}
+    if door == "sshd":
+        m = RE_ACCEPTED.fullmatch(msg)
+        if m:
+            return {"kind": "accepted", "svc": "sshd", "method": m.group(1), "user": m.group(2),
+                    "rhost": m.group(3), "port": m.group(4), "keytype": m.group(5) or "", "fp": m.group(6) or ""}
+    elif door == "login":
+        m = RE_ROOT_LOGIN.fullmatch(msg)
+        if m:
+            return {"kind": "login_line", "svc": "login", "user": "root", "tty": m.group(1), "rhost": m.group(2) or ""}
+        m = RE_LOGIN_ON.fullmatch(msg)
+        if m:
+            return {"kind": "login_line", "svc": "login", "user": m.group(2), "tty": m.group(1), "rhost": m.group(3) or ""}
+        m = RE_LOGGED_IN.fullmatch(msg)
+        if m:
+            return {"kind": "login_line", "svc": "login", "user": m.group(1), "tty": m.group(2), "rhost": m.group(3) or ""}
+    elif door == "su":
+        m = RE_SU.fullmatch(msg)
+        if m:
+            return {"kind": "su_line", "svc": "su", "user": m.group(1), "ruser": m.group(2), "tty": m.group(3)}
+    elif door == "sudo":
+        return parse_sudo(msg)
+    elif door in WEB_IDENTS:
+        m = RE_WEB.fullmatch(msg)
+        if m:
+            return {"kind": "web_login", "svc": door, "user": m.group(1), "rhost": m.group(2)}
+    return None
+
+
+def journal_record(rec):
+    """One `journalctl -o json` object -> event fields, or None."""
+    if not isinstance(rec, dict):
+        return None
+    msg = rec.get("MESSAGE")
+    if isinstance(msg, list):
+        try:
+            msg = bytes(msg).decode("utf-8", "replace")
+        except (ValueError, TypeError):
+            return None
+    exe, ident = rec.get("_EXE"), rec.get("SYSLOG_IDENTIFIER")
+    door = EXE_DOOR.get(exe) if isinstance(exe, str) else None
+    if door is None and ident in WEB_IDENTS and rec.get("_UID") == "0":
+        door = ident
+    if door is None:
+        return None
+    # The system's sshd and login log as root. Any account can start a copy
+    # of sshd on a high port: that is not a door into the server, and its
+    # lines must not look like one. (su and sudo log as the account that
+    # ran them.)
+    if door in ("sshd", "login") and rec.get("_UID") != "0":
+        return None
+    ev = classify_line(door, msg)
+    if ev is None:
+        return None
+    pid, ts = rec.get("_PID"), rec.get("__REALTIME_TIMESTAMP")
+    ev["src"] = "journal"
+    ev["app"] = pid if isinstance(pid, str) and pid.isdigit() else ""
+    ev["ts"] = str(int(ts) // 1000000) if isinstance(ts, str) and ts.isdigit() else ""
+    return ev
+
+
+def journal_args(cursor):
+    args = [tool("journalctl"), "--follow", "--output=json", "--no-pager", "--quiet",
+            "--output-fields=" + JOURNAL_FIELDS]
+    args.append("--after-cursor=" + cursor if cursor else "--lines=0")
+    args += ["_EXE=" + exe for exe in sorted(EXE_DOOR)]
+    args += ["+", "_UID=0"] + ["SYSLOG_IDENTIFIER=" + i for i in WEB_IDENTS]
+    return args
+
+
+# --------------------------------------------------------------------- state
+def read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, type(default)) else default
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    tmp = path + ".new"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def touch(name):
+    path = os.path.join(P(STATE), name)
+    try:
+        with open(path, "a", encoding="ascii"):
+            pass
+        os.utime(path, None)
+    except OSError:
+        pass
+
+
+def age_of(name, now):
+    try:
+        return now - os.stat(os.path.join(P(STATE), name)).st_mtime
+    except OSError:
+        return None
+
+
+def unit_state(unit):
+    try:
+        out = subprocess.run([tool("systemctl"), "is-active", unit], capture_output=True, text=True,
+                             timeout=15, check=False).stdout.strip()
+        return out if re.fullmatch(r"[a-z-]{1,20}", out) else "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def checker_problem(now, up_since):
+    """Asked by the two services: does the independent checker still run?
+
+    Not in a service's first 10 minutes: an install starts the checker's
+    timer after the services, and after a boot its first run is 2 minutes
+    away while its last one may be hours old.
+    """
+    if now - up_since < CHECK_GRACE:
+        return ""
+    st = unit_state(CHECK_TIMER)
+    if st != "active":
+        return "%s is %s" % (CHECK_TIMER, st)
+    last = read_json(os.path.join(P(STATE), "check.json"), {}).get("last_run", 0)
+    if not isinstance(last, (int, float)) or now - last > 1200:
+        return "the checker has not run since %s" % (stamp(last) if last else "this service started")
+    return ""
+
+
+EMPTY_DAY = {"alerts": 0, "quiet": 0, "by_root": 0, "hook": 0, "journal": 0, "hook_only": 0,
+             "journal_only": 0, "hook_failed": 0, "lost": 0, "late": 0}
+
+
+# Every field of a waiting alert, with the value a missing one gets.
+ITEM_SHAPE = {"t": 0.0, "family": "", "svc": "", "user": "", "by": "", "tty": "", "rhost": "", "method": "",
+              "keytype": "", "fp": "", "cmd": "", "door": "other", "gap": "", "hook": False, "journal": False,
+              "damaged": False, "odd": False}
+
+
+def num(value):
+    """A number from a state file, or 0 for anything else."""
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def stored_item(a):
+    """A waiting alert from the state file, with every field this version reads."""
+    it = {}
+    for key, default in ITEM_SHAPE.items():
+        v = a.get(key, default)
+        if isinstance(default, bool):
+            it[key] = v is True
+        elif isinstance(default, float):
+            it[key] = float(num(v))
+        else:
+            it[key] = safe(v, 255) if isinstance(v, str) else default
+    if num(a.get("ready")):
+        it["ready"] = num(a["ready"])
+    if a.get("follow") is True:
+        it["follow"] = True
+    return it
+
+
+def load_state():
+    """The state file, in the shape this version reads.
+
+    This program wrote it, but perhaps another version of it did, or the
+    disk was full: a missing or odd value must never stop the sender, the
+    checker or the status. Anything that does not fit starts empty.
+    """
+    st = read_json(os.path.join(P(STATE), "state.json"), {})
+
+    def of(key, kind):
+        return st[key] if isinstance(st.get(key), kind) else kind()
+
+    day = dict(EMPTY_DAY)
+    day.update({k: v for k, v in of("day", dict).items() if k in EMPTY_DAY and isinstance(v, int) and not isinstance(v, bool)})
+    un = of("unsent", dict)
+    lines = un["lines"] if isinstance(un.get("lines"), list) else []
+    return {
+        "day": day,
+        "day_from": num(st.get("day_from")) or time.time(),
+        "last_alive": num(st.get("last_alive")),
+        "last_sent": num(st.get("last_sent")),
+        "last_event": num(st.get("last_event")),
+        "last_hook": num(st.get("last_hook")),
+        "fail_since": num(st.get("fail_since")),
+        "fail_why": safe(of("fail_why", str), 40),
+        "alerts": [stored_item(a) for a in of("alerts", list) if isinstance(a, dict)][:ALERTS_MAX],
+        "notices": [{"kind": n["kind"], "t": num(n.get("t")), "text": n["text"] if isinstance(n.get("text"), str) else ""}
+                    for n in of("notices", list) if isinstance(n, dict) and n.get("kind") in ("alive", "text")][:20],
+        "unsent": {"count": int(num(un.get("count"))), "since": num(un.get("since")),
+                   "lines": [safe(x, 200) for x in lines if isinstance(x, str)][:30], "flood": un.get("flood") is True},
+        "said": {k: num(v) for k, v in of("said", dict).items() if isinstance(k, str)},
+        "started": num(st.get("started")),
+        "installed": num(st.get("installed")),
+    }
+
+
+# -------------------------------------------------------------------- sender
+class Sender:
+    """Joins events, applies the quiet list, bundles and sends."""
+
+    def __init__(self, conf, now=time.time, send=None):
+        self.conf = conf
+        self.now = now
+        self.send = send or (lambda text: tg_send(conf, text))
+        self.state = load_state()
+        self.groups = {}       # (family, key) -> {"first": t, "events": [...]}
+        self.done = {}         # (family, key) -> (time, alert item or None)
+        self.next_send = 0.0
+        self.backoff = 0
+        self.dirty = False
+
+    # ---- reading the queue
+    def scan(self):
+        try:
+            names = sorted(os.listdir(P(QUEUE)))
+        except OSError:
+            return 0
+        took, now = 0, self.now()
+        for name in names:
+            path = os.path.join(P(QUEUE), name)
+            if not EVENT_NAME.match(name):
+                # a half-written file of sensor B that was never renamed
+                try:
+                    if name.startswith(".tmp.") and now - os.lstat(path).st_mtime > 3600:
+                        os.unlink(path)
+                except OSError:
+                    pass
+                continue
+            fields, complete, mtime = parse_event(path)
+            if fields is None:
+                continue
+            if not complete:
+                if now - mtime < 5:
+                    continue        # perhaps still being written
+                fields = dict(fields, kind="damaged", src=fields.get("src") or ("hook" if name[0] == "h" else "journal"))
+            try:
+                os.unlink(path)
+            except OSError:
+                continue
+            took += 1
+            self.take(fields, mtime)
+        return took
+
+    def take(self, f, mtime):
+        now = self.now()
+        self.dirty = True
+        src = f.get("src", "")
+        kind = f.get("kind", "")
+        if src == "notice":
+            self.notice(kind, f)
+            return
+        self.state["last_event"] = now
+        if kind == "hook_fail":
+            self.state["day"]["hook_failed"] += 1
+            return
+        svc = safe(f.get("svc", ""), 32)
+        ev = {
+            "src": "hook" if src == "hook" else "journal",
+            "kind": "hook" if src == "hook" else safe(kind, 20),
+            "svc": svc,
+            "user": safe(f.get("user", ""), 64), "ruser": safe(f.get("ruser", ""), 64),
+            "tty": safe(f.get("tty", ""), 64), "rhost": safe(f.get("rhost", ""), 255),
+            "method": safe(f.get("method", ""), 40), "keytype": safe(f.get("keytype", ""), 40),
+            "fp": safe(f.get("fp", ""), 110), "cmd": safe(f.get("cmd", ""), 120),
+            "app": to_int(f.get("app")), "ruid": to_int(f.get("ruid")), "byuid": to_int(f.get("byuid")),
+            "odd": f.get("odd") == "1",
+            "t": float(to_int(f.get("ts")) or mtime),
+        }
+        if ev["src"] == "hook":
+            self.state["day"]["hook"] += 1
+            self.state["last_hook"] = now
+        if kind == "damaged":
+            ev["kind"] = "damaged"
+        family = FAMILY.get(svc, "other:" + svc)
+        if family in WEB_IDENTS or ev["app"] is None:
+            key = (family, "%s@%s" % (ev["user"], ev["rhost"]))
+        else:
+            key = (family, ev["app"])
+        # One login gives each kind of event once. A kind that is already
+        # there means the next login with the same key.
+        g = self.groups.get(key)
+        if g is not None and ev["kind"] != "damaged" and ev["kind"] in {e["kind"] for e in g["events"]}:
+            self.close(key)
+            g = None
+        if g is None and key in self.done and now - self.done[key][0] < 60 \
+                and ev["kind"] not in self.done[key][2]:
+            self.late(key, ev)
+            return
+        g = self.groups.setdefault(key, {"first": now, "events": []})
+        g["events"].append(ev)
+
+    def close(self, key):
+        evs = self.groups.pop(key)["events"]
+        self.done[key] = (self.now(), self.finish(key[0], evs), {e["kind"] for e in evs})
+        self.dirty = True       # the counts changed, also for a quiet login
+
+    def late(self, key, ev):
+        """The other sensor's event came after the login was already handled."""
+        self.dirty = True
+        self.state["day"]["late"] += 1
+        when, item, kinds = self.done[key]
+        kinds.add(ev["kind"])
+        if item and ev["kind"] == "accepted" and item.get("method") == "" and item.get("door") == "ssh":
+            # The alert said "key or password not known". Say it now.
+            more = dict(item, method=ev["method"], fp=ev["fp"], keytype=ev["keytype"], follow=True)
+            more.pop("ready", None)
+            if not self.is_quiet(more):
+                self.state["alerts"].append(more)
+            self.done[key] = (when, more, kinds)
+
+    # ---- one login
+    def ripe(self):
+        now = self.now()
+        for key in [k for k in self.done if now - self.done[k][0] > 120]:
+            del self.done[key]
+        for key in list(self.groups):
+            g = self.groups[key]
+            family = key[0]
+            evs = g["events"]
+            has_hook = any(e["src"] == "hook" for e in evs)
+            kinds = {e["kind"] for e in evs}
+            wait = WAIT_SSH if family == "sshd" else WAIT_OTHER
+            hook_wanted = self.conf["login_hook"]
+            if family == "sshd":
+                full = "accepted" in kinds and (has_hook or not hook_wanted)
+            elif family == "sudo":
+                full = "sudo_cmd" in kinds and has_hook
+            elif family.startswith("other:"):
+                full = False
+            else:
+                full = (has_hook or not hook_wanted) and bool(kinds - {"hook", "damaged"})
+            if full or now - g["first"] >= wait:
+                self.close(key)
+
+    def finish(self, family, evs):
+        day = self.state["day"]
+        hook = next((e for e in evs if e["src"] == "hook"), None)
+        jour = [e for e in evs if e["src"] == "journal"]
+        if jour:
+            day["journal"] += 1
+        kinds = {e["kind"] for e in evs}
+
+        def first(name, order):
+            for kind in order:
+                for e in evs:
+                    if e["kind"] == kind and e.get(name):
+                        return e[name]
+            return ""
+
+        item = {
+            "t": min(e["t"] for e in evs),
+            "family": family,
+            "svc": first("svc", ("hook", "pam_open", "accepted", "login_line", "su_line", "sudo_cmd", "web_login", "damaged")),
+            "user": first("user", ("hook", "accepted", "pam_open", "sudo_cmd", "login_line", "su_line", "web_login", "damaged")),
+            "by": first("ruser", ("sudo_cmd", "su_line", "hook", "pam_open")),
+            "tty": first("tty", ("login_line", "su_line", "sudo_cmd", "hook")),
+            "rhost": first("rhost", ("accepted", "hook", "web_login", "login_line")),
+            "method": first("method", ("accepted",)),
+            "keytype": first("keytype", ("accepted",)),
+            "fp": first("fp", ("accepted",)),
+            "cmd": first("cmd", ("sudo_cmd",)),
+            "hook": hook is not None,
+            "journal": bool(jour),
+            "damaged": "damaged" in kinds,
+            "odd": any(e["odd"] for e in evs),
+        }
+        if family == "sshd":
+            item["door"] = "ssh"
+        elif family == "login":
+            item["door"] = "console"
+        elif family in ("su", "sudo", "webmin", "usermin"):
+            item["door"] = family
+        else:
+            item["door"] = "other"
+
+        # su and sudo started by root give nobody a new right: counted, not sent.
+        if family == "su":
+            uids = [e[k] for e in evs for k in ("ruid", "byuid") if e.get(k) is not None]
+            if uids and all(u == 0 for u in uids):
+                day["by_root"] += 1
+                return None
+        if family == "sudo" and item["by"] == "root" and not item["odd"]:
+            day["by_root"] += 1
+            return None
+
+        # which sensor missed it (where both should see it)
+        hook_expected = self.conf["login_hook"] and (
+            family in ("sshd", "login", "su") or (family == "sudo" and item["svc"] == "sudo-i"))
+        journal_expected = family in ("sshd", "login", "su", "sudo")
+        item["gap"] = ""
+        if item["hook"] and not item["journal"] and journal_expected:
+            day["hook_only"] += 1
+            item["gap"] = "the journal reader did not report this login"
+        elif item["journal"] and not item["hook"] and hook_expected:
+            day["journal_only"] += 1
+            item["gap"] = "the login hook did not report this login"
+
+        if self.is_quiet(item):
+            day["quiet"] += 1
+            return None
+        day["alerts"] += 1
+        self.state["alerts"].append(item)
+        return item
+
+    def is_quiet(self, it):
+        user = it["user"]
+        if it["damaged"] or it["odd"] or it["door"] == "console":
+            return False
+        key_ok = it["method"] == "publickey" and it["fp"] != "" and it["fp"] in self.conf["quiet_keys"]
+        if it["door"] == "ssh":
+            if user == "root":
+                return key_ok
+            return key_ok or user in self.conf["quiet_accounts"]
+        if user == "root" or user == "":
+            return False
+        return user in self.conf["quiet_accounts"]
+
+    # ---- messages
+    @staticmethod
+    def headline(it):
+        user = it["user"] or "(account not known)"
+        if it.get("follow"):
+            head = "More on the SSH login of %s: " % user
+        else:
+            head = ""
+        if it["damaged"]:
+            return "a login was recorded, but its record is incomplete (account: %s, PAM service: %s)" % (user, it["svc"] or "?")
+        if it["door"] == "console":
+            return "%s logged in on the console (%s)" % (user, it["tty"] or "terminal not known")
+        if it["door"] == "ssh":
+            if it["method"] == "publickey":
+                how = "with a key (%s %s)" % (it["keytype"] or "?", it["fp"] or "?")
+            elif it["method"] in ("password", "none"):
+                how = "with a PASSWORD" if it["method"] == "password" else "with NO password (method none)"
+            elif it["method"]:
+                how = "(method: %s)" % it["method"]
+            else:
+                how = "(key or password not known: sshd's line did not come within %d s)" % WAIT_SSH
+            return head + "%s logged in over SSH %s" % (user, how)
+        if it["door"] == "su":
+            return "%s became %s with su" % (it["by"] or "an account", user)
+        if it["door"] == "sudo":
+            if it["odd"]:
+                return "%s ran sudo, and sudo's line cannot be read safely (check it on the server)" % (it["by"] or "an account")
+            what = "sudo -i" if it["svc"] == "sudo-i" else "sudo"
+            return "%s opened a shell as %s with %s%s" % (it["by"] or "an account", user, what,
+                                                          (" (%s)" % it["cmd"]) if it["cmd"] else "")
+        if it["door"] in WEB_IDENTS:
+            return "%s logged in to %s" % (user, it["door"].capitalize())
+        return "%s logged in through PAM service '%s', a door auto_sec does not know" % (user, it["svc"])
+
+    def block(self, it):
+        lines = [self.headline(it)]
+        if it["rhost"]:
+            lines.append("from: " + it["rhost"])
+        if it["tty"] and it["tty"] != "ssh" and it["door"] != "console":
+            lines.append("terminal: " + it["tty"])
+        lines.append("time: " + both_times(it["t"]))
+        seen = [n for n, on in (("login hook", it["hook"]), ("journal", it["journal"])) if on]
+        lines.append("seen by: " + " and ".join(seen) + ((" (" + it["gap"] + ")") if it["gap"] else ""))
+        return "\n".join(lines)
+
+    @staticmethod
+    def short(it):
+        return "%s %s %s%s" % (time.strftime("%H:%M UTC", time.gmtime(it["t"])), it["user"] or "?", it["door"],
+                               (" from " + it["rhost"][:60]) if it["rhost"] else "")
+
+    def notice(self, kind, f):
+        now = self.now()
+        if kind == "alive":
+            self.state["notices"].append({"kind": "alive", "t": now})
+        elif kind == "checker_down":
+            if now - self.state["said"].get("checker_down", 0) >= REPEAT:
+                self.state["said"]["checker_down"] = now
+                self.state["notices"].append({"kind": "text", "t": now, "text": (
+                    "auto_sec detection problem: %s\nThe checker that watches the watcher is not running: %s.\n"
+                    "This message repeats every hour until it is fixed." % (self.conf["host"], safe(f.get("why", ""), 100)))})
+
+    def alive_text(self):
+        d, st = self.state["day"], self.state
+        mode = "login hook and journal reader" if self.conf["login_hook"] else "journal reader only (no login hook)"
+        lines = [ALIVE_LINE + self.conf["host"],
+                 "Detection is running: %s." % mode,
+                 "Since %s:" % stamp(st["day_from"]),
+                 "- logins that sent an alert: %d" % d["alerts"],
+                 "- quiet logins: %d" % d["quiet"],
+                 "- su and sudo started by root (not counted as logins): %d" % d["by_root"],
+                 "- events from the login hook: %d; logins in the journal: %d" % (d["hook"], d["journal"])]
+        if d["hook_only"] or d["journal_only"]:
+            lines.append("- GAP: %d login(s) the journal reader missed, %d the login hook missed"
+                         % (d["hook_only"], d["journal_only"]))
+        if d["hook_failed"]:
+            lines.append("- the login hook failed or was cut off %d time(s)" % d["hook_failed"])
+        if d["lost"]:
+            lines.append("- alerts that went out late, as one line each or only counted: %d" % d["lost"])
+        try:
+            waiting = len([n for n in os.listdir(P(QUEUE)) if EVENT_NAME.match(n)])
+        except OSError:
+            waiting = 0
+        lines.append("- waiting in the queue now: %d" % waiting)
+        if self.conf["test_mode"]:
+            lines.append("TEST MODE: messages go to %s, not to Telegram." % self.conf["api"])
+        return "\n".join(lines)
+
+    def compose(self):
+        """The next message: (text, number of alerts in it, kind)."""
+        st = self.state
+        tail = ""
+        if st["unsent"]["count"]:
+            if st["unsent"]["flood"]:
+                why = "Not sent one by one (more than %d logins waited at once; the oldest from %s)" % (
+                    ALERTS_MAX, stamp(st["unsent"]["since"]))
+            else:
+                why = "Not sent earlier (Telegram could not be reached since %s)" % stamp(st["unsent"]["since"])
+            tail = "\n\n%s: %d alert(s)\n%s" % (
+                why, st["unsent"]["count"], "\n".join("- " + x for x in st["unsent"]["lines"][:15]))
+            if st["unsent"]["count"] > 15:
+                tail += "\n... and %d more (not listed)." % (st["unsent"]["count"] - min(15, len(st["unsent"]["lines"])))
+        if st["alerts"]:
+            head = "auto_sec login alert: %s" % self.conf["host"]
+            blocks, used = [], 0
+            for it in st["alerts"]:
+                b = self.block(it)
+                if blocks and used + len(b) + len(tail) > MSG_MAX:
+                    break
+                blocks.append(b)
+                used += len(b) + 2
+            n = len(blocks)
+            if len(st["alerts"]) > 1:
+                head = "auto_sec login alerts: %s (%d logins)" % (self.conf["host"], len(st["alerts"]))
+            more = len(st["alerts"]) - n
+            text = head + "\n" + "\n\n".join(blocks)
+            if more:
+                text += "\n\n... and %d more in the next message." % more
+            return text + tail, n, "alerts"
+        if st["notices"]:
+            nt = st["notices"][0]
+            text = self.alive_text() if nt["kind"] == "alive" else nt.get("text", "")
+            return text + tail, 0, nt["kind"]
+        return "", 0, ""
+
+    def flush(self):
+        now = self.now()
+        st = self.state
+        # An alert that could not be sent for 10 minutes is kept as one line.
+        # So are the oldest when more than ALERTS_MAX wait at once (logins
+        # keep coming while nothing goes out): what waits stays small, and
+        # every login is still counted.
+        over = max(0, len(st["alerts"]) - ALERTS_MAX)
+        old, keep = [], []
+        for i, it in enumerate(st["alerts"]):
+            (old if i < over or now - it.get("ready", now) > GIVE_UP else keep).append(it)
+        if old:
+            st["alerts"] = keep
+            un = st["unsent"]
+            un["since"] = un["since"] or min(it.get("ready", now) for it in old)
+            un["count"] += len(old)
+            un["lines"] = (un["lines"] + [self.short(it) for it in old])[:30]
+            un["flood"] = un["flood"] or over > 0
+            st["day"]["lost"] += len(old)
+            self.dirty = True
+        st["notices"] = [n for n in st["notices"] if now - n["t"] <= GIVE_UP or n["kind"] == "alive" and now - n["t"] <= 3600]
+        for it in st["alerts"]:
+            it.setdefault("ready", now)
+        if now < self.next_send:
+            return False
+        text, n, kind = self.compose()
+        if not text:
+            return False
+        ok, info = self.send(text)
+        self.dirty = True
+        if ok:
+            if kind == "alerts":
+                del st["alerts"][:n]
+            else:
+                st["notices"].pop(0)
+                if kind == "alive":
+                    st["last_alive"] = now
+                    st["day"] = dict(EMPTY_DAY)
+                    st["day_from"] = now
+            st["unsent"] = {"count": 0, "since": 0, "lines": [], "flood": False}
+            st["last_sent"] = now
+            st["fail_since"] = 0
+            st["fail_why"] = ""
+            self.backoff = 0
+            self.next_send = now + SEND_GAP
+            return True
+        st["fail_since"] = st["fail_since"] or now
+        st["fail_why"] = safe(info.get("error", ""), 40)
+        if info.get("retry"):
+            self.next_send = now + info["retry"]      # Telegram's own "retry after"
+        else:
+            self.backoff = min(60, max(2, self.backoff * 2))
+            self.next_send = now + self.backoff
+        return False
+
+    def save(self):
+        if self.dirty and write_json(os.path.join(P(STATE), "state.json"), self.state):
+            self.dirty = False
+
+    def busy(self):
+        return bool(self.groups or self.state["alerts"] or self.state["notices"])
+
+    def shutdown(self):
+        """The service stops. A login whose events were already taken out of
+        the queue and still wait for the other sensor is closed now: its
+        alert is kept in the state file and goes out at the next start."""
+        for key in list(self.groups):
+            self.close(key)
+        self.dirty = True
+        self.save()
+
+
+STOP = []
+
+
+def _stop(_signum, _frame):
+    STOP.append(1)
+
+
+def cmd_send(conf):
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    s = Sender(conf)
+    s.state["started"] = time.time()
+    s.state["installed"] = s.state["installed"] or time.time()
+    s.dirty = True
+    last_beat = last_check = 0.0
+    log("sender started (%s)" % ("TEST MODE: " + conf["api"] if conf["test_mode"] else "Telegram"))
+    while not STOP:
+        s.scan()
+        s.ripe()
+        s.flush()
+        now = time.time()
+        if now - last_beat >= 5:
+            touch("sender.alive")
+            last_beat = now
+        if now - last_check >= 60:
+            last_check = now
+            why = checker_problem(now, s.state["started"])
+            if why:
+                s.notice("checker_down", {"why": why})
+                s.dirty = True
+        s.save()
+        time.sleep(0.2)
+    s.shutdown()
+    return 0
+
+
+# ------------------------------------------------------------------- sensor B
+def cmd_watch(conf):
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    cpath = os.path.join(P(STATE), "cursor")
+    cursor = ""
+    try:
+        with open(cpath, encoding="ascii") as fh:
+            cursor = fh.read(600).strip()
+    except (OSError, UnicodeError):
+        cursor = ""
+    if not re.fullmatch(r"[A-Za-z0-9=;:_-]{8,500}", cursor):
+        cursor = ""
+    started = time.time()
+    try:
+        proc = subprocess.Popen(journal_args(cursor), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                stdin=subprocess.DEVNULL, bufsize=0)
+    except OSError as exc:
+        log("cannot start journalctl: %s" % type(exc).__name__)
+        return 1
+    log("journal reader started (%s)" % ("after its last place" if cursor else "new lines only"))
+    fd = proc.stdout.fileno()
+    buf = b""
+    newest = cursor
+    last_beat = last_save = last_check = 0.0
+    seen = 0
+    while not STOP:
+        ready, _, _ = select.select([fd], [], [], 2.0)
+        if ready:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) > 2097152 and b"\n" not in buf:
+                buf = b""
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                try:
+                    rec = json.loads(line.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                cur = rec.get("__CURSOR")
+                if isinstance(cur, str) and re.fullmatch(r"[A-Za-z0-9=;:_-]{8,500}", cur):
+                    newest = cur
+                ev = journal_record(rec)
+                if ev is not None:
+                    seen += 1
+                    if not write_event("j", ev):
+                        log("cannot write to the queue")
+        now = time.time()
+        if now - last_beat >= 5:
+            touch("watch.alive")
+            last_beat = now
+        if newest != cursor and now - last_save >= 2:
+            try:
+                fdc = os.open(cpath + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fdc, "w", encoding="ascii") as fh:
+                    fh.write(newest + "\n")
+                os.replace(cpath + ".new", cpath)
+                cursor = newest
+            except OSError:
+                pass
+            last_save = now
+        if now - last_check >= 60:
+            last_check = now
+            why = checker_problem(now, started)
+            if why:
+                write_event("n", {"src": "notice", "kind": "checker_down", "why": why})
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if STOP:
+        return 0
+    # journalctl ended by itself. If it ended at once, its saved place is
+    # no longer in the journal: start from new lines next time.
+    if time.time() - started < 5 and cursor:
+        try:
+            os.unlink(cpath)
+        except OSError:
+            pass
+        log("journalctl ended at once: its saved place is gone, the next start reads new lines only")
+    else:
+        log("journalctl ended (%d events read)" % seen)
+    return 1
+
+
+# -------------------------------------------------------------- proof of life
+def cmd_alive(_conf):
+    return 0 if write_event("n", {"src": "notice", "kind": "alive"}) else 1
+
+
+def cmd_test(conf):
+    ident = os.urandom(4).hex()
+    text = ("auto_sec test %s: alerts from %s reach this chat.\nSent by an auto_sec run at %s."
+            % (ident, conf["host"], stamp(time.time())))
+    ok, info = send_now(conf, text, tries=3)
+    print(json.dumps({"ok": bool(ok), "id": ident, "message_id": info if ok else None,
+                      "error": "" if ok else safe(info.get("error", ""), 40), "test_mode": conf["test_mode"]}))
+    return 0 if ok else 1
+
+
+def pam_problems(conf):
+    """Is the login hook still wired into PAM? (Not asked in journal-only mode.)"""
+    if not conf["login_hook"]:
+        return []
+    out = []
+    try:
+        with open(P(PAM_SESSION), encoding="utf-8", errors="replace") as fh:
+            lines = fh.read(262144).split("\n")
+    except OSError:
+        lines = []
+    if PAM_LINE not in lines:
+        out.append("the login hook's line is no longer in %s" % PAM_SESSION)
+    try:
+        with open(P(PROFILE), encoding="utf-8", errors="replace") as fh:
+            first = fh.readline().rstrip("\n")
+    except OSError:
+        first = None
+    if first != PROFILE_HEADER:
+        out.append("the PAM profile %s is missing or was changed" % PROFILE)
+    if not (os.path.isfile(P(HOOK)) and os.access(P(HOOK), os.X_OK)):
+        out.append("the login hook %s is missing" % HOOK)
+    return out
+
+
+def alive_due(conf, now):
+    """The time today's (or yesterday's) daily message should have gone out."""
+    m = re.fullmatch(r"([01][0-9]|2[0-3]):([0-5][0-9])", conf["alive_time"])
+    hh, mm = (int(m.group(1)), int(m.group(2))) if m else (9, 0)
+    lt = time.localtime(now)
+    due = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hh, mm, 0, 0, 0, -1))
+    return due if due <= now else due - 86400
+
+
+def health(conf, now):
+    """What is wrong right now: [[code, text], ...]. Used by check and status.
+
+    The code names the kind of problem and stays the same while it lasts
+    (the text may hold a count or a time that moves).
+    """
+    problems = []
+    for unit, what in ((WATCH, "the journal reader"), (SENDER, "the sender"), (PATHUNIT, "the sender's wake-up"),
+                       (ALIVE_TIMER, "the daily message's timer")):
+        st = unit_state(unit)
+        if st != "active":
+            problems.append(["unit:" + unit, "%s is not running (%s: %s)" % (what, unit, st)])
+    for name, what in (("sender.alive", "the sender"), ("watch.alive", "the journal reader")):
+        age = age_of(name, now)
+        if age is None or age > 120:
+            problems.append(["beat:" + name, "%s has not answered since %s" % (
+                what, stamp(now - age) if age is not None else "it was installed")])
+    problems += [["pam:%d" % i, text] for i, text in enumerate(pam_problems(conf))]
+    oldest = None
+    count = 0
+    try:
+        for name in os.listdir(P(QUEUE)):
+            if EVENT_NAME.match(name):
+                count += 1
+                mt = os.stat(os.path.join(P(QUEUE), name)).st_mtime
+                oldest = mt if oldest is None else min(oldest, mt)
+    except OSError:
+        problems.append(["queue:read", "the queue %s cannot be read" % QUEUE])
+    if oldest is not None and now - oldest > 120:
+        problems.append(["queue:stuck", "the queue is not moving: %d event(s) wait, the oldest since %s" % (count, stamp(oldest))])
+    st = load_state()
+    if st["fail_since"] and now - st["fail_since"] > GIVE_UP:
+        problems.append(["send", "messages cannot be sent since %s (%s)" % (stamp(st["fail_since"]), st["fail_why"] or "no answer")])
+    due = alive_due(conf, now)
+    if now - due > 1800 and st["installed"] and st["installed"] < due - 60 and st["last_alive"] < due - 60:
+        problems.append(["alive", "the daily message of %s did not go out" % stamp(due)])
+    if conf["bad"]:
+        problems.append(["conf", "the settings are not usable: " + "; ".join(conf["bad"])])
+    return problems, st, count
+
+
+def cmd_check(conf):
+    now = time.time()
+    path = os.path.join(P(STATE), "check.json")
+    prev = read_json(path, {})
+    found, _st, _count = health(conf, now)
+    problems = [text for _code, text in found]
+    codes = sorted(code for code, _text in found)
+    rec = {"last_run": now, "problems": problems, "codes": codes, "since": num(prev.get("since")),
+           "said": num(prev.get("said")), "boot": prev["boot"] if isinstance(prev.get("boot"), str) else ""}
+    try:
+        with open(P(BOOT_ID), encoding="ascii") as fh:
+            boot = fh.read(64).strip()
+    except OSError:
+        boot = ""
+    if boot and rec["boot"] and boot != rec["boot"]:
+        ok, _ = send_now(conf, "auto_sec: %s started again (a boot). Detection is running.\nSeen at %s."
+                         % (conf["host"], both_times(now)))
+        if ok:
+            rec["boot"] = boot
+    elif boot and not rec["boot"]:
+        rec["boot"] = boot
+    if problems:
+        rec["since"] = rec["since"] or now
+        if now - rec["said"] >= REPEAT or codes != prev.get("codes", []):
+            text = ("auto_sec detection problem: %s\n%s\nFirst seen %s.\n"
+                    "This message repeats every hour until it is fixed." % (
+                        conf["host"], "\n".join("- " + p for p in problems[:12]), stamp(rec["since"])))
+            ok, why = send_now(conf, text)
+            if ok:
+                rec["said"] = now
+            else:
+                # Not a failure of this unit: the next run, 5 minutes on, tries again.
+                log("could not send the problem message (%s)" % safe(why.get("error", ""), 40))
+    else:
+        if prev.get("problems") and prev.get("said"):
+            send_now(conf, "auto_sec detection is working again on %s (checked at %s)." % (conf["host"], stamp(now)))
+        rec["since"] = 0
+        rec["said"] = 0
+    write_json(path, rec)
+    for p in problems:
+        log("problem: " + p)
+    return 0
+
+
+def cmd_stopped(conf, unit, result):
+    """A detection unit stopped or failed. Sent by auto-sec-notify@.service."""
+    now = time.time()
+    unit = safe(unit, 60)
+    try:
+        if now - os.stat(P(PLANNED)).st_mtime < 900:
+            log("%s stopped during an auto_sec run: no message" % unit)
+            return 0
+    except OSError:
+        pass
+    try:
+        running = subprocess.run([tool("systemctl"), "is-system-running"], capture_output=True, text=True,
+                                 timeout=15, check=False).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        running = ""
+    if running == "stopping":
+        return 0
+    path = os.path.join(P(STATE), "stopped.json")
+    said = {k: num(v) for k, v in read_json(path, {}).items() if isinstance(k, str)}
+    if now - said.get(unit, 0) < 600:
+        return 0
+    # The two services restart by themselves (Restart=always); the path and
+    # timer units do not.
+    if unit in (WATCH, SENDER):
+        more = "After a crash it starts again by itself; if it stays down, the checker says so within 5 minutes."
+    else:
+        more = "The checker says more within 5 minutes."
+    text = ("auto_sec: the watcher on %s was stopped.\nUnit: %s%s\nTime: %s\n"
+            "If this was not you, look at the server now. %s" % (
+                conf["host"], unit, (" (%s)" % safe(result, 30)) if result else "", both_times(now), more))
+    ok, _ = send_now(conf, text)
+    if ok:
+        said[unit] = now
+        write_json(path, {k: v for k, v in said.items() if now - v < 86400})
+    return 0 if ok else 1
+
+
+def cmd_goodbye(conf):
+    """An auto_sec run takes detection out (-e detection_remove=true)."""
+    ok, _ = send_now(conf, "auto_sec: login alerts are being taken out of %s by an auto_sec run "
+                           "(-e detection_remove=true), at %s.\nNo more messages will come from this server. "
+                           "If this was not you, look at the server now." % (conf["host"], both_times(time.time())))
+    return 0 if ok else 1
+
+
+def cmd_status(conf, as_json):
+    now = time.time()
+    found, st, count = health(conf, now)
+    problems = [text for _code, text in found]
+    # Dead: no alert would get out, or a sensor is gone.
+    fatal = ("unit:" + SENDER, "unit:" + WATCH, "beat:sender.alive", "beat:watch.alive", "queue:read",
+             "queue:stuck", "send", "conf")
+    dead = [text for code, text in found if code in fatal]
+    since = 0
+    if dead:
+        times = []
+        for name, codes in (("sender.alive", ("unit:" + SENDER, "beat:sender.alive")),
+                            ("watch.alive", ("unit:" + WATCH, "beat:watch.alive"))):
+            age = age_of(name, now)
+            if age is not None and any(code in codes for code, _text in found):
+                times.append(now - age)
+        if st["fail_since"]:
+            times.append(st["fail_since"])
+        since = min(times) if times else 0
+    out = {
+        "verdict": "dead" if dead else "on",
+        "since": int(since),
+        "problems": problems,
+        "mode": "hook+journal" if conf["login_hook"] else "journal",
+        "last_alive": int(st["last_alive"]), "last_sent": int(st["last_sent"]),
+        "last_event": int(st["last_event"]), "last_hook": int(st["last_hook"]),
+        "queue": count, "waiting": len(st["alerts"]) + len(st["notices"]),
+        "unsent": st["unsent"]["count"], "test_mode": conf["test_mode"],
+        "day": st["day"],
+        "line": "",
+    }
+    if dead:
+        out["line"] = "detection: DEAD since %s (%s)" % (stamp(since) if since else "it was installed", dead[0])
+    else:
+        out["line"] = "detection: on, last alive message %s" % stamp(st["last_alive"])
+        if problems:
+            out["line"] += " (%d problem(s): %s)" % (len(problems), problems[0])
+    if as_json:
+        print(json.dumps(out, sort_keys=True))
+        return 0
+    print(out["line"])
+    if conf["test_mode"]:
+        print("TEST MODE: messages go to %s, not to Telegram" % conf["api"])
+    print("mode:          %s" % ("login hook and journal reader" if conf["login_hook"] else "journal reader only"))
+    for unit in (WATCH, SENDER, PATHUNIT, ALIVE_TIMER, CHECK_TIMER):
+        print("%-14s %s" % (unit.split(".")[0].replace("auto-sec-", "") + ":", unit_state(unit)))
+    print("last event:    %s" % stamp(st["last_event"]))
+    print("last message:  %s" % stamp(st["last_sent"]))
+    print("last alive:    %s" % stamp(st["last_alive"]))
+    print("queue:         %d event file(s), %d message(s) waiting, %d not sent" % (count, out["waiting"], out["unsent"]))
+    for p in problems:
+        print("problem:       " + p)
+    return 0 if not dead else 3
+
+
+def main(argv):
+    global ROOT
+    args = list(argv)
+    if len(args) >= 2 and args[0] == "--root":
+        ROOT = args[1].rstrip("/")
+        args = args[2:]
+    cmd = args[0] if args else ""
+    if cmd in ("", "-h", "--help", "help"):
+        print(__doc__)
+        return 0 if cmd else 2
+    conf = load_conf()
+    if conf is None:
+        if cmd == "status" and "--json" in args:
+            print(json.dumps({"verdict": "absent", "line": "detection: not set up (no %s)" % CONF, "problems": []}))
+            return 0
+        log("cannot read %s" % CONF)
+        return 2
+    if cmd == "watch":
+        return cmd_watch(conf)
+    if cmd == "send":
+        return cmd_send(conf)
+    if cmd == "alive":
+        return cmd_alive(conf)
+    if cmd == "check":
+        return cmd_check(conf)
+    if cmd == "stopped" and len(args) >= 2:
+        return cmd_stopped(conf, args[1], args[2] if len(args) > 2 else "")
+    if cmd == "test":
+        return cmd_test(conf)
+    if cmd == "goodbye":
+        return cmd_goodbye(conf)
+    if cmd == "status":
+        return cmd_status(conf, "--json" in args)
+    log("unknown command")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

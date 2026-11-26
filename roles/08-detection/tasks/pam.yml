@@ -1,0 +1,299 @@
+---
+# roles/08-detection/tasks/pam.yml - the one PAM change, under role 02's
+# automatic undo, kept only if logins still work.
+#
+# Included by main.yml (_det_pam_do: enable) and remove.yml (remove) when
+# the preflight planned a PAM change. Not in --check.
+#
+#   P1  install the undo guard; no undo may be pending (M08-6)
+#   P2  keep the checksums of the PAM files as they are now (enable, first
+#       time only: a later removal compares with them)
+#   P3  arm the undo (--pam) on the five common PAM files, pam-auth-update's
+#       records in /var/lib/pam and the profile
+#   P4  enable: put the profile in place. remove: nothing yet
+#   P5  the trial again, on the files as they are at this moment (M08-2)
+#   P6  pam-auth-update --package --enable (or --remove) for real
+#   P7  the files must now be exactly what the trial showed (M08-3)
+#   P8  login tests (M08-4): `su` on the server, and in remote mode a
+#       brand-new SSH login (role 02 tasks_from prove)
+#   P9  remove: delete the profile. Then keep the change (disarm)
+# On any failure the undo puts every file back at once, and the run stops.
+# If the connection is lost, the undo's timer does it at the deadline; after
+# a reboot inside the window its boot unit does it before any login.
+#
+# The login test with `su` runs without a login shell (`su root -s /bin/sh
+# -c 'exit 0'`), so root's profile scripts cannot fail it. PAM runs the
+# same session stack as for `su -`.
+
+- name: "Detection PAM P1: name this change"
+  ansible.builtin.set_fact:
+    _ssh_guard_id: "autosec-{{ '%012x' | format(281474976710655 | random) }}"
+    _det_pam_armed: false
+    _det_pam_kept: false
+
+- name: "Detection PAM P1: install the automatic undo"
+  ansible.builtin.include_role:
+    name: 02-ssh-hardening
+    tasks_from: guard
+  vars:
+    _ssh_guard_action: install
+
+- name: "Detection PAM P1: is an earlier undo still pending?"
+  ansible.builtin.stat:
+    path: "{{ _det_guard_pending }}"
+    get_checksum: false
+  register: _det_pam_pending
+
+- name: "Detection PAM M08-6: no other change may be waiting for its undo now"
+  ansible.builtin.assert:
+    quiet: true
+    that: not (_det_pam_pending.stat.exists | default(false))
+    fail_msg: >-
+      [M08-6] Another auto_sec change on {{ inventory_hostname }} is waiting for its automatic undo
+      (it was not when the plan was made). Check with `sudo auto-sec-ssh-guard status`. The common
+      PAM files have not been changed.
+
+# The checksums stay on the host: a small script writes them there, and
+# nothing of them comes back to this computer.
+- name: "Detection PAM P2: keep the checksums of the PAM files as they are now (first install)"
+  when: _det_pam_do == 'enable'
+  ansible.builtin.command:
+    argv: "{{ ['sh', '-c', _det_pam_keep_sh, 'sh', _det_pam_before, _det_pam_root] + _det_pam_files }}"
+  register: _det_pam_keep
+  changed_when: "'written' in _det_pam_keep.stdout"
+  vars:
+    # $2 is empty on a real server (the lab's PAM files are under a lab root).
+    _det_pam_keep_sh: |
+      set -eu
+      out=$1; root=$2; shift 2
+      [ -e "$out" ] && exit 0
+      umask 077
+      {
+        printf '{'
+        sep=
+        for f in "$@"; do
+          if [ -L "$root$f" ]; then exit 3
+          elif [ -f "$root$f" ]; then s=$(sha256sum < "$root$f" | cut -d' ' -f1)
+          else s=absent
+          fi
+          printf '%s"%s": "%s"' "$sep" "$f" "$s"
+          sep=', '
+        done
+        printf '}\n'
+      } > "$out.new"
+      mv -f -- "$out.new" "$out"
+      echo written
+
+# The deadline is computed from the server's own clock. --pam: the undo
+# only puts the files back; PAM reads them at every login.
+- name: "Detection PAM P3: arm the automatic undo (--pam)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['sh', '-c', 'set -eu; d=$(( $(date +%s) + $1 )); echo "deadline=$d"; b=$2; i=$3; shift 3; exec "$b" arm "$i" "$d" --pam -- "$@"',
+          'sh', detection_revert_seconds | int | string, _det_guard_bin, _ssh_guard_id] + _det_guard_paths }}
+  register: _det_pam_arm
+  changed_when: _det_pam_arm.rc == 0
+  failed_when: false
+
+- name: "Detection PAM P3: arming must succeed"
+  ansible.builtin.assert:
+    quiet: true
+    that: _det_pam_arm.rc == 0
+    fail_msg: >-
+      Could not arm the automatic undo on {{ inventory_hostname }} (rc {{ _det_pam_arm.rc }}):
+      {{ {7: 'another auto_sec change is still pending (sudo auto-sec-ssh-guard status)',
+          9: 'the undo deadline is out of range (check the server clock)',
+          2: 'bad arguments, or one of the PAM files is a link (auto_sec bug or an unusual server)'}[_det_pam_arm.rc | int] | default('see the error output') }}.
+      {{ _det_pam_arm.stderr | default('') | regex_replace('[{}]', '?') | trim }} The common PAM files have not been changed.
+
+- name: "Detection PAM P3: the undo is armed"
+  ansible.builtin.set_fact:
+    _det_pam_armed: true
+
+- name: "Detection PAM P4-P9: change, check, test (undone on any failure)"
+  block:
+    - name: "Detection PAM P4: put auto_sec's profile in place (not enabled yet: Default: no)"
+      when: _det_pam_do == 'enable'
+      ansible.builtin.copy:
+        src: "{{ _det_profile_name }}"
+        dest: "{{ _det_profile }}"
+        owner: "{{ _det_file_owner }}"
+        group: "{{ _det_file_group }}"
+        mode: "0644"
+
+    - name: "Detection PAM P5: the trial again, on the files as they are now"
+      ansible.builtin.include_tasks:
+        file: pam-trial.yml
+
+    - name: "Detection PAM P5: refuse or go on"
+      ansible.builtin.include_tasks:
+        file: pam-decide.yml
+      vars:
+        _det_stage: apply
+
+    # With the profile in place, every pam-auth-update can try it (also
+    # Ubuntu 22.04's). What the preflight's trial showed must still hold.
+    - name: "Detection PAM M08-2: the trial must show what the plan showed"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - not (_det_pam_blind | bool)
+          - (_det_pam_do != 'enable') or (_det_pam.enable.ok | default(false))
+          - (_det_pam_do != 'remove') or (_det_pam.remove.ok | default(false))
+          - >-
+            (_det_pam_do != 'enable') or (_det_pam_pf.enable.blind | default(true))
+            or (_det_pam.enable.after == _det_pam_pf.enable.after)
+        fail_msg: >-
+          [M08-2] The PAM files on {{ inventory_hostname }} changed during this run, or
+          pam-auth-update cannot try auto_sec's profile: the trial now gives another result than the
+          one the plan was made from. The common PAM files have not been changed.
+
+    - name: "Detection PAM P5: remember what the trial said the files will be"
+      ansible.builtin.set_fact:
+        _det_pam_t1: "{{ _det_pam }}"
+
+    - name: "Detection PAM P6: pam-auth-update, for real"
+      ansible.builtin.command:
+        argv: >-
+          {{ [_det_pam_tool] + _det_pam_real_args + ['--package', ('--enable' if _det_pam_do == 'enable' else '--remove'), _det_profile_name] }}
+      environment: "{{ {'DEBIAN_FRONTEND': 'noninteractive', 'LC_ALL': 'C'} | combine(_det_pam_real_env) }}"
+      register: _det_pam_real
+      changed_when: true
+
+    - name: "Detection PAM P7: read the files as they are now"
+      ansible.builtin.include_tasks:
+        file: pam-trial.yml
+
+    - name: "Detection PAM M08-3: the files must be exactly what the trial showed"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _det_pam_real.rc == 0
+          - _det_pam_want | length >= 11
+          - _det_pam_mismatch | length == 0
+        fail_msg: >-
+          [M08-3] After pam-auth-update on {{ inventory_hostname }}, {{ _det_pam_mismatch | join(", ") or "the PAM files" }}
+          {{ "is" if (_det_pam_mismatch | length == 1) else "are" }} not what the trial showed
+          ({{ (_det_pam_real.stdout | default("") ~ " " ~ _det_pam_real.stderr | default("")) | regex_replace("[^ -~]", " ") | regex_replace("[{}]", "?") | trim | truncate(300) }}).
+      vars:
+        # What the trial before the real run said the files would be.
+        _det_pam_want: "{{ (_det_pam_t1.enable.after if _det_pam_do == 'enable' else _det_pam_t1.remove.after) | default({}) }}"
+        _det_pam_mismatch: >-
+          {%- set out = [] -%}
+          {%- for p, h in (_det_pam_want | dictsort) -%}
+          {%- if ((_det_pam.now | default({}))[p] | default('?')) != h -%}{%- set _ = out.append(p) -%}{%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "Detection PAM P7: the undo is still armed, and knows what this run wrote"
+      ansible.builtin.include_role:
+        name: 02-ssh-hardening
+        tasks_from: guard
+      vars:
+        _ssh_guard_action: check
+
+    # A hook that hangs is cut off after 1 s; 20 s means something else is wrong.
+    - name: "Detection PAM P8: login test on the server (su)"
+      ansible.builtin.command:
+        argv: >-
+          {{ ['timeout', '20'] + _det_su_argv }}
+      register: _det_pam_su
+      changed_when: false
+      failed_when: false
+
+    - name: "Detection PAM P8: brand-new SSH login"
+      when: not (_ssh_local_mode | default(false) | bool)
+      ansible.builtin.include_role:
+        name: 02-ssh-hardening
+        tasks_from: prove
+      vars:
+        _ssh_prove_mode: normal
+        _ssh_prove_label: after the PAM change
+        _ssh_prove_delay: 0
+
+    - name: "Detection PAM P8: brand-new SSH login, once more after 10 s"
+      when:
+        - not (_ssh_local_mode | default(false) | bool)
+        - not (_ssh_prove_ok | bool)
+      ansible.builtin.include_role:
+        name: 02-ssh-hardening
+        tasks_from: prove
+      vars:
+        _ssh_prove_mode: normal
+        _ssh_prove_label: after the PAM change (retry)
+        _ssh_prove_delay: 10
+
+    # CI only (tests/detection/live): the login test counts as failed, so
+    # the undo runs on a real runner.
+    - name: "Detection PAM P8: CI-only injected login failure"
+      when: autosec_ci_inject_pam_fail | default(false) | bool
+      ansible.builtin.set_fact:
+        _det_pam_inject: true
+
+    - name: "Detection PAM M08-4: logins must still work"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _det_pam_su.rc == 0
+          - (_ssh_local_mode | default(false) | bool) or (_ssh_prove_ok | default(false) | bool)
+          - not (_det_pam_inject | default(false) | bool)
+        fail_msg: >-
+          [M08-4] A login test failed on {{ inventory_hostname }} after the PAM change:
+          {{ ('su on the server: rc ' ~ _det_pam_su.rc ~ ' ' ~ (_det_pam_su.stderr | default('') | regex_replace('[^ -~]', ' ') | regex_replace('[{}]', '?') | truncate(200)))
+             if _det_pam_su.rc != 0 else '' }}
+          {{ ('a brand-new SSH login: ' ~ (_ssh_prove_msg | default('')))
+             if (not (_ssh_local_mode | default(false) | bool) and not (_ssh_prove_ok | default(false) | bool)) else '' }}
+          {{ 'injected by autosec_ci_inject_pam_fail (CI only)' if (_det_pam_inject | default(false) | bool) else '' }}
+
+    # The profile goes only after pam-auth-update has taken its line out.
+    # The script deletes it only while it still carries auto_sec's header.
+    - name: "Detection PAM P9: delete auto_sec's profile (removal)"
+      when: _det_pam_do == 'remove'
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - |
+            f=$1
+            [ -e "$f" ] || [ -L "$f" ] || exit 0
+            if [ -f "$f" ] && [ ! -L "$f" ] && [ "$(head -n 1 -- "$f")" = "$2" ]; then rm -f -- "$f" && echo removed; else exit 4; fi
+          - sh
+          - "{{ _det_profile }}"
+          - "{{ _det_header_pam }}"
+      register: _det_pam_rmprof
+      changed_when: "'removed' in _det_pam_rmprof.stdout"
+
+    - name: "Detection PAM P9: keep the change (disarm the undo)"
+      ansible.builtin.include_role:
+        name: 02-ssh-hardening
+        tasks_from: guard
+      vars:
+        _ssh_guard_action: disarm
+
+    - name: "Detection PAM P9: kept"
+      ansible.builtin.set_fact:
+        _det_pam_kept: true
+
+  rescue:
+    - name: "Detection PAM: put the PAM files back now"
+      when: not (_det_pam_kept | bool)
+      ansible.builtin.include_role:
+        name: 02-ssh-hardening
+        tasks_from: guard
+      vars:
+        _ssh_guard_action: revert
+
+    - name: "Detection PAM: stop this host"
+      ansible.builtin.fail:
+        msg: >-
+          The PAM change on {{ inventory_hostname }} failed at "{{ ansible_failed_task.name | default('?') }}":
+          {{ ((ansible_failed_result.msg | default('')) ~ ' ' ~ (ansible_failed_result.stderr | default('')))
+             | string | regex_replace('[{}]', '?') | regex_replace('\s+', ' ') | trim | truncate(700) }}.
+          {% if _det_pam_kept | bool %}The change stays (the undo was already disarmed).
+          {% elif (_ssh_guard_revert_rc | default(-1) | int) == 0 %}auto_sec put the common PAM files, /var/lib/pam and
+          its profile back as they were before this step. Logins work as before.
+          {% else %}The undo reported rc {{ _ssh_guard_revert_rc | default('?') }} ({{ _ssh_guard_revert_err | default('') }}).
+          Check with `sudo auto-sec-ssh-guard status`: if line 1 still says "pending", its timer puts the files
+          back at the deadline; otherwise look at the files it lists as left in place.
+          {% endif %}{{ 'The journal reader and the sender stay installed and keep working without the login hook. Run again, or set detection_login_hook: false.'
+          if _det_pam_do == 'enable' else 'Nothing else of detection was taken out. Run again.' }} No later role ran on this host.

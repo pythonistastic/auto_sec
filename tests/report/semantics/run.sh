@@ -120,7 +120,7 @@ for pb in "${ANSIBLES[@]}"; do
     [ "$(stat -c %a "$f" 2>/dev/null)" = 600 ] && [ "$(stat -c %a "$d/reports" 2>/dev/null)" = 700 ]
     ok "$tag $c: file 0600, folder 0700" $?
     ! grep -Eq "$REMOVED" "$f"; ok "$tag $c: none of the removed claims" $?
-    grep -q 'Detection: not managed by auto_sec 0.6' "$f" && grep -q 'Backups: not checked by auto_sec' "$f"
+    grep -q 'Login alerts (read during this run): not checked in this run' "$f" && grep -q 'Backups: not checked by auto_sec' "$f"
     ok "$tag $c: unmeasured parts say so" $?
     # shellcheck disable=SC2016  # a literal backtick, not an expansion
     ! grep -q '{{' "$f" && ! grep -q '`id`' "$f"; ok "$tag $c: no braces or backticks from the host" $?

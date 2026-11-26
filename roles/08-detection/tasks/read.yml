@@ -1,0 +1,98 @@
+---
+# roles/08-detection/tasks/read.yml - what is on the host now (read-only).
+#
+# Included by preflight.yml and again by main.yml and remove.yml right
+# before they change anything. One shell command prints one line per name:
+#   <name> absent
+#   <name> file <sha256> <1|0>    1: it carries auto_sec's header line
+#   <name> dir <mode> <owner>
+#   <name> link <ok|other>        ok: it points at auto_sec's own unit file
+#   <name> other                  anything else (a link where a file belongs, ...)
+#   elsewhere <path>              a unit with one of auto_sec's names in
+#                                 another unit folder
+# Only checksums and yes/no answers come back. detect.conf holds the
+# Telegram token: only its first line is compared, on the host, and no
+# line of it is printed.
+#
+# Sets:
+#   _det_now        dict  name -> {type, sha, own, mode, owner}
+#   _det_elsewhere  list  paths (filtered)
+
+- name: "Detection: the files role 08 would write, as they are now"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['sh', '-c', _det_read_sh, 'sh', _det_header, _det_header_py, _det_header_pam]
+         + _det_read_specs + ['--'] + _det_elsewhere_dirs }}
+  register: _det_read
+  changed_when: false
+  check_mode: false
+  vars:
+    # "<name>=<kind>=<path>[=<where a link must point>]"; kind: 1 or 2 (the
+    # header's line), p (the PAM profile), d (a folder), l (a link).
+    _det_read_specs: >-
+      {%- set out = [] -%}
+      {%- for n in _det_order -%}
+      {%- set _ = out.append('f:' ~ n ~ '=' ~ _det_targets[n].header ~ '=' ~ _det_targets[n].dest) -%}
+      {%- endfor -%}
+      {%- set _ = out.append('f:profile=p=' ~ _det_profile) -%}
+      {%- for d in _det_dirs -%}
+      {%- set _ = out.append('d:' ~ d.path ~ '=d=' ~ d.path) -%}
+      {%- endfor -%}
+      {%- for r in _det_run -%}
+      {%- set _ = out.append('l:' ~ r.unit ~ '=l=' ~ _det_unit_dir ~ '/' ~ r.wants ~ '/' ~ r.unit ~ '=' ~ _det_unit_dir ~ '/' ~ r.unit) -%}
+      {%- endfor -%}
+      {{ out }}
+    _det_read_sh: |
+      H=$1; HP=$2; HM=$3; shift 3
+      while [ $# -gt 0 ] && [ "$1" != -- ]; do
+        spec=$1; shift
+        n=${spec%%=*}; rest=${spec#*=}; k=${rest%%=*}; f=${rest#*=}
+        want=
+        case $n in l:*) want=${f#*=}; f=${f%%=*} ;; esac
+        if [ -L "$f" ]; then
+          case $n in
+            l:*) if [ "$(readlink -- "$f")" = "$want" ]; then echo "$n link ok"; else echo "$n link other"; fi ;;
+            *) echo "$n other" ;;
+          esac
+        elif [ -d "$f" ]; then
+          case $n in d:*) echo "$n dir $(stat -c '%a %U' -- "$f")" ;; *) echo "$n other" ;; esac
+        elif [ -f "$f" ]; then
+          case $n in
+            f:*)
+              s=$(sha256sum < "$f" | cut -d' ' -f1)
+              own=0
+              case $k in
+                1) [ "$(head -n 1 -- "$f")" = "$H" ] && own=1 ;;
+                2) [ "$(sed -n 2p -- "$f")" = "$HP" ] && own=1 ;;
+                p) [ "$(head -n 1 -- "$f")" = "$HM" ] && own=1 ;;
+              esac
+              echo "$n file $s $own" ;;
+            *) echo "$n other" ;;
+          esac
+        elif [ -e "$f" ]; then echo "$n other"
+        else echo "$n absent"
+        fi
+      done
+      shift
+      for d in "$@"; do
+        for f in "$d"/auto-sec-alert.* "$d"/auto-sec-login-watch.* "$d"/auto-sec-alive.* "$d"/auto-sec-check.* "$d"/auto-sec-notify@*; do
+          if [ -e "$f" ] || [ -L "$f" ]; then echo "elsewhere $f"; fi
+        done
+      done
+
+- name: "Detection: remember what is there"
+  ansible.builtin.set_fact:
+    _det_now: >-
+      {%- set out = {} -%}
+      {%- for ln in _det_read.stdout_lines | select('match', '^[fdl]:\S+ (absent|file [0-9a-f]{64} [01]|dir [0-7]{3,4} [A-Za-z0-9_.-]{1,32}|link (ok|other)|other)$') -%}
+      {%- set f = ln.split() -%}
+      {%- set _ = out.update({f[0][2:]: {'type': f[1],
+                                          'sha': (f[2] if f[1] == 'file' else ''),
+                                          'own': (f[1] == 'file' and f[3] == '1') or (f[1] == 'link' and f[2] == 'ok'),
+                                          'mode': (f[2] if f[1] == 'dir' else ''),
+                                          'owner': (f[3] if f[1] == 'dir' else '')}}) -%}
+      {%- endfor -%}
+      {{ out }}
+    _det_elsewhere: >-
+      {{ _det_read.stdout_lines | select('match', '^elsewhere /') | map('regex_replace', '^elsewhere ', '')
+         | map('regex_replace', '[^ -~]', '?') | map('regex_replace', '[{}]', '?') | list }}
