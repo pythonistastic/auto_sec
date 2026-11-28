@@ -10,6 +10,10 @@ changes. auto_sec is a personal research project, not a production service — s
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.7.0] - 2026-11-28
+
 **Login alerts, the first part of the detection rewrite.** Opt-in per
 server (`detection_enabled: true`), off on `existing` and on `new`. The
 server tells you on Telegram when someone logs in, proves once a day that
@@ -1097,7 +1101,8 @@ Backups/restore, fwknop, app/DB/TLS roles, Telegram delivery, `active`
 mode, and non-Ubuntu-22.04 targets are shipped but **not yet validated
 end-to-end**. See [docs/RETROSPECTIVE.md](docs/RETROSPECTIVE.md).
 
-[Unreleased]: https://github.com/pythonistastic/auto_sec/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/pythonistastic/auto_sec/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.7.0
 [0.6.1]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.6.1
 [0.6.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.6.0
 [0.5.0]: https://github.com/pythonistastic/auto_sec/releases/tag/v0.5.0
